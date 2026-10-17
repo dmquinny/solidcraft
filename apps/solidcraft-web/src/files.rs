@@ -4,6 +4,13 @@
 //! Access API where the browser has it, an `<input type=file>` otherwise) or a drop on the page,
 //! and go out as downloads (exports, and "Download design"). An autosave of unsaved work is kept
 //! in OPFS too and offered again after a reload or a crash.
+//!
+//! Server storage (a self-hosting patch, not upstream): when the site has a `files/` endpoint
+//! next to the app (nginx with WebDAV, packaging/docker/nginx.conf: `GET files/` lists the
+//! folder as nginx's JSON autoindex, `GET files/<name>` reads, `PUT` writes, `DELETE` removes),
+//! designs are kept there instead of in the browser, so every browser and device sees the same
+//! files. The endpoint is probed once at start; without it (404, or anything but a JSON
+//! listing) nothing changes. The autosave stays in the browser: it is written on every edit.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -127,6 +134,89 @@ pub fn local_only() -> bool {
     LOCAL.with(Cell::get)
 }
 
+thread_local! {
+    /// The site has server storage (see the module doc): designs go there, not to the browser.
+    static REMOTE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The server's design folder, relative to the page (same origin: no CORS, no configuration).
+const REMOTE_DIR: &str = "files/";
+
+/// Are designs kept on the server?
+pub fn remote_only() -> bool {
+    REMOTE.with(Cell::get)
+}
+
+/// Files that stay in the browser even with server storage: the autosave is written on every edit.
+fn stays_local(name: &str) -> bool {
+    name == RECOVERY || name == RECOVERY_META || name == LEGACY_RECOVERY
+}
+
+fn remote_url(name: &str) -> String {
+    format!("{REMOTE_DIR}{}", String::from(js_sys::encode_uri_component(name)))
+}
+
+/// One request to the server's design folder: the response, whatever its status.
+async fn remote_request(method: &str, url: &str, body: Option<&[u8]>) -> Result<web_sys::Response, String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method(method);
+    init.set_cache(web_sys::RequestCache::NoStore);
+    if let Some(b) = body {
+        init.set_body(&Uint8Array::from(b));
+    }
+    JsFuture::from(window.fetch_with_str_and_init(url, &init))
+        .await
+        .map_err(|e| format!("the server's design folder is unreachable ({})", err(e)))?
+        .dyn_into()
+        .map_err(|_| "no response".to_string())
+}
+
+/// The server's design folder: `Some` listing (name, modified) when the site has one, `None`
+/// when it has not (404, or no JSON listing: the upstream site), an error when it failed.
+async fn remote_list() -> Result<Option<Vec<(String, f64)>>, String> {
+    let r = remote_request("GET", REMOTE_DIR, None).await?;
+    let json = r.headers().get("content-type").ok().flatten().is_some_and(|t| t.starts_with("application/json"));
+    if r.status() == 404 || (r.ok() && !json) {
+        return Ok(None);
+    }
+    if !r.ok() {
+        return Err(format!("the server's design folder answered HTTP {}", r.status()));
+    }
+    let list: Array = JsFuture::from(r.json().map_err(err)?).await.map_err(err)?.dyn_into().map_err(|_| "the listing isn't a list".to_string())?;
+    let mut out = Vec::new();
+    for e in list.iter() {
+        let get = |k: &str| Reflect::get(&e, &k.into()).ok().and_then(|v| v.as_string());
+        let Some(name) = get("name") else { continue };
+        if name.starts_with('.') || get("type").is_some_and(|t| t != "file") {
+            continue;
+        }
+        let modified = get("mtime").map(|m| js_sys::Date::parse(&m)).filter(|t| !t.is_nan()).unwrap_or(0.0);
+        out.push((name, modified));
+    }
+    Ok(Some(out))
+}
+
+async fn remote_read(name: &str) -> Result<Vec<u8>, String> {
+    let r = remote_request("GET", &remote_url(name), None).await?;
+    if !r.ok() {
+        return Err(format!("HTTP {}", r.status()));
+    }
+    let buf = JsFuture::from(r.array_buffer().map_err(err)?).await.map_err(err)?;
+    Ok(Uint8Array::new(&buf).to_vec())
+}
+
+async fn remote_write(name: &str, bytes: &[u8]) -> Result<(), String> {
+    let r = remote_request("PUT", &remote_url(name), Some(bytes)).await?;
+    if r.ok() { Ok(()) } else { Err(format!("the server's design folder refused the write (HTTP {})", r.status())) }
+}
+
+async fn remote_remove(name: &str) -> Result<(), String> {
+    let r = remote_request("DELETE", &remote_url(name), None).await?;
+    // Gone already is gone.
+    if r.ok() || r.status() == 404 { Ok(()) } else { Err(format!("the server's design folder refused the delete (HTTP {})", r.status())) }
+}
+
 fn err(e: JsValue) -> String {
     e.as_string().or_else(|| Reflect::get(&e, &"message".into()).ok().and_then(|m| m.as_string())).unwrap_or_else(|| format!("{e:?}"))
 }
@@ -167,6 +257,9 @@ async fn file_handle(dir: &FileSystemDirectoryHandle, name: &str, create: bool) 
 }
 
 async fn write_file(name: &str, bytes: &[u8]) -> Result<(), String> {
+    if remote_only() && !stays_local(name) {
+        return remote_write(name, bytes).await;
+    }
     if local_only() {
         return local()?
             .set_item(&format!("{LOCAL_PREFIX}{name}"), &encode(bytes))
@@ -182,6 +275,9 @@ async fn write_file(name: &str, bytes: &[u8]) -> Result<(), String> {
 }
 
 async fn remove_file(name: &str) -> Result<(), String> {
+    if remote_only() && !stays_local(name) {
+        return remote_remove(name).await;
+    }
     if local_only() {
         let st = local()?;
         st.remove_item(&format!("{LEGACY_LOCAL_PREFIX}{name}")).map_err(err)?;
@@ -206,8 +302,31 @@ fn read_local() -> Result<Vec<(String, Vec<u8>, f64)>, String> {
     Ok(out)
 }
 
-/// Every stored file: (name, bytes). Without OPFS, local storage takes over from here on.
+/// Every stored file: (name, bytes, modified). With server storage, the server's files and the
+/// browser's autosave; a server that is there but fails keeps designs out of the browser (saves
+/// report the failure) rather than hiding them in it until the next reload.
 async fn read_all() -> Result<Vec<(String, Vec<u8>, f64)>, String> {
+    let list = match remote_list().await {
+        Ok(None) => return read_browser().await,
+        r => r,
+    };
+    REMOTE.with(|r| r.set(true));
+    let mut out = Vec::new();
+    for (name, modified) in list?.unwrap_or_default() {
+        match remote_read(&name).await {
+            Ok(b) => out.push((name, b, modified)),
+            Err(e) => log::warn!("{name}: {e}"),
+        }
+    }
+    match read_browser().await {
+        Ok(b) => out.extend(b.into_iter().filter(|(n, _, _)| stays_local(n))),
+        Err(e) => log::warn!("browser storage: {e}"),
+    }
+    Ok(out)
+}
+
+/// Every file in the browser's storage. Without OPFS, local storage takes over from here on.
+async fn read_browser() -> Result<Vec<(String, Vec<u8>, f64)>, String> {
     let dir = match root().await {
         Ok(d) => d,
         Err(e) => {
@@ -255,7 +374,7 @@ pub fn start(files: &Rc<Files>) {
     spawn_local(async move {
         match read_all().await {
             Ok(all) => {
-                if local_only() {
+                if local_only() && !remote_only() {
                     files.say("This page can't use the browser's file storage (it needs https or localhost): designs are kept in local storage, a few MB at most.", false);
                 }
                 let mut entries = Vec::new();
@@ -285,7 +404,7 @@ pub fn start(files: &Rc<Files>) {
                     *files.recovery.borrow_mut() = None;
                 }
             }
-            Err(e) => files.say(format!("browser storage: {e}"), true),
+            Err(e) => files.say(format!("storage: {e}"), true),
         }
         files.ready.set(true);
         files.wake();
