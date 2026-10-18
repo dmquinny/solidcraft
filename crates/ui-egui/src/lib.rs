@@ -277,6 +277,10 @@ pub struct Services {
     /// Preferences pages of the host's own (a web host's server settings, say), listed after the
     /// built-in ones and drawn by the host (`prefs::open_host_page` opens one).
     pub host_pages: Vec<HostPage>,
+    /// Sections of the start page the host adds (a web host's "Shared with you", say), drawn by
+    /// the host between Recent and Samples; each draws its own heading (`home::section`) when it
+    /// has something to show.
+    pub home_sections: Vec<Box<dyn FnMut(&mut egui::Ui)>>,
 }
 
 /// A Preferences page the host adds (`Services::host_pages`).

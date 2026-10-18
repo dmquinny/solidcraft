@@ -242,6 +242,15 @@ fn route(
     }
     let may_view = |path: &str, dir: bool| acl.level(user, admin, &access::key(path, dir)) > Level::None;
     let result = match (method, folder) {
+        (Method::Get, true) if get("shared").is_some() => Ok(Reply::json(
+            200,
+            &Value::Array(
+                acl.shared_with(user)
+                    .into_iter()
+                    .map(|(k, owner, edit)| json!({"path": k.trim_end_matches('/'), "folder": k.ends_with('/'), "owner": owner, "edit": edit}))
+                    .collect(),
+            ),
+        )),
         (Method::Get, true) if get("log").is_some() => store.log(&clean, LOG_ENTRIES).map(|mut c| {
             c.retain(|c| may_view(&c.path, false));
             Reply::json(200, &changes_json(&c)).with(USER_HEADER, user)

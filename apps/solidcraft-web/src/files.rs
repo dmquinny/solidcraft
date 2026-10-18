@@ -72,6 +72,16 @@ pub struct Change {
     pub path: String,
 }
 
+/// Something another user shared with this one by name.
+#[derive(Clone, Debug)]
+pub struct Shared {
+    /// A design's path, or a folder's ("" for the design folder itself).
+    pub path: String,
+    pub folder: bool,
+    pub owner: String,
+    pub edit: bool,
+}
+
 /// One version of a server design.
 #[derive(Clone, Debug)]
 pub struct Version {
@@ -121,6 +131,10 @@ pub struct Files {
     pub folders: RefCell<Vec<String>>,
     /// The current folder's recent changes, newest first (the storage service only).
     pub changes: RefCell<Vec<Change>>,
+    /// What others shared with this user by name (the storage service only).
+    pub shared: RefCell<Vec<Shared>>,
+    /// A stored design to open as soon as the entries are loaded (after a folder change).
+    pub open_next: RefCell<Option<String>>,
     /// The history window: a server design's name and its versions, newest first (empty while
     /// they are being fetched); `None` when it is closed.
     pub history: RefCell<Option<(String, Vec<Version>)>>,
@@ -331,6 +345,30 @@ pub(crate) fn remote_url(name: &str) -> String {
     format!("{}{}", remote_dir(), String::from(js_sys::encode_uri_component(name)))
 }
 
+/// Go to something another user shared: a folder is shown in the panel; a design's folder is
+/// entered and the design opened once its entries are in (the host's frame does that).
+pub fn open_shared(files: &Rc<Files>, shared: &Shared) {
+    let (folder, design) = if shared.folder {
+        (shared.path.clone(), None)
+    } else {
+        match shared.path.rsplit_once('/') {
+            Some((dir, name)) => (dir.to_string(), Some(name.to_string())),
+            None => (String::new(), Some(shared.path.clone())),
+        }
+    };
+    if folder != remote_folder()
+        && let Err(e) = set_remote_folder(files, &folder)
+    {
+        files.say(e, true);
+        return;
+    }
+    match design {
+        Some(name) => *files.open_next.borrow_mut() = Some(name),
+        None => files.panel.set(true),
+    }
+    files.wake();
+}
+
 /// A JSON answer from the server (any status but 2xx is an error, with the server's words).
 pub(crate) async fn remote_json(method: &str, url: &str, body: Option<&[u8]>) -> Result<serde_json::Value, String> {
     let headers: &[(&str, &str)] = if body.is_some() { &[("Content-Type", "application/json")] } else { &[] };
@@ -508,6 +546,7 @@ struct Listing {
     files: Vec<(String, f64)>,
     folders: Vec<String>,
     changes: Vec<Change>,
+    shared: Vec<Shared>,
 }
 
 /// A JSON array response as its objects' string fields, by key.
@@ -518,7 +557,10 @@ async fn json_rows(r: web_sys::Response) -> Result<Vec<HashMap<String, String>>,
         let mut row = HashMap::new();
         let obj: Object = e.clone().unchecked_into();
         for k in Object::keys(&obj).iter().filter_map(|k| k.as_string()) {
-            if let Some(v) = Reflect::get(&e, &k.clone().into()).ok().and_then(|v| v.as_string().or_else(|| v.as_f64().map(|n| n.to_string()))) {
+            if let Some(v) = Reflect::get(&e, &k.clone().into())
+                .ok()
+                .and_then(|v| v.as_string().or_else(|| v.as_f64().map(|n| n.to_string())).or_else(|| v.as_bool().map(|b| b.to_string())))
+            {
                 row.insert(k, v);
             }
         }
@@ -529,6 +571,25 @@ async fn json_rows(r: web_sys::Response) -> Result<Vec<HashMap<String, String>>,
 
 fn date_of(row: &HashMap<String, String>, key: &str) -> f64 {
     row.get(key).map(|m| js_sys::Date::parse(m)).filter(|t| !t.is_nan()).unwrap_or(0.0)
+}
+
+/// What others shared with this user (none from plain nginx storage).
+async fn remote_shared() -> Vec<Shared> {
+    let Ok(r) = remote_request("GET", &format!("{REMOTE_DIR}?shared"), None, &[]).await else { return Vec::new() };
+    if !is_listing(&r) {
+        return Vec::new();
+    }
+    let Ok(rows) = json_rows(r).await else { return Vec::new() };
+    rows.iter()
+        .filter_map(|row| {
+            Some(Shared {
+                path: row.get("path")?.clone(),
+                folder: row.get("folder").is_some_and(|f| f == "true"),
+                owner: row.get("owner").cloned().unwrap_or_default(),
+                edit: row.get("edit").is_some_and(|e| e == "true"),
+            })
+        })
+        .collect()
 }
 
 /// A folder's recent changes (none from plain nginx storage).
@@ -589,6 +650,7 @@ async fn remote_list() -> Result<Option<Listing>, String> {
     }
     listing.folders.sort_by_key(|f| f.to_lowercase());
     listing.changes = remote_log(&dir).await;
+    listing.shared = remote_shared().await;
     Ok(Some(listing))
 }
 
@@ -926,6 +988,7 @@ struct Loaded {
     files: Vec<Stored>,
     folders: Vec<String>,
     changes: Vec<Change>,
+    shared: Vec<Shared>,
 }
 
 /// Every stored file, and the server folder's subfolders. With server storage, the server's files
@@ -954,7 +1017,7 @@ async fn read_remote(listing: Listing) -> Loaded {
             Err(e) => log::warn!("{name}: {e}"),
         }
     }
-    Loaded { files, folders: listing.folders, changes: listing.changes }
+    Loaded { files, folders: listing.folders, changes: listing.changes, shared: listing.shared }
 }
 
 /// Every file in the browser's storage. Without OPFS, local storage takes over from here on.
@@ -1019,7 +1082,7 @@ pub fn start(files: &Rc<Files>) {
 /// The loaded files go into the engine's files and the panel's entries; the app may open them.
 fn install(files: &Files, loaded: Result<Loaded, String>) {
     match loaded {
-        Ok(Loaded { files: all, folders, changes }) => {
+        Ok(Loaded { files: all, folders, changes, shared }) => {
             let mut entries = Vec::new();
             let has_recovery = all.iter().any(|(n, _, _)| n == RECOVERY);
             for (name, bytes, modified) in all {
@@ -1044,6 +1107,7 @@ fn install(files: &Files, loaded: Result<Loaded, String>) {
             *files.entries.borrow_mut() = entries;
             *files.folders.borrow_mut() = folders;
             *files.changes.borrow_mut() = changes;
+            *files.shared.borrow_mut() = shared;
             // An autosave without its design file is nothing to recover.
             if !vfs::exists(&format!("{OPFS}{RECOVERY}")) {
                 *files.recovery.borrow_mut() = None;

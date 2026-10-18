@@ -127,6 +127,17 @@ impl Acl {
         if listed(&e.edit) { Level::Edit } else { Level::View }
     }
 
+    /// What others shared with `user` by name: (key, owner, may edit), folders and designs.
+    pub fn shared_with(&self, user: &str) -> Vec<(String, String, bool)> {
+        let Ok(entries) = self.entries.lock() else { return Vec::new() };
+        let listed = |l: &Option<Vec<String>>| l.as_ref().is_some_and(|l| l.iter().any(|u| u == user));
+        entries
+            .iter()
+            .filter(|(_, e)| e.owner != user && (listed(&e.view) || listed(&e.edit)))
+            .map(|(k, e)| (k.clone(), e.owner.clone(), listed(&e.edit)))
+            .collect()
+    }
+
     /// May `user` change the sharing of a key? Admins, and the owner of its own entry.
     pub fn manages(&self, user: &str, admin: bool, key: &str) -> bool {
         admin || self.get(key).is_some_and(|e| e.owner == user)
@@ -153,6 +164,9 @@ mod tests {
         assert_eq!(acl.level("eve", false, "a/y.solidcraft"), Level::None, "the folder's still covers the rest");
         assert_eq!(acl.effective("a/b/z.solidcraft").map(|(k, _)| k), Some("a/".to_string()));
         assert!(acl.manages("ben", false, "a/") && !acl.manages("felix", false, "a/") && acl.manages("felix", true, "a/"));
+        assert_eq!(acl.shared_with("felix"), vec![("a/".to_string(), "ben".to_string(), false)]);
+        assert_eq!(acl.shared_with("eve"), vec![("a/x.solidcraft".to_string(), "ben".to_string(), true)]);
+        assert!(acl.shared_with("ben").is_empty(), "one's own entries are not shares");
         assert_eq!(key("", true), "/");
         assert_eq!(parent("a/b/"), Some("a/".to_string()));
         assert_eq!(parent("a/"), Some("/".to_string()));

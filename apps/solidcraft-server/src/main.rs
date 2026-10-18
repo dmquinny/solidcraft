@@ -18,6 +18,8 @@
 //! - `PUT /files/<path>` → 201 / 204 with the new `ETag`; with `If-Match`, 412 and
 //!   `{"author","date"}` when someone else saved since that version; with `If-None-Match: *`,
 //!   412 when the design exists already.
+//! - `GET /files/?shared` → what others shared with the signed-in user by name (path, folder?,
+//!   owner, may edit?).
 //! - `DELETE /files/<path>` → 204 (404 when absent).
 //! - `POST /files/<path>?restore=<hash>` → that version becomes the current one (a new commit).
 //! - Live collaboration (see `ops`): `POST /files/<path>?ops` appends the commands a client ran

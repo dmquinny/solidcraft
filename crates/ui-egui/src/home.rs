@@ -472,6 +472,12 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                     }
                 });
             }
+            // The host's own sections (`Services::home_sections`).
+            for j in 0..app.services.home_sections.len() {
+                if let Some(show) = app.services.home_sections.get_mut(j) {
+                    show(ui);
+                }
+            }
             ui.add_space(24.0);
             section(ui, app.tr("home.samples"));
             grid(ui, samples.len(), |ui, i| {
@@ -496,7 +502,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     }
 }
 
-fn section(ui: &mut egui::Ui, title: &str) {
+/// A section heading of the start page (hosts use it for their own sections).
+pub fn section(ui: &mut egui::Ui, title: &str) {
     let t = Tokens::get();
     ui.label(RichText::new(title).size(15.0).strong().color(t.text));
     ui.add_space(8.0);

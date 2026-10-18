@@ -71,6 +71,31 @@ mod web {
         my_password: String,
     }
 
+    /// The start page's "Shared with you" (files::open_shared): what others shared with this
+    /// user by name, opened with one click. Nothing is drawn when there is nothing to show.
+    fn shared_section(ui: &mut egui::Ui, files: &Rc<Files>) {
+        let shared = files.shared.borrow().clone();
+        if !files::remote_only() || shared.is_empty() {
+            return;
+        }
+        ui.add_space(24.0);
+        solidcraft_ui_egui::home::section(ui, "Shared with you");
+        for s in &shared {
+            ui.horizontal(|ui| {
+                let what = match (s.folder, s.path.is_empty()) {
+                    (true, true) => "the whole design folder".to_string(),
+                    (true, false) => format!("the folder {}", s.path),
+                    (false, _) => s.path.clone(),
+                };
+                let label = if s.folder { "Show" } else { "Open" };
+                if ui.button(label).clicked() {
+                    files::open_shared(files, s);
+                }
+                ui.label(format!("{what} \u{b7} shared by {}{}", s.owner, if s.edit { "" } else { " (view only)" }));
+            });
+        }
+    }
+
     /// Preferences › Users (files::users): everyone changes their own password; admins add and
     /// remove users and say who else is an admin. Only with the storage service.
     fn users_page(ui: &mut egui::Ui, files: &Rc<Files>, form: &Rc<std::cell::RefCell<UsersForm>>) {
@@ -256,6 +281,17 @@ mod web {
                 self.recents_synced = true;
                 self.sync_recents();
             }
+            // A shared design picked on the start page opens once its folder's entries are in.
+            if self.files.ready.get()
+                && let Some(name) = self.files.open_next.borrow_mut().take()
+            {
+                let path = format!("{}{name}", files::OPFS);
+                if vfs::exists(&path) {
+                    self.app.open_path(&path);
+                } else {
+                    self.app.set_status(format!("{name}: not on the server any more"), true);
+                }
+            }
             let now = ctx.input(|i| i.time);
             // Unsaved work is kept (at most every AUTOSAVE_S); saved work needs no autosave.
             if self.files.ready.get() && self.files.recovery.borrow().is_none() {
@@ -435,6 +471,31 @@ mod web {
                             }
                         });
                     });
+                    // What others shared with this user by name, wherever it is.
+                    let shared = self.files.shared.borrow().clone();
+                    if remote && !shared.is_empty() {
+                        ui.separator();
+                        egui::CollapsingHeader::new("Shared with me").default_open(true).show(ui, |ui| {
+                            for s in &shared {
+                                ui.horizontal(|ui| {
+                                    let what = match (s.folder, s.path.is_empty()) {
+                                        (true, true) => "the whole design folder".to_string(),
+                                        (true, false) => format!("the folder {}", s.path),
+                                        (false, _) => s.path.clone(),
+                                    };
+                                    ui.label(format!("{what} \u{b7} by {}{}", s.owner, if s.edit { "" } else { " (view only)" }));
+                                    if ui.small_button("Go").on_hover_text("Open that folder in this panel").clicked() {
+                                        let folder = if s.folder {
+                                            s.path.clone()
+                                        } else {
+                                            s.path.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string())
+                                        };
+                                        act = Some(("folder", folder));
+                                    }
+                                });
+                            }
+                        });
+                    }
                     // Who did what in this folder (the storage service's log).
                     let changes = self.files.changes.borrow().clone();
                     if remote && !changes.is_empty() {
@@ -920,6 +981,7 @@ mod web {
                         files::start(&files);
                         let panel = files.clone();
                         let (page_files, form) = (files.clone(), Rc::new(std::cell::RefCell::new(UsersForm::default())));
+                        let home_files = files.clone();
                         let services = Services {
                             // Open shows the browser's files (and the computer's, from there).
                             pick_open: Some(Box::new(move |_: &[&str]| {
@@ -934,6 +996,7 @@ mod web {
                             install_app: Some(crate::install::service(&cc.egui_ctx)),
                             // Preferences › Users: who can sign in to the server (files::users).
                             host_pages: vec![HostPage { title: "Users".into(), show: Box::new(move |ui| users_page(ui, &page_files, &form)) }],
+                            home_sections: vec![Box::new(move |ui| shared_section(ui, &home_files))],
                             ..Default::default()
                         };
                         // Thumbnails of saves and start-page cards.
