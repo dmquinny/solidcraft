@@ -13,8 +13,8 @@ the server instead of in the browser.
 | `apps/solidcraft-web/Cargo.toml` | Three more `web-sys` features (`RequestInit`, `RequestCache`, `Headers`). |
 | `packaging/docker/nginx.conf` | `location ^~ /files/`: nginx's JSON autoindex plus `dav_methods PUT DELETE`, backed by `/srv/designs`. |
 
-Outside the repo, `W:\docker-compose.yml` mounts `/mnt/Apps/Apps/SolidCraftDesigns` (that is
-`W:\SolidCraftDesigns` on the PC) at `/srv/designs` in the `solidcraft` service. Keep only
+Outside the repo, `W:\docker-compose.yml` mounts `/mnt/Apps/Backup/Maker/SolidCraft` (that is
+`Z:\Maker\SolidCraft` on the PC, a Syncthing-synced folder) at `/srv/designs` in the `solidcraft` service. Keep only
 designs in that folder: everything in it is listed in the app and read at start.
 
 Remotes: `origin` is the fork (github.com/dmquinny/solidcraft), `upstream` is tangency-labs.
