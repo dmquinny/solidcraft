@@ -46,6 +46,13 @@ impl HomeState {
         self.open = true;
     }
 
+    /// The file at `key` changed: its picture is made again when next shown (hosts' own
+    /// sections, whose files the host fetches).
+    pub fn forget(&mut self, key: &str) {
+        self.thumbs.remove(key);
+        self.queued.retain(|k| k != key);
+    }
+
     /// Put a design at the top of the recent list.
     pub fn add_recent(&mut self, path: &str) {
         self.recent.retain(|p| p != path);

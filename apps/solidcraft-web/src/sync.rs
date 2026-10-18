@@ -437,7 +437,15 @@ impl Sync {
         let mut seq = base_seq;
         engine::apply(|| {
             vfs::insert(&path, bytes);
-            app.open_path(&path);
+            // The same design, caught up: reloaded in its own tab; a new tab only when it is no
+            // longer the active document (`open_path` always opens one).
+            if app.session.path.as_deref() == Some(path.as_str()) {
+                if let Err(e) = app.run("doc.open", serde_json::json!({ "path": path })) {
+                    log::warn!("live: reloading {name}: {e}");
+                }
+            } else {
+                app.open_path(&path);
+            }
             for e in &log {
                 seq = e["seq"].as_u64().unwrap_or(seq);
                 if e.get("saved").is_some() {

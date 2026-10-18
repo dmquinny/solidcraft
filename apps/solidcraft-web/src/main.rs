@@ -88,6 +88,10 @@ mod web {
             files::refresh_shared(files);
         }
         let shared = files.shared.borrow().clone();
+        // Designs saved again since their picture was made get a new one.
+        for key in files.repaint.borrow_mut().drain(..) {
+            app.home.forget(&key);
+        }
         ui.add_space(24.0);
         solidcraft_ui_egui::home::section(ui, "Shared with you");
         if shared.is_empty() {

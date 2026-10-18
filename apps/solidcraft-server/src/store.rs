@@ -267,6 +267,11 @@ impl Store {
     }
 
     /// The entries of a folder (hidden names left out), `None` when there is no such folder.
+    /// When a design (a clean relative path) was last written, if it is there.
+    pub fn modified(&self, path: &str) -> Option<std::time::SystemTime> {
+        std::fs::metadata(self.designs.join(path)).ok().filter(|m| m.is_file())?.modified().ok()
+    }
+
     pub fn list(&self, folder: &str) -> Result<Option<Vec<Entry>>, String> {
         let dir = self.disk(folder);
         let read = match std::fs::read_dir(&dir) {

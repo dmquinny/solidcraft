@@ -256,7 +256,11 @@ fn route(
             &Value::Array(
                 acl.shared_with(user)
                     .into_iter()
-                    .map(|(k, owner, edit)| json!({"path": k.trim_end_matches('/'), "folder": k.ends_with('/'), "owner": owner, "edit": edit}))
+                    .map(|(k, owner, edit)| {
+                        // When a design was last saved: the app fetches it again for its picture.
+                        let modified = (!k.ends_with('/')).then(|| store.modified(&k)).flatten().map(httpdate::fmt_http_date);
+                        json!({"path": k.trim_end_matches('/'), "folder": k.ends_with('/'), "owner": owner, "edit": edit, "modified": modified})
+                    })
                     .collect(),
             ),
         )),

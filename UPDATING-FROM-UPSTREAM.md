@@ -183,7 +183,9 @@ Reading a folder is never refused: its listing shows what the user may see (a de
 them from a folder that isn't), its `?log` likewise, `?shared` is their own; the listing says
 their level in `X-Folder-Access` (`edit`, `view`, `none`), which the menu explains. Writes to a
 folder that isn't theirs are still 403. The start page's "Shared with you" always shows with
-server storage (an empty state names the user) and asks again every half minute.
+server storage (an empty state names the user) and asks again every half minute; each shared
+design carries its `modified` time, and the app fetches the file again when that changes so the
+card's picture follows the design.
 
 ## Going back
 

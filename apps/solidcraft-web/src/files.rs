@@ -80,6 +80,8 @@ pub struct Shared {
     pub folder: bool,
     pub owner: String,
     pub edit: bool,
+    /// When the design was last saved (ms since 1970; 0 when the server doesn't say).
+    pub modified: f64,
 }
 
 /// One version of a server design.
@@ -138,6 +140,9 @@ pub struct Files {
     /// Who the storage service says we are (`?me`); None before it answered, and with plain
     /// nginx storage (no sign-in).
     pub me: RefCell<Option<Me>>,
+    /// Shared designs whose file here was just replaced by a newer one: the start page makes
+    /// their pictures again (`HomeState::forget`).
+    pub repaint: RefCell<Vec<String>>,
     /// What this user may do in the current server folder, as its listing said: "edit", "view",
     /// "none" (not shared with them: only designs shared with them are listed) or "" (unknown).
     pub folder_access: RefCell<String>,
@@ -265,6 +270,9 @@ thread_local! {
     /// The open design's name and fingerprint, sent with its next save so the other sessions
     /// can tell whether they agree with it.
     static FINGERPRINT: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+    /// When each shared design's file here was saved on the server (`Shared::modified`), by
+    /// path: a newer one is fetched again.
+    static SHARED_STAMPS: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
 }
 
 /// The log position a server design's bytes here correspond to (sync.rs).
@@ -405,21 +413,37 @@ fn remote_path_url(path: &str) -> String {
 
 /// Fetch the shared designs' files into the engine's files under `SHARED`, so the start page
 /// can show their pictures.
-fn fetch_shared_files(files: &Files, shared: &[Shared]) {
+fn fetch_shared_files(files: &Rc<Files>, shared: &[Shared]) {
     for s in shared.iter().filter(|s| !s.folder) {
         let key = format!("{SHARED}{}", s.path);
-        if vfs::exists(&key) {
+        let known = SHARED_STAMPS.with(|m| m.borrow().get(&s.path).copied());
+        if vfs::exists(&key) && known == Some(s.modified) {
             continue;
         }
-        let (ctx, path) = (files.ctx.borrow().clone(), s.path.clone());
+        // Claimed now, so a slow fetch isn't started again by the next refresh.
+        SHARED_STAMPS.with(|m| {
+            m.borrow_mut().insert(s.path.clone(), s.modified);
+        });
+        let (files, path, stamp) = (files.clone(), s.path.clone(), s.modified);
         spawn_local(async move {
             match remote_bytes(&remote_path_url(&path)).await {
-                Ok(bytes) => vfs::insert(&key, bytes),
-                Err(e) => log::warn!("{path}: {e}"),
+                Ok(bytes) => {
+                    let replaced = vfs::exists(&key);
+                    vfs::insert(&key, bytes);
+                    if replaced {
+                        files.repaint.borrow_mut().push(key);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("{path}: {e}");
+                    SHARED_STAMPS.with(|m| {
+                        if m.borrow().get(&path) == Some(&stamp) {
+                            m.borrow_mut().remove(&path);
+                        }
+                    });
+                }
             }
-            if let Some(c) = &ctx {
-                c.request_repaint();
-            }
+            files.wake();
         });
     }
 }
@@ -689,6 +713,7 @@ async fn remote_shared() -> Vec<Shared> {
                 folder: row.get("folder").is_some_and(|f| f == "true"),
                 owner: row.get("owner").cloned().unwrap_or_default(),
                 edit: row.get("edit").is_some_and(|e| e == "true"),
+                modified: date_of(row, "modified"),
             })
         })
         .collect()
@@ -756,7 +781,7 @@ async fn remote_list() -> Result<Option<Listing>, String> {
     // An older service has no `?me`: then the listing's name is all we know.
     listing.me = remote_me().await.or_else(|| {
         let name = remote_user();
-        (!name.is_empty()).then(|| Me { name, admin: false, logout: None })
+        (!name.is_empty()).then_some(Me { name, admin: false, logout: None })
     });
     if let Some(m) = &listing.me {
         REMOTE_USER.with(|u| *u.borrow_mut() = m.name.clone());
@@ -1192,7 +1217,7 @@ pub fn start(files: &Rc<Files>) {
 }
 
 /// The loaded files go into the engine's files and the panel's entries; the app may open them.
-fn install(files: &Files, loaded: Result<Loaded, String>) {
+fn install(files: &Rc<Files>, loaded: Result<Loaded, String>) {
     match loaded {
         Ok(Loaded { files: all, folders, changes, shared, me, access }) => {
             *files.me.borrow_mut() = me;
