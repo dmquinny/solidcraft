@@ -22,6 +22,7 @@ pub mod render_jobs;
 pub mod sample;
 mod slicer_icon;
 pub mod slicers;
+pub mod sync;
 pub mod timing;
 pub mod view;
 
@@ -262,6 +263,9 @@ pub struct Session {
     /// Record this session's top-level commands in the crash journal (the app's own design;
     /// never previews or other scratch sessions). See [`crash`].
     pub crash_journal: bool,
+    /// Hand this session's top-level commands to a host that shares them with other sessions
+    /// live (the design the host shows; never previews or scratch sessions). See [`sync`].
+    pub shared: bool,
     /// Full model evaluations (`refresh`), for tests.
     #[cfg(test)]
     pub(crate) evaluations: usize,
@@ -385,6 +389,7 @@ impl Session {
             #[cfg(test)]
             evaluations: 0,
             crash_journal: false,
+            shared: false,
         }
     }
 
@@ -720,6 +725,9 @@ impl Session {
             Ok((v, live_edit)) => {
                 let v = if changed { self.with_created(spec.id, params, &before, v) } else { v };
                 if changed {
+                    if outermost && self.shared && !sync::applying() {
+                        sync::record(spec.id, given, live.is_some());
+                    }
                     let render_only = self.render_only_change(&before);
                     let previous_doc = before.doc.clone();
                     if spec.undoable {
@@ -853,6 +861,7 @@ impl Session {
             #[cfg(test)]
             evaluations: 0,
             crash_journal: false,
+            shared: false,
         }
     }
 

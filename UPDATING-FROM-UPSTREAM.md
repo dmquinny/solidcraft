@@ -10,7 +10,9 @@ self-hosting patches on top of upstream `main`:
   (`apps/solidcraft-server`) answers `files/` instead of nginx: everyone signs in, every save is
   recorded with the user as author, the panel shows who changed what, each design's history,
   and can restore or copy an earlier version; a save over someone else's newer save is refused
-  once. Further stages (live sync of commands, component locks, branches) build on it.
+  once. Live collaboration: people with the same server design open see each other's edits as
+  they happen (the commands they run go through a log on the server, in one order for everyone).
+  Further stages (component locks, branches) build on it.
 
 ## What the patch changes
 
@@ -29,7 +31,10 @@ And on `collab`:
 | `packaging/docker/Dockerfile.server` | The service's image (Debian slim with git). |
 | `packaging/docker/nginx.conf` | `auth_basic` for the whole site against that users file; `/files/` proxied to `solidcraft-server:8782` with `X-Remote-User`; `/healthz` without sign-in for the health check. |
 | `apps/solidcraft-web/src/files.rs` | Saves carry the version they replace; a 412 is reported with the other person's name and the next save overwrites. The signed-in name, a folder's recent changes, a design's versions, restore and "copy a version" (`history`, `restore`, `copy_version`, `remote_user`, `ago`, `when`). |
-| `apps/solidcraft-web/src/main.rs` | The user in the panel's title, a History button per design, a "Recent changes" list, and the history window (`history_window`). |
+| `apps/solidcraft-web/src/main.rs` | The user in the panel's title, a History button per design, a "Recent changes" list, and the history window (`history_window`). The `Shell` drives `sync.rs` once a frame and shows "Also here: …" while others have the design open. |
+| `crates/engine/src/sync.rs` (new), `crates/engine/src/lib.rs` | The one change below the apps: a `shared` flag on `Session`, and three lines in `Session::execute` that record each outermost command that changed the design of a shared session (`sync::record`), unless it is being applied on another session's behalf (`sync::apply`). `sync::fingerprint` digests a document. `doc.*`, `file.*` and the checkpoint commands are never shared. |
+| `apps/solidcraft-server/src/ops.rs` | One log per design (`<history>/ops/<design>.jsonl`): the commands clients ran, and a marker for every saved version (etag, commit, the saver's fingerprint). `POST ?ops` appends; `GET ?ops&since=N&wait=S&client=C` answers what came after N, waiting up to S seconds, with who else is polling. A design's `GET`/`PUT` carry `X-Ops-Seq` / `X-Ops-Commit`, the marker its bytes correspond to. |
+| `apps/solidcraft-web/src/sync.rs` (new) | The client side: the open server design is marked `shared`; commands run here are batched and posted; others' commands come back through a long poll and are applied with `sync::apply`; the client's own entries are skipped by its id. A command that fails to apply, or a fingerprint that disagrees with the one another session reported (after its command, or with its save), makes the session start afresh: load the design's last saved version and replay the log after it. Status messages say who joined, who left and when a catch-up happened. |
 
 Outside the repo, `W:\docker-compose.yml` runs two services: `solidcraft` (nginx, the site) and
 `solidcraft-server` (the storage service). The designs folder `/mnt/Apps/Backup/Maker/SolidCraft`
@@ -40,6 +45,13 @@ designs in the designs folder: everything in it is listed in the app and read at
 Subfolders (made from the file panel's folder field, or by hand) are listed as folders, each with
 its own designs. Hidden names (starting with a dot, such as Syncthing's markers) are ignored and
 never committed.
+
+How the live sync behaves, in short: edits to different features, sketches or components merge
+on their own; two people editing the very same thing at the same moment means one of them gets
+a refused command (its status line says so) and their session catches up with the server's
+order. Every save is a checkpoint: a session that disagrees with a save reloads from it. Undo
+and redo are shared like any other command. The log is per design and per browser tab; a design
+that never came from the server (new, unsaved) is shared once it is saved there.
 
 Users: in the TrueNAS root shell, `cd /mnt/Apps/Apps && docker compose exec -it solidcraft-server
 solidcraft-server user add NAME` (it asks for the password twice); `user list` and `user remove NAME`
@@ -66,8 +78,11 @@ marked "self-hosting patch" (the module-doc paragraph, the `REMOTE` block after 
 through `remote_remove`, the two `if remote_only() && !stays_local(name)` guards, `read_all` /
 `read_remote` / `read_browser`, and `start` / `install` / `set_remote_folder`). If `main.rs`
 conflicts, keep upstream's version and re-apply the `remote` lines in `file_panel` (the title,
-the `if remote` folder row, the two `if remote` labels, the `"folder"` action) and the `folder`
-field of `Shell`. Then:
+the `if remote` folder row, the two `if remote` labels, the `"folder"` and `"history"` actions),
+`history_window`, and the `folder` and `sync` fields of `Shell` with the two `sync` lines in
+`update`. If `crates/engine/src/lib.rs` conflicts, keep upstream's version and re-add `pub mod
+sync;`, the `shared` field (its two `shared: false` initialisers) and the three `sync::record`
+lines in `execute`. Then:
 
 ```bash
 git add -A

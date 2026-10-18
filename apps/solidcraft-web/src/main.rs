@@ -14,6 +14,8 @@ mod files;
 mod install;
 #[cfg(any(target_arch = "wasm32", test))]
 mod space_mouse;
+#[cfg(target_arch = "wasm32")]
+mod sync;
 
 #[cfg(target_arch = "wasm32")]
 mod web {
@@ -98,6 +100,8 @@ mod web {
         rename_focus: bool,
         /// The file panel's folder field (server storage, files.rs).
         folder: String,
+        /// Live collaboration on the open server design (sync.rs).
+        sync: Rc<crate::sync::Sync>,
         /// The start page's recent designs were filled from the stored ones.
         recents_synced: bool,
         /// On-demand CJK font: fetched only when a CJK language is selected.
@@ -531,9 +535,16 @@ mod web {
         }
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             self.app.ui(ui);
+            self.sync.tick(&mut self.app, &self.files);
             let ctx = ui.ctx().clone();
             self.file_panel(&ctx);
             self.history_window(&ctx);
+            let others = self.sync.others();
+            if !others.is_empty() {
+                egui::Area::new(egui::Id::new("live_presence")).anchor(egui::Align2::RIGHT_TOP, [-16.0, 44.0]).interactable(false).show(&ctx, |ui| {
+                    ui.label(format!("Also here: {}", others.join(", ")));
+                });
+            }
             self.recovery_prompt(&ctx);
             self.watch_text_for_font(&ctx);
         }
@@ -660,6 +671,7 @@ mod web {
                             renaming: None,
                             rename_focus: false,
                             folder: files::remote_folder(),
+                            sync: crate::sync::Sync::new(),
                             recents_synced: false,
                             font: Default::default(),
                             font_result: Rc::new(std::cell::RefCell::new(None)),

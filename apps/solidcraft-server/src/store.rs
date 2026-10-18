@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+use crate::ops::Ops;
+
 /// Longest path (segments joined) and deepest folder the service accepts.
 const MAX_PATH: usize = 400;
 const MAX_DEPTH: usize = 8;
@@ -25,6 +27,8 @@ pub struct Store {
     /// One git operation at a time (the index is shared).
     lock: Mutex<()>,
     last_sweep: Mutex<Option<Instant>>,
+    /// The live-collaboration logs: every new version of a design is a marker in its log.
+    ops: Ops,
 }
 
 /// One entry of a folder listing.
@@ -41,6 +45,8 @@ pub struct Meta {
     pub etag: String,
     pub author: String,
     pub date: String,
+    /// Where in the design's command log this version stands: (position, commit).
+    pub base: Option<(u64, String)>,
 }
 
 /// One version of a design.
@@ -62,9 +68,9 @@ pub struct Change {
 }
 
 pub enum Written {
-    Created(String),
-    Updated(String),
-    Unchanged(String),
+    Created(Meta),
+    Updated(Meta),
+    Unchanged(Meta),
     /// Someone else saved since the version the client had: who and when.
     Stale(Meta),
 }
@@ -107,7 +113,13 @@ impl Store {
     pub fn open(designs: &Path, history: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(designs).map_err(|e| io(designs, e))?;
         std::fs::create_dir_all(history).map_err(|e| io(history, e))?;
-        let store = Self { designs: designs.to_path_buf(), git_dir: history.join("designs.git"), lock: Mutex::new(()), last_sweep: Mutex::new(None) };
+        let store = Self {
+            designs: designs.to_path_buf(),
+            git_dir: history.join("designs.git"),
+            lock: Mutex::new(()),
+            last_sweep: Mutex::new(None),
+            ops: Ops::open(&history.join("ops"))?,
+        };
         if !store.git_dir.join("HEAD").is_file() {
             log::info!("making the history repository at {}", store.git_dir.display());
             store.git(&["init", "--initial-branch=main"])?;
@@ -145,17 +157,40 @@ impl Store {
         }
     }
 
-    fn commit(&self, user: &str, message: &str, paths: &[&str]) -> Result<bool, String> {
+    /// Commit `paths` as `user`: the new commit's hash, or `None` when nothing changed.
+    fn commit(&self, user: &str, message: &str, paths: &[&str]) -> Result<Option<String>, String> {
         let mut add = vec!["add", "-A", "--"];
         add.extend(paths);
         self.git(&add)?;
         let staged = self.git(&["diff", "--cached", "--quiet"]).is_err();
         if !staged {
-            return Ok(false);
+            return Ok(None);
         }
         let author = format!("{user} <{user}@solidcraft.local>");
         self.git(&["commit", "--quiet", "--no-verify", "--author", &author, "-m", message])?;
-        Ok(true)
+        Ok(Some(self.head()))
+    }
+
+    /// The latest commit ("" in an empty repository).
+    fn head(&self) -> String {
+        self.git(&["rev-parse", "HEAD"]).map(|h| h.trim().to_string()).unwrap_or_default()
+    }
+
+    /// The live-collaboration logs.
+    pub fn ops(&self) -> &Ops {
+        &self.ops
+    }
+
+    /// Mark the design's current bytes in its command log (unless its latest marker is this
+    /// version already): what clients loading it now start from.
+    fn mark(&self, path: &str, bytes: &[u8], commit: &str, user: &str, fingerprint: Option<&str>) -> (u64, String) {
+        let tag = etag(bytes);
+        if let Some((seq, latest, c)) = self.ops.base(path)
+            && latest == tag
+        {
+            return (seq, c);
+        }
+        (self.ops.saved(path, &tag, commit, user, fingerprint), commit.to_string())
     }
 
     /// Commit whatever changed outside the app (at most every few seconds unless forced).
@@ -173,8 +208,17 @@ impl Store {
             Ok(status) => {
                 let n = status.lines().count();
                 match self.commit(DISK, &format!("{n} change(s) outside the app"), &["."]) {
-                    Ok(true) => log::info!("history: {n} change(s) made outside the app recorded"),
-                    Ok(false) => {}
+                    Ok(Some(commit)) => {
+                        log::info!("history: {n} change(s) made outside the app recorded");
+                        // Each changed design gets a marker, so clients see the new version.
+                        for line in status.lines() {
+                            let path = line.get(3..).unwrap_or("").trim().trim_matches('"');
+                            if let Ok(bytes) = std::fs::read(self.disk(path)) {
+                                self.mark(path, &bytes, &commit, DISK, None);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
                     Err(e) => log::warn!("history: {e}"),
                 }
             }
@@ -222,6 +266,11 @@ impl Store {
         };
         let mut meta = self.last_change(path).unwrap_or_default();
         meta.etag = etag(&bytes);
+        // A design that predates the log (or changed on disk a moment ago) gets its marker now.
+        if self.ops.base(path).is_none_or(|(_, latest, _)| latest != meta.etag) {
+            self.sweep(true);
+        }
+        meta.base = Some(self.mark(path, &bytes, &self.head(), DISK, None));
         Ok(Some((bytes, meta)))
     }
 
@@ -229,12 +278,20 @@ impl Store {
     fn last_change(&self, path: &str) -> Option<Meta> {
         let out = self.git(&["log", "-1", "--format=%an%x1f%aI", "--", path]).ok()?;
         let (author, date) = out.trim().split_once('\x1f')?;
-        Some(Meta { etag: String::new(), author: author.to_string(), date: date.to_string() })
+        Some(Meta { etag: String::new(), author: author.to_string(), date: date.to_string(), base: None })
     }
 
     /// Write a design (folders made as needed). With `if_match`, only when the current version
     /// is still the one the client saw; with `only_new`, only when there is no such design yet.
-    pub fn write(&self, path: &str, bytes: &[u8], user: &str, if_match: Option<&str>, only_new: bool) -> Result<Written, String> {
+    pub fn write(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        user: &str,
+        if_match: Option<&str>,
+        only_new: bool,
+        fingerprint: Option<&str>,
+    ) -> Result<Written, String> {
         let _guard = self.lock.lock().map_err(|_| "the store is poisoned".to_string())?;
         let file = self.disk(path);
         let existing = match std::fs::read(&file) {
@@ -255,9 +312,10 @@ impl Store {
                 return Ok(Written::Stale(meta));
             }
         }
-        let tag = etag(bytes);
+        let meta = |tag: String, base: (u64, String)| Meta { etag: tag, base: Some(base), ..Default::default() };
         if existing.as_deref() == Some(bytes) {
-            return Ok(Written::Unchanged(tag));
+            let base = self.mark(path, bytes, &self.head(), user, fingerprint);
+            return Ok(Written::Unchanged(meta(etag(bytes), base)));
         }
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
@@ -265,8 +323,9 @@ impl Store {
         let tmp = file.with_extension("part");
         std::fs::write(&tmp, bytes).map_err(|e| io(&tmp, e))?;
         std::fs::rename(&tmp, &file).map_err(|e| io(&file, e))?;
-        self.commit(user, &format!("saved {path}"), &[path])?;
-        Ok(if existing.is_some() { Written::Updated(tag) } else { Written::Created(tag) })
+        let commit = self.commit(user, &format!("saved {path}"), &[path])?.unwrap_or_else(|| self.head());
+        let base = self.mark(path, bytes, &commit, user, fingerprint);
+        Ok(if existing.is_some() { Written::Updated(meta(etag(bytes), base)) } else { Written::Created(meta(etag(bytes), base)) })
     }
 
     /// Remove a design (`false` when there was none).
@@ -310,7 +369,7 @@ impl Store {
     }
 
     /// Make a version the current one again: a new commit, nothing rewritten.
-    pub fn restore(&self, path: &str, hash: &str, user: &str) -> Result<Option<String>, String> {
+    pub fn restore(&self, path: &str, hash: &str, user: &str) -> Result<Option<Meta>, String> {
         let Some(bytes) = self.version(path, hash)? else { return Ok(None) };
         let short: String = hash.chars().take(8).collect();
         let _guard = self.lock.lock().map_err(|_| "the store is poisoned".to_string())?;
@@ -321,8 +380,9 @@ impl Store {
         let tmp = file.with_extension("part");
         std::fs::write(&tmp, &bytes).map_err(|e| io(&tmp, e))?;
         std::fs::rename(&tmp, &file).map_err(|e| io(&file, e))?;
-        self.commit(user, &format!("restored {path} to {short}"), &[path])?;
-        Ok(Some(etag(&bytes)))
+        let commit = self.commit(user, &format!("restored {path} to {short}"), &[path])?.unwrap_or_else(|| self.head());
+        let base = self.mark(path, &bytes, &commit, user, None);
+        Ok(Some(Meta { etag: etag(&bytes), base: Some(base), ..Default::default() }))
     }
 
     /// The last `n` changes under a folder: one line per file touched.

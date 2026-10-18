@@ -107,7 +107,7 @@ pub struct Files {
 }
 
 impl Files {
-    fn say(&self, text: impl Into<String>, error: bool) {
+    pub(crate) fn say(&self, text: impl Into<String>, error: bool) {
         self.messages.borrow_mut().push((text.into(), error));
         self.wake();
     }
@@ -119,7 +119,7 @@ impl Files {
     }
 
     /// Run a frame (the app sleeps until something happens).
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         if let Some(c) = self.ctx.borrow().as_ref() {
             c.request_repaint();
         }
@@ -190,6 +190,30 @@ thread_local! {
     /// `If-Match` on a save; `None` means the next save overwrites whatever is there (the server
     /// gave no ETag, or refused a save once); a name not here is saved as a new design only.
     static ETAGS: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
+    /// Where in a design's server log the bytes here stand (the version loaded or saved), by
+    /// name: (position, commit). Live collaboration (sync.rs) starts from there.
+    static BASES: RefCell<HashMap<String, (u64, String)>> = RefCell::new(HashMap::new());
+    /// The open design's name and fingerprint, sent with its next save so the other sessions
+    /// can tell whether they agree with it.
+    static FINGERPRINT: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+}
+
+/// The log position a server design's bytes here correspond to (sync.rs).
+pub fn base_of(name: &str) -> Option<(u64, String)> {
+    BASES.with(|b| b.borrow().get(name).cloned())
+}
+
+/// The server holds this version of the design now (its log said so): a save from here replaces
+/// it instead of being refused.
+pub fn note_version(name: &str, etag: &str) {
+    ETAGS.with(|e| {
+        e.borrow_mut().insert(name.to_string(), Some(etag.to_string()));
+    });
+}
+
+/// The fingerprint of the design `name` holds here, to go with its next save.
+pub fn set_fingerprint(name: &str, fingerprint: &str) {
+    FINGERPRINT.with(|f| *f.borrow_mut() = Some((name.to_string(), fingerprint.to_string())));
 }
 
 /// The signed-in user (empty when the server doesn't say).
@@ -265,8 +289,39 @@ fn remote_dir() -> String {
     format!("{REMOTE_DIR}{}/", path.join("/"))
 }
 
-fn remote_url(name: &str) -> String {
+pub(crate) fn remote_url(name: &str) -> String {
     format!("{}{}", remote_dir(), String::from(js_sys::encode_uri_component(name)))
+}
+
+/// A JSON answer from the server (any status but 2xx is an error).
+pub(crate) async fn remote_json(method: &str, url: &str, body: Option<&[u8]>) -> Result<serde_json::Value, String> {
+    let headers: &[(&str, &str)] = if body.is_some() { &[("Content-Type", "application/json")] } else { &[] };
+    let r = remote_request(method, url, body, headers).await?;
+    if !r.ok() {
+        return Err(format!("HTTP {}", r.status()));
+    }
+    let text = JsFuture::from(r.text().map_err(err)?).await.map_err(err)?.as_string().unwrap_or_default();
+    serde_json::from_str(&text).map_err(|e| format!("not JSON: {e}"))
+}
+
+/// Bytes from the server (any status but 2xx is an error).
+pub(crate) async fn remote_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let r = remote_request("GET", url, None, &[]).await?;
+    if !r.ok() {
+        return Err(format!("HTTP {}", r.status()));
+    }
+    let buf = JsFuture::from(r.array_buffer().map_err(err)?).await.map_err(err)?;
+    Ok(Uint8Array::new(&buf).to_vec())
+}
+
+/// Wait `ms` (the browser's timer).
+pub(crate) async fn sleep(ms: i32) {
+    let p = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(w) = web_sys::window() {
+            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = JsFuture::from(p).await;
 }
 
 /// One request to the server's design folder: the response, whatever its status.
@@ -382,12 +437,19 @@ async fn remote_list() -> Result<Option<Listing>, String> {
     Ok(Some(listing))
 }
 
-/// Keep the version a response says a design is at.
+/// Keep the version a response says a design is at, and where in its log that version stands.
 fn remember_etag(name: &str, r: &web_sys::Response) {
     let tag = r.headers().get("etag").ok().flatten().map(|t| t.trim().trim_start_matches("W/").trim_matches('"').to_string());
     ETAGS.with(|e| {
         e.borrow_mut().insert(name.to_string(), tag);
     });
+    let seq = r.headers().get("x-ops-seq").ok().flatten().and_then(|s| s.parse::<u64>().ok());
+    let commit = r.headers().get("x-ops-commit").ok().flatten().unwrap_or_default();
+    if let Some(seq) = seq {
+        BASES.with(|b| {
+            b.borrow_mut().insert(name.to_string(), (seq, commit));
+        });
+    }
 }
 
 /// A design's versions, newest first.
@@ -430,7 +492,13 @@ async fn remote_write(name: &str, bytes: &[u8]) -> Result<(), String> {
         Some(None) => None,
         None => Some(("If-None-Match", "*".to_string())),
     };
-    let headers: Vec<(&str, &str)> = precondition.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut extra: Vec<(&str, String)> = precondition.into_iter().collect();
+    if let Some((n, fp)) = FINGERPRINT.with(|f| f.borrow().clone())
+        && n == name
+    {
+        extra.push(("X-Fingerprint", fp));
+    }
+    let headers: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let r = remote_request("PUT", &remote_url(name), Some(bytes), &headers).await?;
     if r.ok() {
         remember_etag(name, &r);
@@ -810,6 +878,9 @@ pub fn set_remote_folder(files: &Rc<Files>, folder: &str) -> Result<(), String> 
     files.folders.borrow_mut().clear();
     files.changes.borrow_mut().clear();
     *files.history.borrow_mut() = None;
+    // Names mean other files in another folder.
+    ETAGS.with(|e| e.borrow_mut().clear());
+    BASES.with(|b| b.borrow_mut().clear());
     files.ready.set(false);
     let files = files.clone();
     spawn_local(async move {

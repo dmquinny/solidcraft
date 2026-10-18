@@ -20,6 +20,11 @@
 //!   412 when the design exists already.
 //! - `DELETE /files/<path>` → 204 (404 when absent).
 //! - `POST /files/<path>?restore=<hash>` → that version becomes the current one (a new commit).
+//! - Live collaboration (see `ops`): `POST /files/<path>?ops` appends the commands a client ran
+//!   (`{"client", "ops": [{"id", "params", "live", "after"}]}`); `GET /files/<path>?ops&since=N
+//!   [&wait=S&client=C]` answers the entries after N (waiting up to S seconds for some), the
+//!   latest saved marker and who else is there. A design's `GET` carries `X-Ops-Seq` and
+//!   `X-Ops-Commit`: the marker its bytes correspond to.
 //! - `GET /healthz` → 200.
 //!
 //! Command line: `solidcraft-server` serves; `solidcraft-server user add|remove|list [NAME]`
@@ -30,6 +35,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod http;
+mod ops;
 mod store;
 mod users;
 

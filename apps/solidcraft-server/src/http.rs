@@ -35,9 +35,10 @@ fn handle(store: &Store, mut request: Request) {
     let user = header(&request, USER_HEADER).filter(|u| !u.is_empty()).unwrap_or_else(|| ANONYMOUS.to_string());
     let if_match = header(&request, "If-Match").map(|v| v.trim().trim_start_matches("W/").trim_matches('"').to_string());
     let only_new = header(&request, "If-None-Match").is_some_and(|v| v.trim() == "*");
-    let body = if method == Method::Put { read_body(&mut request) } else { Ok(Vec::new()) };
+    let fingerprint = header(&request, "X-Fingerprint").filter(|f| !f.is_empty() && f.len() <= 64);
+    let body = if matches!(method, Method::Put | Method::Post) { read_body(&mut request) } else { Ok(Vec::new()) };
     let reply = match body {
-        Ok(body) => route(store, &method, &url, &user, if_match.as_deref(), only_new, body),
+        Ok(body) => route(store, &method, &url, &user, if_match.as_deref(), only_new, fingerprint.as_deref(), body),
         Err(e) => Reply::text(413, &e),
     };
     log::info!("{user} {method} {url} -> {}", reply.status);
@@ -105,6 +106,9 @@ impl Reply {
         if !meta.author.is_empty() {
             r = r.with("X-Author", &meta.author).with("X-Author-Date", &meta.date);
         }
+        if let Some((seq, commit)) = &meta.base {
+            r = r.with("X-Ops-Seq", &seq.to_string()).with("X-Ops-Commit", commit);
+        }
         r
     }
 }
@@ -124,7 +128,17 @@ fn split_url(url: &str) -> (String, Vec<(String, String)>) {
     (decode(path), query)
 }
 
-fn route(store: &Store, method: &Method, url: &str, user: &str, if_match: Option<&str>, only_new: bool, body: Vec<u8>) -> Reply {
+#[allow(clippy::too_many_arguments)]
+fn route(
+    store: &Store,
+    method: &Method,
+    url: &str,
+    user: &str,
+    if_match: Option<&str>,
+    only_new: bool,
+    fingerprint: Option<&str>,
+    body: Vec<u8>,
+) -> Reply {
     let (path, query) = split_url(url);
     let get = |k: &str| query.iter().find(|(q, _)| q == k).map(|(_, v)| v.as_str());
     if path == "/healthz" {
@@ -147,6 +161,20 @@ fn route(store: &Store, method: &Method, url: &str, user: &str, if_match: Option
             Some(entries) => Reply::json(200, &listing_json(&entries)).with(USER_HEADER, user),
             None => Reply::text(404, "no such folder"),
         }),
+        (Method::Get, false) if get("ops").is_some() => {
+            let since = get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let wait = std::time::Duration::from_secs(get("wait").and_then(|s| s.parse().ok()).unwrap_or(0));
+            let client = get("client").filter(|c| !c.is_empty()).map(|c| (c, user));
+            Ok(Reply::json(200, &store.ops().since(&clean, since, wait, client)))
+        }
+        (Method::Post, false) if get("ops").is_some() => match serde_json::from_slice::<Value>(&body) {
+            Ok(v) => {
+                let client = v.get("client").and_then(Value::as_str).unwrap_or("");
+                let ops = v.get("ops").and_then(Value::as_array).cloned().unwrap_or_default();
+                store.ops().append(&clean, user, client, &ops).map(|seq| Reply::json(200, &json!({"seq": seq})))
+            }
+            Err(e) => Ok(Reply::text(400, &format!("not a command list: {e}"))),
+        },
         (Method::Get, false) if get("history").is_some() => store.history(&clean).map(|v| Reply::json(200, &versions_json(&v))),
         (Method::Get, false) if get("at").is_some() => store.version(&clean, get("at").unwrap_or("")).map(|b| match b {
             Some(bytes) => Reply::bytes(bytes),
@@ -157,14 +185,14 @@ fn route(store: &Store, method: &Method, url: &str, user: &str, if_match: Option
             None => Reply::text(404, "no such design"),
         }),
         (Method::Put, false) if clean.is_empty() => Ok(Reply::text(400, "a design needs a name")),
-        (Method::Put, false) => store.write(&clean, &body, user, if_match, only_new).map(|w| match w {
-            Written::Created(tag) => Reply::new(201).with_meta(&Meta { etag: tag, ..Default::default() }),
-            Written::Updated(tag) | Written::Unchanged(tag) => Reply::new(204).with_meta(&Meta { etag: tag, ..Default::default() }),
+        (Method::Put, false) => store.write(&clean, &body, user, if_match, only_new, fingerprint).map(|w| match w {
+            Written::Created(meta) => Reply::new(201).with_meta(&meta),
+            Written::Updated(meta) | Written::Unchanged(meta) => Reply::new(204).with_meta(&meta),
             Written::Stale(meta) => Reply::json(412, &json!({"author": meta.author, "date": meta.date})).with_meta(&meta),
         }),
         (Method::Delete, false) => store.delete(&clean, user).map(|gone| if gone { Reply::new(204) } else { Reply::text(404, "no such design") }),
         (Method::Post, false) if get("restore").is_some() => store.restore(&clean, get("restore").unwrap_or(""), user).map(|r| match r {
-            Some(tag) => Reply::new(200).with_meta(&Meta { etag: tag, ..Default::default() }),
+            Some(meta) => Reply::new(200).with_meta(&meta),
             None => Reply::text(404, "no such version of that design"),
         }),
         (Method::Put | Method::Delete | Method::Post, true) => Ok(Reply::text(405, "folders are made by saving into them")),
