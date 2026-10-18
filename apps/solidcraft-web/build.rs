@@ -8,7 +8,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SOLIDCRAFT_BUILD");
     let git = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.git");
     println!("cargo:rerun-if-changed={}", git.join("HEAD").display());
-    let build = std::env::var("SOLIDCRAFT_BUILD").ok().filter(|b| !b.trim().is_empty()).or_else(|| commit(&git)).unwrap_or_else(|| "dev".to_string());
+    let build = std::env::var("SOLIDCRAFT_BUILD").ok().filter(|b| !b.trim().is_empty()).or_else(|| commit(&git)).unwrap_or_else(|| {
+        let head = std::fs::read_to_string(git.join("HEAD")).map(|h| h.trim().to_string());
+        println!("cargo:warning=SOLIDCRAFT_BUILD: no commit found through {} (HEAD: {head:?}); the build id is \"dev\"", git.display());
+        "dev".to_string()
+    });
     println!("cargo:rustc-env=SOLIDCRAFT_BUILD={build}");
 }
 

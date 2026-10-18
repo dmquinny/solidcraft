@@ -663,11 +663,13 @@ async fn remote_me() -> Option<Me> {
     }
     let text = JsFuture::from(r.text().ok()?).await.ok()?.as_string()?;
     let v: Value = serde_json::from_str(&text).ok()?;
+    // An older service answers the folder listing (an array) to any query it doesn't know.
+    let name = v.as_object().and_then(|o| o.get("name")).and_then(Value::as_str).filter(|n| !n.is_empty())?;
     if v["anonymous"].as_bool().unwrap_or(false) {
         return None;
     }
     Some(Me {
-        name: v["name"].as_str().unwrap_or_default().to_string(),
+        name: name.to_string(),
         admin: v["admin"].as_bool().unwrap_or(false),
         logout: v["logout"].as_str().filter(|u| u.starts_with('/') || u.starts_with("https://")).map(str::to_string),
     })
@@ -751,7 +753,11 @@ async fn remote_list() -> Result<Option<Listing>, String> {
     listing.folders.sort_by_key(|f| f.to_lowercase());
     listing.changes = remote_log(&dir).await;
     listing.shared = remote_shared().await;
-    listing.me = remote_me().await;
+    // An older service has no `?me`: then the listing's name is all we know.
+    listing.me = remote_me().await.or_else(|| {
+        let name = remote_user();
+        (!name.is_empty()).then(|| Me { name, admin: false, logout: None })
+    });
     if let Some(m) = &listing.me {
         REMOTE_USER.with(|u| *u.borrow_mut() = m.name.clone());
     }
