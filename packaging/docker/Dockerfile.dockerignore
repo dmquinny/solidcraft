@@ -1,6 +1,10 @@
 # Build context for packaging/docker/Dockerfile (the repository root): the sources the web build
-# needs, without build output, git history or local files.
+# needs, without build output, git history or local files. The few small files that say which
+# commit this is stay in, for the build id (apps/solidcraft-web/build.rs).
 .git
+!.git/HEAD
+!.git/packed-refs
+!.git/refs/heads
 **/target*
 dist
 plan
