@@ -9,6 +9,10 @@
 //! `shared` every frame, and commands applied on others' behalf run under `apply` so they are
 //! not sent back. Only a design that came from the server (or was saved there) is shared: the
 //! position in its log that its bytes correspond to came with them (files.rs keeps it).
+//!
+//! Locks: a user can hold a component (or the whole design); the engine refuses changes to what
+//! someone else holds, with the holder's name, and the server refuses them too should the two
+//! disagree. The holder's polls renew the lock; it lapses a couple of minutes after they stop.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -45,7 +49,7 @@ struct Shared {
 #[derive(Default)]
 pub struct Sync {
     shared: RefCell<Option<Shared>>,
-    /// Commands run here, not sent yet (`{id, params, live, after}`).
+    /// Commands run here, not sent yet (`{id, params, live, after, components}`).
     pending: RefCell<Vec<Value>>,
     sending: Cell<bool>,
     last_send: Cell<f64>,
@@ -58,6 +62,8 @@ pub struct Sync {
     fetching_fresh: Cell<bool>,
     /// Who has this design open, as the server sees it (including us).
     pub present: RefCell<Vec<String>>,
+    /// Who holds which component (0 = the whole design), as the server last said.
+    locks: RefCell<Vec<(u64, String)>>,
     /// The design's fingerprint, by the document it was taken from (serialising is not free).
     fingerprint: RefCell<Option<(usize, String)>>,
     /// This browser's id in the log: its own entries come back and are skipped.
@@ -70,10 +76,20 @@ impl Sync {
         Rc::new(Self { client, ..Default::default() })
     }
 
+    /// Is the open design shared?
+    pub fn is_shared(&self) -> bool {
+        self.shared.borrow().is_some()
+    }
+
     /// Who else is here.
     pub fn others(&self) -> Vec<String> {
         let me = files::remote_user();
         self.present.borrow().iter().filter(|u| **u != me).cloned().collect()
+    }
+
+    /// Who holds which component (0 = the whole design).
+    pub fn locks(&self) -> Vec<(u64, String)> {
+        self.locks.borrow().clone()
     }
 
     fn fingerprint_of(&self, app: &SolveApp) -> String {
@@ -88,6 +104,12 @@ impl Sync {
         fp
     }
 
+    fn take_locks(&self, v: &Value) {
+        if let Some(locks) = v.get("locks").and_then(Value::as_array) {
+            *self.locks.borrow_mut() = locks.iter().filter_map(|l| Some((l["component"].as_u64()?, l["user"].as_str()?.to_string()))).collect();
+        }
+    }
+
     /// Once a frame, after the app ran its commands: share the open server design, send what ran
     /// here, apply what came in.
     pub fn tick(self: &Rc<Self>, app: &mut SolveApp, files: &Rc<Files>) {
@@ -96,6 +118,7 @@ impl Sync {
         self.finish_fresh(app, files);
         let shared = self.shared.borrow().is_some();
         app.session.shared = shared;
+        engine::set_locks(if shared { self.locks.borrow().clone() } else { Vec::new() }, &files::remote_user());
         let ran = engine::take_executed();
         if !shared {
             return;
@@ -112,7 +135,8 @@ impl Sync {
                 if e.live && pending.last().is_some_and(|p| p["live"] == true && p["id"] == e.id) {
                     pending.pop();
                 }
-                pending.push(json!({"id": e.id, "params": e.params, "live": e.live, "after": if i == last { Value::from(after.clone()) } else { Value::Null }}));
+                let after = if i == last { Value::from(after.clone()) } else { Value::Null };
+                pending.push(json!({"id": e.id, "params": e.params, "live": e.live, "after": after, "components": e.components}));
             }
         }
         self.send(files);
@@ -131,6 +155,7 @@ impl Sync {
         self.incoming.borrow_mut().clear();
         *self.fresh.borrow_mut() = None;
         self.present.borrow_mut().clear();
+        self.locks.borrow_mut().clear();
         *self.shared.borrow_mut() = None;
         let Some(name) = name else { return };
         // A design that never came from the server (new, unsaved) is shared once it is saved.
@@ -140,17 +165,18 @@ impl Sync {
         self.poll(name.to_string(), generation, files.clone());
     }
 
+    fn current(&self, generation: u64) -> bool {
+        self.shared.borrow().as_ref().is_some_and(|s| s.generation == generation)
+    }
+
     fn poll(self: &Rc<Self>, name: String, generation: u64, files: Rc<Files>) {
         let me = self.clone();
         spawn_local(async move {
-            loop {
-                if me.shared.borrow().as_ref().is_none_or(|s| s.generation != generation) {
-                    return;
-                }
+            while me.current(generation) {
                 let url = format!("{}?ops&since={}&wait={POLL_WAIT_S}&client={}", files::remote_url(&name), me.received.get(), me.client);
                 match files::remote_json("GET", &url, None).await {
                     Ok(v) => {
-                        if me.shared.borrow().as_ref().is_none_or(|s| s.generation != generation) {
+                        if !me.current(generation) {
                             return;
                         }
                         if let Some(seq) = v["seq"].as_u64() {
@@ -163,6 +189,7 @@ impl Sync {
                             v["present"].as_array().map(|p| p.iter().filter_map(|u| u.as_str().map(str::to_string)).collect()).unwrap_or_default();
                         me.arrivals(&present, &files);
                         *me.present.borrow_mut() = present;
+                        me.take_locks(&v);
                         files.wake();
                     }
                     Err(e) => {
@@ -209,10 +236,20 @@ impl Sync {
                         s.seq = s.seq.max(seq);
                     }
                 }
+                // The server knows of a lock this session did not: the change is undone by a
+                // fresh start from the server's state.
+                Err(e) if e.contains("409") => {
+                    files.say("That change touched a component someone else holds; catching up with the server…", true);
+                    if let Some(s) = me.shared.borrow_mut().as_mut()
+                        && s.generation == generation
+                    {
+                        s.stale = true;
+                    }
+                }
                 Err(e) => {
                     // Kept for the next try, ahead of anything run since.
                     files.say(format!("live: {e}"), true);
-                    if me.shared.borrow().as_ref().is_some_and(|s| s.generation == generation) {
+                    if me.current(generation) {
                         let mut pending = me.pending.borrow_mut();
                         let later = std::mem::take(&mut *pending);
                         pending.extend(batch);
@@ -220,6 +257,22 @@ impl Sync {
                     }
                     me.last_send.set(js_sys::Date::now() + f64::from(RETRY_MS));
                 }
+            }
+            files.wake();
+        });
+    }
+
+    /// Hold (or let go of) a component for this user; the server answers with the design's locks.
+    pub fn lock(self: &Rc<Self>, files: &Rc<Files>, component: u64, take: bool) {
+        let Some(name) = self.shared.borrow().as_ref().map(|s| s.name.clone()) else { return };
+        let (me, files) = (self.clone(), files.clone());
+        spawn_local(async move {
+            let what = if take { "lock" } else { "unlock" };
+            let url = format!("{}?{what}={component}&client={}", files::remote_url(&name), me.client);
+            match files::remote_json("POST", &url, Some(b"{}")).await {
+                Ok(v) => me.take_locks(&v),
+                Err(e) if e.contains("409") => files.say("Someone else holds that already", true),
+                Err(e) => files.say(format!("live: {e}"), true),
             }
             files.wake();
         });
@@ -250,7 +303,6 @@ impl Sync {
                 // Someone's save is a checkpoint: a session that disagrees with it starts afresh.
                 if let Some(fp) = saved["fp"].as_str()
                     && quiet
-                    && e["client"].as_str() != Some(&self.client)
                     && e["user"].as_str() != Some(&files::remote_user())
                     && fp != self.fingerprint_of(app)
                 {
@@ -310,7 +362,7 @@ impl Sync {
                 Ok::<_, String>((bytes, log["ops"].as_array().cloned().unwrap_or_default()))
             };
             match r.await {
-                Ok(fresh) if me.shared.borrow().as_ref().is_some_and(|s| s.generation == generation) => *me.fresh.borrow_mut() = Some(fresh),
+                Ok(fresh) if me.current(generation) => *me.fresh.borrow_mut() = Some(fresh),
                 Ok(_) => {}
                 Err(e) => files.say(format!("live: {e}"), true),
             }

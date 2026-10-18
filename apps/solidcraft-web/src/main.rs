@@ -443,6 +443,55 @@ mod web {
             }
         }
 
+        /// Live collaboration (sync.rs): who else has this design open, and the locks: the active
+        /// component can be held so only this user changes it.
+        fn live_panel(&mut self, ctx: &egui::Context) {
+            if !self.sync.is_shared() || self.app.home.open {
+                return;
+            }
+            let me = files::remote_user();
+            let others = self.sync.others();
+            let locks = self.sync.locks();
+            let active = self.app.session.active_component;
+            let doc = self.app.session.doc.clone();
+            let name_of = |c: u64| match c {
+                0 => "the whole design".to_string(),
+                c => doc.components.iter().find(|k| k.id == c).map_or_else(|| format!("component {c}"), |k| k.name.clone()),
+            };
+            let mut act: Option<(u64, bool)> = None;
+            egui::Area::new(egui::Id::new("live_panel")).anchor(egui::Align2::RIGHT_TOP, [-16.0, 44.0]).show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(if others.is_empty() {
+                        "Shared on the server; nobody else here now".to_string()
+                    } else {
+                        format!("Also here: {}", others.join(", "))
+                    });
+                    match locks.iter().find(|(c, _)| *c == active).map(|(_, u)| u.as_str()) {
+                        Some(u) if u == me => {
+                            if ui.small_button(format!("Unlock {}", name_of(active))).clicked() {
+                                act = Some((active, false));
+                            }
+                        }
+                        Some(u) => {
+                            ui.label(format!("{} is locked by {u}", name_of(active)));
+                        }
+                        None => {
+                            let hint = "Only you can change it until you unlock it (or stop working for a few minutes)";
+                            if ui.small_button(format!("Lock {}", name_of(active))).on_hover_text(hint).clicked() {
+                                act = Some((active, true));
+                            }
+                        }
+                    }
+                    for (c, u) in locks.iter().filter(|(c, _)| *c != active) {
+                        ui.label(format!("{} is locked by {u}", name_of(*c)));
+                    }
+                });
+            });
+            if let Some((component, take)) = act {
+                self.sync.lock(&self.files, component, take);
+            }
+        }
+
         /// Offer the autosave an earlier session left.
         fn recovery_prompt(&mut self, ctx: &egui::Context) {
             let Some((name, path)) = self.files.recovery.borrow().clone() else { return };
@@ -539,12 +588,7 @@ mod web {
             let ctx = ui.ctx().clone();
             self.file_panel(&ctx);
             self.history_window(&ctx);
-            let others = self.sync.others();
-            if !others.is_empty() {
-                egui::Area::new(egui::Id::new("live_presence")).anchor(egui::Align2::RIGHT_TOP, [-16.0, 44.0]).interactable(false).show(&ctx, |ui| {
-                    ui.label(format!("Also here: {}", others.join(", ")));
-                });
-            }
+            self.live_panel(&ctx);
             self.recovery_prompt(&ctx);
             self.watch_text_for_font(&ctx);
         }

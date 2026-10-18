@@ -23,8 +23,11 @@
 //! - Live collaboration (see `ops`): `POST /files/<path>?ops` appends the commands a client ran
 //!   (`{"client", "ops": [{"id", "params", "live", "after"}]}`); `GET /files/<path>?ops&since=N
 //!   [&wait=S&client=C]` answers the entries after N (waiting up to S seconds for some), the
-//!   latest saved marker and who else is there. A design's `GET` carries `X-Ops-Seq` and
-//!   `X-Ops-Commit`: the marker its bytes correspond to.
+//!   latest saved marker, who else is there and who holds what. A design's `GET` carries
+//!   `X-Ops-Seq` and `X-Ops-Commit`: the marker its bytes correspond to. `POST ?lock=<component>
+//!   &client=C` holds a component (0 = the whole design) for the user, 409 when someone else
+//!   does; `POST ?unlock=<component>` lets it go; commands touching a component someone else
+//!   holds are refused with 409.
 //! - `GET /healthz` → 200.
 //!
 //! Command line: `solidcraft-server` serves; `solidcraft-server user add|remove|list [NAME]`

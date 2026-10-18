@@ -721,13 +721,25 @@ impl Session {
             crash::command_done(self.crash_journal, changed, &before.doc, after, spec.id, given, failed.map_or(Ok(()), Err));
         }
         let changed = !Arc::ptr_eq(&self.doc, &before.doc);
+        // Live collaboration (`sync`): a change to a component someone else holds fails like any
+        // other refused command (the design is restored below); the rest is handed to the host.
+        let r = match r {
+            Ok(ok) if changed && outermost && self.shared && !sync::applying() => {
+                let touched = sync::touched(&before.doc, &self.doc);
+                match sync::allowed(&self.doc, &touched) {
+                    Ok(()) => {
+                        sync::record(spec.id, given, live.is_some(), touched);
+                        Ok(ok)
+                    }
+                    Err(why) => Err(EngineError::Disabled(spec.id.to_string(), why)),
+                }
+            }
+            r => r,
+        };
         match r {
             Ok((v, live_edit)) => {
                 let v = if changed { self.with_created(spec.id, params, &before, v) } else { v };
                 if changed {
-                    if outermost && self.shared && !sync::applying() {
-                        sync::record(spec.id, given, live.is_some());
-                    }
                     let render_only = self.render_only_change(&before);
                     let previous_doc = before.doc.clone();
                     if spec.undoable {

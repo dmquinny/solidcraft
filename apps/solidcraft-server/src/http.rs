@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::Settings;
+use crate::ops::Refused;
 use crate::store::{Change, Entry, Meta, Store, Version, Written, clean_path};
 
 /// The largest design accepted (nginx has the same limit).
@@ -171,10 +172,27 @@ fn route(
             Ok(v) => {
                 let client = v.get("client").and_then(Value::as_str).unwrap_or("");
                 let ops = v.get("ops").and_then(Value::as_array).cloned().unwrap_or_default();
-                store.ops().append(&clean, user, client, &ops).map(|seq| Reply::json(200, &json!({"seq": seq})))
+                Ok(match store.ops().append(&clean, user, client, &ops) {
+                    Ok(seq) => Reply::json(200, &json!({"seq": seq})),
+                    Err(Refused::Locked { component, user }) => Reply::json(409, &json!({"component": component, "user": user})),
+                    Err(Refused::Other(e)) => Reply::text(400, &e),
+                })
             }
             Err(e) => Ok(Reply::text(400, &format!("not a command list: {e}"))),
         },
+        (Method::Post, false) if get("lock").is_some() => {
+            let component = get("lock").and_then(|c| c.parse().ok()).unwrap_or(0);
+            let client = get("client").unwrap_or("");
+            Ok(match store.ops().lock(&clean, component, user, client) {
+                Ok(locks) => Reply::json(200, &json!({"locks": locks})),
+                Err(Refused::Locked { component, user }) => Reply::json(409, &json!({"component": component, "user": user})),
+                Err(Refused::Other(e)) => Reply::text(500, &e),
+            })
+        }
+        (Method::Post, false) if get("unlock").is_some() => {
+            let component = get("unlock").and_then(|c| c.parse().ok()).unwrap_or(0);
+            Ok(Reply::json(200, &json!({"locks": store.ops().unlock(&clean, component, user)})))
+        }
         (Method::Get, false) if get("history").is_some() => store.history(&clean).map(|v| Reply::json(200, &versions_json(&v))),
         (Method::Get, false) if get("at").is_some() => store.version(&clean, get("at").unwrap_or("")).map(|b| match b {
             Some(bytes) => Reply::bytes(bytes),
