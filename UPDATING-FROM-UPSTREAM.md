@@ -187,6 +187,21 @@ server storage (an empty state names the user) and asks again every half minute;
 design carries its `modified` time, and the app fetches the file again when that changes so the
 card's picture follows the design.
 
+## Who made what
+
+Each feature remembers who added it (`Feature.author`, a pending design-format change in
+`crates/doc/src/format/pending/feature-author.rs`): the engine stamps the features an undoable
+command adds with the current author (`solidcraft_engine::sync::set_author`, which the web app
+sets to the signed-in name; `sync::as_author` while another user's commands are applied live,
+replayed on a fresh start or merged from a branch). The timeline's tooltip says "by <name>", and
+a design with several authors marks each feature with a small colour per author. Older designs
+have no authors; a build without this change refuses the newer format number as usual.
+
+On the web the start page's cards of the design open in this browser (Recent, and "Shared with
+you") draw it as it is now, not as its file is, so live edits show without a save; the others'
+changes received live never make a document "modified" here (their save marks it saved when
+both sides agree on the design).
+
 ## Going back
 
 To the small `server-storage` build (nginx WebDAV, no sign-in, no history): check out

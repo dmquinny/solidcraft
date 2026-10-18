@@ -176,7 +176,7 @@ pub(crate) fn clipboard_buttons(app: &mut SolveApp, ui: &mut egui::Ui, id: u64) 
 
 /// A colour for a person's features' marks: the same for the same name, well apart for
 /// different ones (a hue from the name).
-fn author_colour(name: &str) -> Color32 {
+fn author_colour(name: &str) -> egui::Color32 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     name.hash(&mut h);
