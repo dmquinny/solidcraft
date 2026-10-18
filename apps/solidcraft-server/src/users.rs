@@ -90,10 +90,11 @@ pub fn remove(file: &Path, name: &str) -> Result<(), String> {
     write(file, &entries)
 }
 
-/// Names nginx and URLs are happy with.
+/// Names nginx, URLs and the users file are happy with (an identity provider may use email
+/// addresses as user names).
 pub fn check_name(name: &str) -> Result<(), String> {
-    let ok = !name.is_empty() && name.len() <= 32 && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok { Ok(()) } else { Err("a user name is 1 to 32 letters, digits, '.', '_' or '-'".into()) }
+    let ok = !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '+'));
+    if ok { Ok(()) } else { Err("a user name is 1 to 64 letters, digits, '.', '_', '-', '@' or '+'".into()) }
 }
 
 fn read_line() -> Result<String, String> {
