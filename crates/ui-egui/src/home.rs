@@ -29,6 +29,9 @@ pub struct HomeState {
     samples: HashMap<usize, Session>,
     /// Keys asked for and not made yet.
     queued: Vec<String>,
+    /// The revision of the open design each key's picture was made from, when it was made from
+    /// the open design rather than its file (`live`).
+    live: HashMap<String, u64>,
     #[cfg(not(target_arch = "wasm32"))]
     rx: Option<std::sync::mpsc::Receiver<Made>>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -51,6 +54,7 @@ impl HomeState {
     pub fn forget(&mut self, key: &str) {
         self.thumbs.remove(key);
         self.queued.retain(|k| k != key);
+        self.live.remove(key);
     }
 
     /// Put a design at the top of the recent list.
@@ -310,6 +314,29 @@ fn poll(app: &mut SolveApp, ctx: &egui::Context) {
     }
 }
 
+/// A card of the design open in this app (`path` is its session's path) shows the design as it
+/// is now, not as its file is: its picture is made again here when the revision changed. Only
+/// on the web, where pictures are made on the UI thread anyway; the desktop keeps the picture
+/// of the saved file (its pictures are made in threads).
+fn live(app: &mut SolveApp, ctx: &egui::Context, key: &str, path: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if app.session.path.as_deref() != Some(path) {
+            return;
+        }
+        let rev = app.session.revision;
+        if app.home.live.get(key) == Some(&rev) && app.home.thumbs.contains_key(key) {
+            return;
+        }
+        let img = remember_at(&app.session);
+        install(&mut app.home, ctx, key, img);
+        app.home.queued.retain(|k| k != key);
+        app.home.live.insert(key.to_string(), rev);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (app, ctx, key, path);
+}
+
 /// Ask for a key's picture (once: an empty entry marks it as asked for).
 fn want(h: &mut HomeState, key: &str) {
     if !h.thumbs.contains_key(key) {
@@ -457,6 +484,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                         sub.push('\n');
                         sub.push_str(&opened);
                     }
+                    live(app, ui.ctx(), p, p);
                     let response = card(ui, Pic::Ready(app.home.thumbs.get(p.as_str()).and_then(Option::as_ref)), &name, &sub, missing)
                         .on_hover_text(p.as_str());
                     crate::scenario::publish_handle(&format!("home:recent:{i}"), response.rect.center());
@@ -519,7 +547,11 @@ pub fn section(ui: &mut egui::Ui, title: &str) {
 
 /// A card for a design kept at `key` (a path in the engine's files), with its picture made in
 /// the background once the file is there: for hosts' own sections of the start page.
-pub fn design_card(app: &mut SolveApp, ui: &mut egui::Ui, key: &str, name: &str, sub: &str) -> egui::Response {
+pub fn design_card(app: &mut SolveApp, ui: &mut egui::Ui, key: &str, open_path: Option<&str>, name: &str, sub: &str) -> egui::Response {
+    // `open_path`: the path the design has when open in this app; open, it is drawn as it is.
+    if let Some(p) = open_path {
+        live(app, ui.ctx(), key, p);
+    }
     if solidcraft_engine::io::vfs::exists(key) {
         want(&mut app.home, key);
     }

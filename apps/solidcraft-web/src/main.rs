@@ -107,8 +107,11 @@ mod web {
                 let name = if s.path.is_empty() { "The design folder".to_string() } else { format!("Folder: {}", s.path) };
                 solidcraft_ui_egui::home::plain_card(ui, &name, &sub)
             } else {
-                let name = s.path.rsplit_once('/').map_or(s.path.as_str(), |(_, n)| n).trim_end_matches(".solidcraft").to_string();
-                solidcraft_ui_egui::home::design_card(app, ui, &format!("{}{}", files::SHARED, s.path), &name, &sub)
+                let file = s.path.rsplit_once('/').map_or(s.path.as_str(), |(_, n)| n);
+                let name = file.trim_end_matches(".solidcraft").to_string();
+                // Open here (from its folder), the design is drawn as it is now.
+                let open = format!("{}{file}", files::OPFS);
+                solidcraft_ui_egui::home::design_card(app, ui, &format!("{}{}", files::SHARED, s.path), Some(&open), &name, &sub)
             };
             if response.on_hover_text(&s.path).clicked() {
                 picked = Some(s.clone());
