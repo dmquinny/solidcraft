@@ -91,6 +91,16 @@ Directory › Tokens and App passwords › Create: intent API, for a user or ser
 view users). Admins are then Authentik's superusers, the members of `SOLIDCRAFT_ADMIN_GROUP`
 (default `solidcraft-admins`), and whoever the users file flags (`user add NAME --admin`).
 
+From the internet the site is `solidcraft.homedc.xyz`: a Cloudflare Tunnel with Cloudflare Access
+in front (Authentik is its identity provider). On that path Cloudflare, not NPM, names the visitor:
+the same header snippet takes `Cf-Access-Authenticated-User-Email` when Authentik's header is
+absent, and the storage service turns that email into the Authentik user name through the
+directory, so one person is the same user on both paths. Two proxies may therefore reach the
+container, and nothing else should: bind its port to the host only (`ports: - "127.0.0.1:8781:8080"`,
+the tunnel's origin being `http://localhost:8781`) and let NPM forward to the container's name
+(`solidcraft`, port 8080, on the compose network). Until then anyone on the LAN who reaches port 8781
+directly could name themselves.
+
 Remotes: `origin` is the fork (github.com/dmquinny/solidcraft), `upstream` is tangency-labs.
 
 ## Pull upstream into the branches

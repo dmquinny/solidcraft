@@ -13,8 +13,16 @@ use serde_json::Value;
 const REFRESH_EVERY: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// When fetched, and the users as (name, admin).
-type Fetched = (Instant, Vec<(String, bool)>);
+/// One person in the directory.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Person {
+    pub name: String,
+    pub email: String,
+    pub admin: bool,
+}
+
+/// When fetched, and the people.
+type Fetched = (Instant, Vec<Person>);
 
 pub struct Directory {
     url: String,
@@ -41,8 +49,8 @@ impl Directory {
         &self.url
     }
 
-    /// Everyone active in the directory, as (name, admin), from the cache or a fresh fetch.
-    pub fn users(&self) -> Vec<(String, bool)> {
+    /// Everyone active in the directory, from the cache or a fresh fetch.
+    pub fn users(&self) -> Vec<Person> {
         let Ok(mut cache) = self.cache.lock() else { return Vec::new() };
         if let Some((at, users)) = cache.as_ref()
             && at.elapsed() < REFRESH_EVERY
@@ -65,10 +73,19 @@ impl Directory {
     }
 
     pub fn is_admin(&self, name: &str) -> bool {
-        self.users().iter().any(|(n, admin)| n == name && *admin)
+        self.users().iter().any(|p| p.name == name && p.admin)
     }
 
-    fn fetch(&self) -> Result<Vec<(String, bool)>, String> {
+    /// The user name behind a name a proxy passed: an email (Cloudflare Access) becomes the
+    /// directory's user name; anything else stays as it is.
+    pub fn resolve(&self, name: &str) -> String {
+        if !name.contains('@') {
+            return name.to_string();
+        }
+        self.users().iter().find(|p| p.email.eq_ignore_ascii_case(name)).map_or_else(|| name.to_string(), |p| p.name.clone())
+    }
+
+    fn fetch(&self) -> Result<Vec<Person>, String> {
         let mut out = Vec::new();
         let mut page = 1;
         loop {
@@ -92,15 +109,15 @@ impl Directory {
             }
             page = next;
         }
-        out.sort_by_key(|(n, _)| n.to_lowercase());
-        out.dedup_by(|a, b| a.0 == b.0);
+        out.sort_by_key(|p| p.name.to_lowercase());
+        out.dedup_by(|a, b| a.name == b.name);
         Ok(out)
     }
 }
 
 /// The people in one page of Authentik's users answer: service accounts are left out; a
 /// superuser, or a member of `admin_group`, is an admin.
-fn parse_users(v: &Value, admin_group: &str) -> Vec<(String, bool)> {
+fn parse_users(v: &Value, admin_group: &str) -> Vec<Person> {
     let Some(results) = v["results"].as_array() else { return Vec::new() };
     results
         .iter()
@@ -112,7 +129,8 @@ fn parse_users(v: &Value, admin_group: &str) -> Vec<(String, bool)> {
                 return None;
             }
             let groups = u["groups_obj"].as_array().map(|g| g.iter().filter_map(|g| g["name"].as_str()).any(|g| g == admin_group)).unwrap_or(false);
-            Some((name, u["is_superuser"].as_bool().unwrap_or(false) || groups))
+            let email = u["email"].as_str().unwrap_or("").to_string();
+            Some(Person { name, email, admin: u["is_superuser"].as_bool().unwrap_or(false) || groups })
         })
         .collect()
 }
@@ -125,9 +143,9 @@ mod tests {
     fn authentik_users_are_read() {
         let v: Value = serde_json::from_str(
             r#"{"pagination":{"next":0},"results":[
-                {"username":"akadmin","is_active":true,"is_superuser":true,"type":"internal","groups_obj":[{"name":"authentik Admins"}]},
-                {"username":"catherine@example.com","is_active":true,"is_superuser":false,"type":"internal","groups_obj":[{"name":"solidcraft-admins"}]},
-                {"username":"stephan","is_active":true,"is_superuser":false,"type":"external","groups_obj":[]},
+                {"username":"akadmin","email":"ben@example.com","is_active":true,"is_superuser":true,"type":"internal","groups_obj":[{"name":"authentik Admins"}]},
+                {"username":"catherine@example.com","email":"catherine@example.com","is_active":true,"is_superuser":false,"type":"internal","groups_obj":[{"name":"solidcraft-admins"}]},
+                {"username":"stephan","email":"Stephan@example.com","is_active":true,"is_superuser":false,"type":"external","groups_obj":[]},
                 {"username":"old","is_active":false,"is_superuser":false,"type":"internal","groups_obj":[]},
                 {"username":"outpost-bot","is_active":true,"is_superuser":false,"type":"internal_service_account","groups_obj":[]},
                 {"username":"bad name!","is_active":true,"is_superuser":false,"type":"internal","groups_obj":[]}
@@ -135,7 +153,16 @@ mod tests {
         )
         .unwrap();
         let users = parse_users(&v, "solidcraft-admins");
-        assert_eq!(users, vec![("akadmin".to_string(), true), ("catherine@example.com".to_string(), true), ("stephan".to_string(), false)]);
+        let names: Vec<(&str, bool)> = users.iter().map(|p| (p.name.as_str(), p.admin)).collect();
+        assert_eq!(names, vec![("akadmin", true), ("catherine@example.com", true), ("stephan", false)]);
+        assert_eq!(users[0].email, "ben@example.com");
         assert!(Directory::new("", "x", "g").is_none() && Directory::new("http://a", "", "g").is_none());
+        // An email from Cloudflare Access becomes the user name, whatever its case.
+        let d = Directory::new("http://a", "t", "g").unwrap();
+        *d.cache.lock().unwrap() = Some((Instant::now(), users));
+        assert_eq!(d.resolve("BEN@example.com"), "akadmin");
+        assert_eq!(d.resolve("stephan@example.com"), "stephan");
+        assert_eq!(d.resolve("nobody@example.com"), "nobody@example.com");
+        assert_eq!(d.resolve("akadmin"), "akadmin");
     }
 }

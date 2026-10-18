@@ -97,7 +97,8 @@ fn handle(service: &Service, mut request: Request) {
         let _ = request.respond(Response::from_string("sign in first (the proxy passed no user name)\n").with_status_code(401));
         return;
     }
-    let user = named.unwrap_or_else(|| ANONYMOUS.to_string());
+    // A proxy that knows people by email (Cloudflare Access) names the directory's user.
+    let user = named.map(|n| service.directory.as_ref().map_or_else(|| n.clone(), |d| d.resolve(&n))).unwrap_or_else(|| ANONYMOUS.to_string());
     if user != ANONYMOUS && service.saw(&user) {
         log::info!("{user}: first sign-in");
     }
@@ -403,10 +404,10 @@ fn users_route(service: &Service, admin: bool, method: &Method, url: &str, user:
     let listing = |status: u16| match users::list(file) {
         Ok(mut list) => {
             // The directory's people first (they may be admins there), then everyone who signed in.
-            for (name, is_admin) in service.directory.as_ref().map(Directory::users).unwrap_or_default() {
-                match list.iter_mut().find(|u| u.name == name) {
-                    Some(u) => u.admin |= is_admin,
-                    None => list.push(users::User { name, admin: is_admin }),
+            for p in service.directory.as_ref().map(Directory::users).unwrap_or_default() {
+                match list.iter_mut().find(|u| u.name == p.name) {
+                    Some(u) => u.admin |= p.admin,
+                    None => list.push(users::User { name: p.name, admin: p.admin }),
                 }
             }
             let seen = service.seen.lock().map(|s| s.clone()).unwrap_or_default();

@@ -50,7 +50,8 @@
 //! page lists people the proxy knows even when the users file does not. With
 //! `SOLIDCRAFT_AUTHENTIK_URL` and `SOLIDCRAFT_AUTHENTIK_TOKEN` the whole directory is read from
 //! Authentik's API (`directory`), so everyone appears before they ever sign in, and Authentik's
-//! superusers and the admin group's members are admins.
+//! superusers and the admin group's members are admins; a name that is an email (what Cloudflare
+//! Access passes) becomes the directory's user name.
 //!
 //! Command line: `solidcraft-server` serves; `solidcraft-server user add|remove|list [NAME]`
 //! maintains the users file. Settings come from the environment: `SOLIDCRAFT_DESIGNS`
