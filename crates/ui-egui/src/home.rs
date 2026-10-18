@@ -472,12 +472,13 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                     }
                 });
             }
-            // The host's own sections (`Services::home_sections`).
-            for j in 0..app.services.home_sections.len() {
-                if let Some(show) = app.services.home_sections.get_mut(j) {
-                    show(ui);
-                }
+            // The host's own sections (`Services::home_sections`), taken out while they draw so
+            // they can use the app.
+            let mut sections = std::mem::take(&mut app.services.home_sections);
+            for show in &mut sections {
+                show(app, ui);
             }
+            app.services.home_sections = sections;
             ui.add_space(24.0);
             section(ui, app.tr("home.samples"));
             grid(ui, samples.len(), |ui, i| {
@@ -509,8 +510,22 @@ pub fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
 }
 
+/// A card for a design kept at `key` (a path in the engine's files), with its picture made in
+/// the background once the file is there: for hosts' own sections of the start page.
+pub fn design_card(app: &mut SolveApp, ui: &mut egui::Ui, key: &str, name: &str, sub: &str) -> egui::Response {
+    if solidcraft_engine::io::vfs::exists(key) {
+        want(&mut app.home, key);
+    }
+    card(ui, Pic::Ready(app.home.thumbs.get(key).and_then(Option::as_ref)), name, sub, false)
+}
+
+/// A card without a picture (a folder, say).
+pub fn plain_card(ui: &mut egui::Ui, name: &str, sub: &str) -> egui::Response {
+    card(ui, Pic::Ready(None), name, sub, true)
+}
+
 /// Cards in rows that fill the width.
-fn grid(ui: &mut egui::Ui, n: usize, mut each: impl FnMut(&mut egui::Ui, usize)) {
+pub fn grid(ui: &mut egui::Ui, n: usize, mut each: impl FnMut(&mut egui::Ui, usize)) {
     let w = THUMB[0] as f32 + 16.0;
     let per_row = ((ui.available_width() + 14.0) / (w + 14.0)).floor().max(1.0) as usize;
     for row in 0..n.div_ceil(per_row) {

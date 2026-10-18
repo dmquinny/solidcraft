@@ -345,6 +345,37 @@ pub(crate) fn remote_url(name: &str) -> String {
     format!("{}{}", remote_dir(), String::from(js_sys::encode_uri_component(name)))
 }
 
+/// Where the files of shared designs are kept for their pictures (not `OPFS`: saving never
+/// goes there).
+pub const SHARED: &str = "/shared/";
+
+/// A design's URL from its path under the designs folder (any folder, each segment encoded).
+fn remote_path_url(path: &str) -> String {
+    let encoded: Vec<String> = path.split('/').map(|s| String::from(js_sys::encode_uri_component(s))).collect();
+    format!("{REMOTE_DIR}{}", encoded.join("/"))
+}
+
+/// Fetch the shared designs' files into the engine's files under `SHARED`, so the start page
+/// can show their pictures.
+fn fetch_shared_files(files: &Files, shared: &[Shared]) {
+    for s in shared.iter().filter(|s| !s.folder) {
+        let key = format!("{SHARED}{}", s.path);
+        if vfs::exists(&key) {
+            continue;
+        }
+        let (ctx, path) = (files.ctx.borrow().clone(), s.path.clone());
+        spawn_local(async move {
+            match remote_bytes(&remote_path_url(&path)).await {
+                Ok(bytes) => vfs::insert(&key, bytes),
+                Err(e) => log::warn!("{path}: {e}"),
+            }
+            if let Some(c) = &ctx {
+                c.request_repaint();
+            }
+        });
+    }
+}
+
 /// Go to something another user shared: a folder is shown in the panel; a design's folder is
 /// entered and the design opened once its entries are in (the host's frame does that).
 pub fn open_shared(files: &Rc<Files>, shared: &Shared) {
@@ -1107,6 +1138,7 @@ fn install(files: &Files, loaded: Result<Loaded, String>) {
             *files.entries.borrow_mut() = entries;
             *files.folders.borrow_mut() = folders;
             *files.changes.borrow_mut() = changes;
+            fetch_shared_files(files, &shared);
             *files.shared.borrow_mut() = shared;
             // An autosave without its design file is nothing to recover.
             if !vfs::exists(&format!("{OPFS}{RECOVERY}")) {

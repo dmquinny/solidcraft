@@ -72,27 +72,32 @@ mod web {
     }
 
     /// The start page's "Shared with you" (files::open_shared): what others shared with this
-    /// user by name, opened with one click. Nothing is drawn when there is nothing to show.
-    fn shared_section(ui: &mut egui::Ui, files: &Rc<Files>) {
+    /// user by name, as cards like Recent's, opened with one click. Nothing is drawn when there
+    /// is nothing to show.
+    fn shared_section(app: &mut SolveApp, ui: &mut egui::Ui, files: &Rc<Files>) {
         let shared = files.shared.borrow().clone();
         if !files::remote_only() || shared.is_empty() {
             return;
         }
         ui.add_space(24.0);
         solidcraft_ui_egui::home::section(ui, "Shared with you");
-        for s in &shared {
-            ui.horizontal(|ui| {
-                let what = match (s.folder, s.path.is_empty()) {
-                    (true, true) => "the whole design folder".to_string(),
-                    (true, false) => format!("the folder {}", s.path),
-                    (false, _) => s.path.clone(),
-                };
-                let label = if s.folder { "Show" } else { "Open" };
-                if ui.button(label).clicked() {
-                    files::open_shared(files, s);
-                }
-                ui.label(format!("{what} \u{b7} shared by {}{}", s.owner, if s.edit { "" } else { " (view only)" }));
-            });
+        let mut picked: Option<files::Shared> = None;
+        solidcraft_ui_egui::home::grid(ui, shared.len(), |ui, i| {
+            let Some(s) = shared.get(i) else { return };
+            let sub = format!("shared by {}{}", s.owner, if s.edit { "" } else { " (view only)" });
+            let response = if s.folder {
+                let name = if s.path.is_empty() { "The design folder".to_string() } else { format!("Folder: {}", s.path) };
+                solidcraft_ui_egui::home::plain_card(ui, &name, &sub)
+            } else {
+                let name = s.path.rsplit_once('/').map_or(s.path.as_str(), |(_, n)| n).trim_end_matches(".solidcraft").to_string();
+                solidcraft_ui_egui::home::design_card(app, ui, &format!("{}{}", files::SHARED, s.path), &name, &sub)
+            };
+            if response.on_hover_text(&s.path).clicked() {
+                picked = Some(s.clone());
+            }
+        });
+        if let Some(s) = picked {
+            files::open_shared(files, &s);
         }
     }
 
@@ -996,7 +1001,7 @@ mod web {
                             install_app: Some(crate::install::service(&cc.egui_ctx)),
                             // Preferences › Users: who can sign in to the server (files::users).
                             host_pages: vec![HostPage { title: "Users".into(), show: Box::new(move |ui| users_page(ui, &page_files, &form)) }],
-                            home_sections: vec![Box::new(move |ui| shared_section(ui, &home_files))],
+                            home_sections: vec![Box::new(move |app, ui| shared_section(app, ui, &home_files))],
                             ..Default::default()
                         };
                         // Thumbnails of saves and start-page cards.
