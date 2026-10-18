@@ -10,7 +10,9 @@
 //! folder as nginx's JSON autoindex, `GET files/<name>` reads, `PUT` writes, `DELETE` removes),
 //! designs are kept there instead of in the browser, so every browser and device sees the same
 //! files. The endpoint is probed once at start; without it (404, or anything but a JSON
-//! listing) nothing changes. The autosave stays in the browser: it is written on every edit.
+//! listing) nothing changes. Designs can be filed in a subfolder of the server's folder (the
+//! file panel's folder field, remembered per browser in local storage; nginx makes the folder on
+//! the first save). The autosave stays in the browser: it is written on every edit.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -56,6 +58,8 @@ pub struct Entry {
 #[derive(Default)]
 pub struct Files {
     pub entries: RefCell<Vec<Entry>>,
+    /// The subfolders of the server's current folder (server storage only): the panel offers them.
+    pub folders: RefCell<Vec<String>>,
     /// Files read from the computer: (name, bytes, what to do).
     pub incoming: RefCell<Vec<(String, Vec<u8>, Intent)>>,
     /// Messages for the status line (errors and confirmations).
@@ -141,10 +145,45 @@ thread_local! {
 
 /// The server's design folder, relative to the page (same origin: no CORS, no configuration).
 const REMOTE_DIR: &str = "files/";
+/// Local storage key of the subfolder designs are filed in.
+const REMOTE_FOLDER_KEY: &str = "solidcraft.remote_folder";
+
+thread_local! {
+    /// The subfolder of the server's design folder designs are filed in ("" is the folder itself,
+    /// else a relative path like "projects/bracket"), remembered per browser.
+    static REMOTE_FOLDER: RefCell<String> = const { RefCell::new(String::new()) };
+}
 
 /// Are designs kept on the server?
 pub fn remote_only() -> bool {
     REMOTE.with(Cell::get)
+}
+
+/// The server subfolder designs are filed in ("" is the design folder itself).
+pub fn remote_folder() -> String {
+    REMOTE_FOLDER.with(|f| f.borrow().clone())
+}
+
+/// `folder` as a server path: segments trimmed, empty ones dropped, none hidden or ".." (a
+/// backslash counts as a slash).
+fn clean_folder(folder: &str) -> Result<String, String> {
+    let mut segments = Vec::new();
+    for s in folder.split(['/', '\\']).map(str::trim).filter(|s| !s.is_empty()) {
+        if s.starts_with('.') {
+            return Err(format!("a folder name can't start with a dot ({s})"));
+        }
+        segments.push(s);
+    }
+    let folder = segments.join("/");
+    if folder.len() > 200 {
+        return Err("the folder path is too long".to_string());
+    }
+    Ok(folder)
+}
+
+/// The folder this browser remembers.
+fn stored_folder() -> String {
+    local().ok().and_then(|st| st.get_item(REMOTE_FOLDER_KEY).ok().flatten()).and_then(|f| clean_folder(&f).ok()).unwrap_or_default()
 }
 
 /// Files that stay in the browser even with server storage: the autosave is written on every edit.
@@ -152,8 +191,18 @@ fn stays_local(name: &str) -> bool {
     name == RECOVERY || name == RECOVERY_META || name == LEGACY_RECOVERY
 }
 
+/// The current folder's URL (relative to the page, trailing slash).
+fn remote_dir() -> String {
+    let folder = remote_folder();
+    if folder.is_empty() {
+        return REMOTE_DIR.to_string();
+    }
+    let path: Vec<String> = folder.split('/').map(|s| String::from(js_sys::encode_uri_component(s))).collect();
+    format!("{REMOTE_DIR}{}/", path.join("/"))
+}
+
 fn remote_url(name: &str) -> String {
-    format!("{REMOTE_DIR}{}", String::from(js_sys::encode_uri_component(name)))
+    format!("{}{}", remote_dir(), String::from(js_sys::encode_uri_component(name)))
 }
 
 /// One request to the server's design folder: the response, whatever its status.
@@ -172,29 +221,49 @@ async fn remote_request(method: &str, url: &str, body: Option<&[u8]>) -> Result<
         .map_err(|_| "no response".to_string())
 }
 
-/// The server's design folder: `Some` listing (name, modified) when the site has one, `None`
-/// when it has not (404, or no JSON listing: the upstream site), an error when it failed.
-async fn remote_list() -> Result<Option<Vec<(String, f64)>>, String> {
-    let r = remote_request("GET", REMOTE_DIR, None).await?;
-    let json = r.headers().get("content-type").ok().flatten().is_some_and(|t| t.starts_with("application/json"));
-    if r.status() == 404 || (r.ok() && !json) {
+/// A server folder's files (name, modified) and its subfolders.
+type Listing = (Vec<(String, f64)>, Vec<String>);
+
+/// Does the response carry nginx's JSON listing?
+fn is_listing(r: &web_sys::Response) -> bool {
+    r.ok() && r.headers().get("content-type").ok().flatten().is_some_and(|t| t.starts_with("application/json"))
+}
+
+/// The server's current folder: `Some` listing when the site has server storage, `None` when it
+/// has not (404, or no JSON listing: the upstream site), an error when it failed.
+async fn remote_list() -> Result<Option<Listing>, String> {
+    let dir = remote_dir();
+    let r = remote_request("GET", &dir, None).await?;
+    if r.status() == 404 && dir != REMOTE_DIR {
+        // A subfolder the server hasn't got yet (nginx makes it on the first save) is empty, as
+        // long as the site has server storage at all.
+        return Ok(is_listing(&remote_request("GET", REMOTE_DIR, None).await?).then(Listing::default));
+    }
+    if r.status() == 404 || (r.ok() && !is_listing(&r)) {
         return Ok(None);
     }
     if !r.ok() {
         return Err(format!("the server's design folder answered HTTP {}", r.status()));
     }
     let list: Array = JsFuture::from(r.json().map_err(err)?).await.map_err(err)?.dyn_into().map_err(|_| "the listing isn't a list".to_string())?;
-    let mut out = Vec::new();
+    let (mut files, mut folders) = Listing::default();
     for e in list.iter() {
         let get = |k: &str| Reflect::get(&e, &k.into()).ok().and_then(|v| v.as_string());
         let Some(name) = get("name") else { continue };
-        if name.starts_with('.') || get("type").is_some_and(|t| t != "file") {
+        if name.starts_with('.') || stays_local(&name) {
             continue;
         }
-        let modified = get("mtime").map(|m| js_sys::Date::parse(&m)).filter(|t| !t.is_nan()).unwrap_or(0.0);
-        out.push((name, modified));
+        match get("type").as_deref() {
+            Some("directory") => folders.push(name),
+            Some("file") | None => {
+                let modified = get("mtime").map(|m| js_sys::Date::parse(&m)).filter(|t| !t.is_nan()).unwrap_or(0.0);
+                files.push((name, modified));
+            }
+            _ => {}
+        }
     }
-    Ok(Some(out))
+    folders.sort_by_key(|f| f.to_lowercase());
+    Ok(Some((files, folders)))
 }
 
 async fn remote_read(name: &str) -> Result<Vec<u8>, String> {
@@ -302,27 +371,36 @@ fn read_local() -> Result<Vec<(String, Vec<u8>, f64)>, String> {
     Ok(out)
 }
 
-/// Every stored file: (name, bytes, modified). With server storage, the server's files and the
-/// browser's autosave; a server that is there but fails keeps designs out of the browser (saves
-/// report the failure) rather than hiding them in it until the next reload.
-async fn read_all() -> Result<Vec<(String, Vec<u8>, f64)>, String> {
+/// A stored file: name, bytes, modified.
+type Stored = (String, Vec<u8>, f64);
+
+/// Every stored file, and the server folder's subfolders. With server storage, the server's files
+/// and the browser's autosave; a server that is there but fails keeps designs out of the browser
+/// (saves report the failure) rather than hiding them in it until the next reload.
+async fn read_all() -> Result<(Vec<Stored>, Vec<String>), String> {
     let list = match remote_list().await {
-        Ok(None) => return read_browser().await,
+        Ok(None) => return Ok((read_browser().await?, Vec::new())),
         r => r,
     };
     REMOTE.with(|r| r.set(true));
+    let (mut out, folders) = read_remote(list?.unwrap_or_default()).await;
+    match read_browser().await {
+        Ok(b) => out.extend(b.into_iter().filter(|(n, _, _)| stays_local(n))),
+        Err(e) => log::warn!("browser storage: {e}"),
+    }
+    Ok((out, folders))
+}
+
+/// The listed server files, read; the subfolders as they are.
+async fn read_remote((list, folders): Listing) -> (Vec<Stored>, Vec<String>) {
     let mut out = Vec::new();
-    for (name, modified) in list?.unwrap_or_default() {
+    for (name, modified) in list {
         match remote_read(&name).await {
             Ok(b) => out.push((name, b, modified)),
             Err(e) => log::warn!("{name}: {e}"),
         }
     }
-    match read_browser().await {
-        Ok(b) => out.extend(b.into_iter().filter(|(n, _, _)| stays_local(n))),
-        Err(e) => log::warn!("browser storage: {e}"),
-    }
-    Ok(out)
+    (out, folders)
 }
 
 /// Every file in the browser's storage. Without OPFS, local storage takes over from here on.
@@ -370,45 +448,85 @@ pub fn start(files: &Rc<Files>) {
             let _ = JsFuture::from(p).await;
         });
     }
+    REMOTE_FOLDER.with(|f| *f.borrow_mut() = stored_folder());
     let files = files.clone();
     spawn_local(async move {
-        match read_all().await {
-            Ok(all) => {
-                if local_only() && !remote_only() {
-                    files.say("This page can't use the browser's file storage (it needs https or localhost): designs are kept in local storage, a few MB at most.", false);
-                }
-                let mut entries = Vec::new();
-                let has_recovery = all.iter().any(|(n, _, _)| n == RECOVERY);
-                for (name, bytes, modified) in all {
-                    if name == LEGACY_RECOVERY {
-                        if !has_recovery {
-                            vfs::insert(&format!("{OPFS}{RECOVERY}"), bytes);
-                        }
-                        continue;
-                    }
-                    if name == RECOVERY_META {
-                        let meta: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-                        let n = meta["name"].as_str().unwrap_or("Untitled").to_string();
-                        *files.recovery.borrow_mut() = Some((n, meta["path"].as_str().map(str::to_string)));
-                        continue;
-                    }
-                    if name != RECOVERY {
-                        entries.push(Entry { name: name.clone(), size: bytes.len() as u64, modified });
-                    }
-                    vfs::insert(&format!("{OPFS}{name}"), bytes);
-                }
-                entries.sort_by_key(|a| a.name.to_lowercase());
-                *files.entries.borrow_mut() = entries;
-                // An autosave without its design file is nothing to recover.
-                if !vfs::exists(&format!("{OPFS}{RECOVERY}")) {
-                    *files.recovery.borrow_mut() = None;
-                }
-            }
-            Err(e) => files.say(format!("storage: {e}"), true),
+        let loaded = read_all().await;
+        if loaded.is_ok() && local_only() && !remote_only() {
+            files.say(
+                "This page can't use the browser's file storage (it needs https or localhost): designs are kept in local storage, a few MB at most.",
+                false,
+            );
         }
-        files.ready.set(true);
-        files.wake();
+        install(&files, loaded);
     });
+}
+
+/// The loaded files go into the engine's files and the panel's entries; the app may open them.
+fn install(files: &Files, loaded: Result<(Vec<Stored>, Vec<String>), String>) {
+    match loaded {
+        Ok((all, folders)) => {
+            let mut entries = Vec::new();
+            let has_recovery = all.iter().any(|(n, _, _)| n == RECOVERY);
+            for (name, bytes, modified) in all {
+                if name == LEGACY_RECOVERY {
+                    if !has_recovery {
+                        vfs::insert(&format!("{OPFS}{RECOVERY}"), bytes);
+                    }
+                    continue;
+                }
+                if name == RECOVERY_META {
+                    let meta: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                    let n = meta["name"].as_str().unwrap_or("Untitled").to_string();
+                    *files.recovery.borrow_mut() = Some((n, meta["path"].as_str().map(str::to_string)));
+                    continue;
+                }
+                if name != RECOVERY {
+                    entries.push(Entry { name: name.clone(), size: bytes.len() as u64, modified });
+                }
+                vfs::insert(&format!("{OPFS}{name}"), bytes);
+            }
+            entries.sort_by_key(|a| a.name.to_lowercase());
+            *files.entries.borrow_mut() = entries;
+            *files.folders.borrow_mut() = folders;
+            // An autosave without its design file is nothing to recover.
+            if !vfs::exists(&format!("{OPFS}{RECOVERY}")) {
+                *files.recovery.borrow_mut() = None;
+            }
+        }
+        Err(e) => files.say(format!("storage: {e}"), true),
+    }
+    files.ready.set(true);
+    files.wake();
+}
+
+/// File designs in `folder` on the server: "" for the design folder itself, else a relative path
+/// like "projects/bracket" (made on the first save). The panel's entries are reloaded from there,
+/// and the browser remembers the folder.
+pub fn set_remote_folder(files: &Rc<Files>, folder: &str) -> Result<(), String> {
+    let folder = clean_folder(folder)?;
+    if folder == remote_folder() {
+        return Ok(());
+    }
+    if let Ok(st) = local() {
+        let _ = if folder.is_empty() { st.remove_item(REMOTE_FOLDER_KEY) } else { st.set_item(REMOTE_FOLDER_KEY, &folder) };
+    }
+    REMOTE_FOLDER.with(|f| *f.borrow_mut() = folder);
+    // The old folder's designs leave the engine's files (the autosave stays).
+    for e in files.entries.borrow_mut().drain(..) {
+        let _ = vfs::remove(&format!("{OPFS}{}", e.name));
+    }
+    files.folders.borrow_mut().clear();
+    files.ready.set(false);
+    let files = files.clone();
+    spawn_local(async move {
+        let loaded = match remote_list().await {
+            Ok(list) => Ok(read_remote(list.unwrap_or_default()).await),
+            Err(e) => Err(e),
+        };
+        install(&files, loaded);
+    });
+    Ok(())
 }
 
 /// Store what commands wrote: OPFS paths into OPFS, download paths as downloads.

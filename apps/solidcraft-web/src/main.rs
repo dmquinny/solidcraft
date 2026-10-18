@@ -96,6 +96,8 @@ mod web {
         renaming: Option<(String, String)>,
         /// The rename field takes the keyboard when it appears.
         rename_focus: bool,
+        /// The file panel's folder field (server storage, files.rs).
+        folder: String,
         /// The start page's recent designs were filled from the stored ones.
         recents_synced: bool,
         /// On-demand CJK font: fetched only when a CJK language is selected.
@@ -201,7 +203,8 @@ mod web {
             }
             let mut open = true;
             let mut act: Option<(&'static str, String)> = None;
-            egui::Window::new("Files in this browser")
+            let remote = files::remote_only();
+            egui::Window::new(if remote { "Files on the server" } else { "Files in this browser" })
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
@@ -220,17 +223,44 @@ mod web {
                             act = Some(("download_open", String::new()));
                         }
                     });
+                    if remote {
+                        // The subfolder of the server's design folder designs are filed in (files.rs).
+                        ui.horizontal_wrapped(|ui| {
+                            let current = files::remote_folder();
+                            ui.label("Folder:");
+                            let r = ui.add(egui::TextEdit::singleline(&mut self.folder).hint_text("the design folder itself").desired_width(220.0));
+                            if r.lost_focus() {
+                                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    act = Some(("folder", self.folder.clone()));
+                                } else {
+                                    self.folder = current.clone();
+                                }
+                            }
+                            if !current.is_empty() && ui.small_button("Up").on_hover_text("The folder above").clicked() {
+                                act = Some(("folder", current.rsplit_once('/').map_or(String::new(), |(p, _)| p.to_string())));
+                            }
+                            for f in self.files.folders.borrow().iter() {
+                                if ui.small_button(format!("{f}/")).clicked() {
+                                    act = Some(("folder", if current.is_empty() { f.clone() } else { format!("{current}/{f}") }));
+                                }
+                            }
+                        });
+                    }
                     ui.separator();
                     if !self.files.ready.get() {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label("Reading the browser's storage…");
+                            ui.label(if remote { "Reading the server's folder…" } else { "Reading the browser's storage…" });
                         });
                         return;
                     }
                     let entries = self.files.entries.borrow().clone();
                     if entries.is_empty() {
-                        ui.label("Designs you save appear here. They stay in this browser.");
+                        ui.label(if remote {
+                            "Designs you save appear here, in this folder on the server."
+                        } else {
+                            "Designs you save appear here. They stay in this browser."
+                        });
                     }
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                         egui::Grid::new("opfs_files").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -317,6 +347,14 @@ mod web {
                     files::delete(&self.files, &name);
                     self.app.home.recent.retain(|r| *r != path);
                 }
+                "folder" => match files::set_remote_folder(&self.files, &name) {
+                    Ok(()) => {
+                        self.folder = files::remote_folder();
+                        // The start page's recent designs follow the folder.
+                        self.recents_synced = false;
+                    }
+                    Err(e) => self.app.set_status(e, true),
+                },
                 "rename_cancel" => self.renaming = None,
                 "rename" => {
                     if let Some((from, _)) = self.renaming.take() {
@@ -557,6 +595,7 @@ mod web {
                             autosaved: None,
                             renaming: None,
                             rename_focus: false,
+                            folder: files::remote_folder(),
                             recents_synced: false,
                             font: Default::default(),
                             font_result: Rc::new(std::cell::RefCell::new(None)),

@@ -3,19 +3,21 @@
 This checkout (`W:\solidcraft`, `/mnt/Apps/Apps/solidcraft` on the NAS) is a fork of
 [tangency-labs/solidcraft](https://github.com/tangency-labs/solidcraft). The `server-storage`
 branch carries one self-hosting patch on top of upstream `main`: the web app keeps designs on
-the server instead of in the browser.
+the server instead of in the browser, optionally in a subfolder chosen in the file panel.
 
 ## What the patch changes
 
 | File | Change |
 | --- | --- |
-| `apps/solidcraft-web/src/files.rs` | A third storage backend, "remote": at start the app probes `files/` (same origin). A JSON listing there means designs are listed, read (`GET`), written (`PUT`) and deleted (`DELETE`) on the server. A 404 means the upstream behaviour (OPFS / local storage) is unchanged. The autosave (`recovery.*`) always stays in the browser. |
+| `apps/solidcraft-web/src/files.rs` | A third storage backend, "remote": at start the app probes `files/` (same origin). A JSON listing there means designs are listed, read (`GET`), written (`PUT`) and deleted (`DELETE`) on the server. A 404 means the upstream behaviour (OPFS / local storage) is unchanged. The autosave (`recovery.*`) always stays in the browser. Designs can be filed in a subfolder (`set_remote_folder`, `remote_folder`): the browser remembers it in local storage (`solidcraft.remote_folder`), the listing's directory entries are offered as subfolders, and a folder the server hasn't got yet lists as empty until the first save makes it. |
+| `apps/solidcraft-web/src/main.rs` | A few lines in `file_panel` (and a `folder` field on `Shell`): with server storage the window is titled "Files on the server", shows a folder field with buttons for the subfolders, and its spinner and empty-list wording say "server" instead of "browser". |
 | `apps/solidcraft-web/Cargo.toml` | Three more `web-sys` features (`RequestInit`, `RequestCache`, `Headers`). |
-| `packaging/docker/nginx.conf` | `location ^~ /files/`: nginx's JSON autoindex plus `dav_methods PUT DELETE`, backed by `/srv/designs`. |
+| `packaging/docker/nginx.conf` | `location ^~ /files/`: nginx's JSON autoindex plus `dav_methods PUT DELETE` (with `create_full_put_path on`, so a subfolder appears on the first save into it), backed by `/srv/designs`. |
 
 Outside the repo, `W:\docker-compose.yml` mounts `/mnt/Apps/Backup/Maker/SolidCraft` (that is
 `Z:\Maker\SolidCraft` on the PC, a Syncthing-synced folder) at `/srv/designs` in the `solidcraft` service. Keep only
-designs in that folder: everything in it is listed in the app and read at start.
+designs in that folder: everything in it is listed in the app and read at start. Subfolders (made
+from the file panel's folder field, or by hand) are listed as folders, each with its own designs.
 
 Remotes: `origin` is the fork (github.com/dmquinny/solidcraft), `upstream` is tangency-labs.
 
@@ -31,9 +33,12 @@ git merge upstream/main
 
 A merge usually goes through untouched: upstream rarely edits the three primitives the patch
 hooks into. If `files.rs` conflicts, keep upstream's version of everything except the pieces
-marked "self-hosting patch" (the module-doc paragraph, the `REMOTE` block after `local_only`,
-the two `if remote_only() && !stays_local(name)` guards, and `read_all` / `read_browser`),
-then:
+marked "self-hosting patch" (the module-doc paragraph, the `REMOTE` block after `local_only`
+through `remote_remove`, the two `if remote_only() && !stays_local(name)` guards, `read_all` /
+`read_remote` / `read_browser`, and `start` / `install` / `set_remote_folder`). If `main.rs`
+conflicts, keep upstream's version and re-apply the `remote` lines in `file_panel` (the title,
+the `if remote` folder row, the two `if remote` labels, the `"folder"` action) and the `folder`
+field of `Shell`. Then:
 
 ```bash
 git add -A
