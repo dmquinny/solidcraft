@@ -75,8 +75,9 @@ through the proxy) is who you can pick. With `SOLIDCRAFT_DEFAULT_ACCESS=owner` i
 environment, every new design is private to its creator until they share it.
 
 Authentik (or another identity provider) instead of nginx's own sign-in: set up forward auth for
-`solidcraft.lan.homedc.xyz` in Nginx Proxy Manager as Authentik's documentation describes (the
-outpost's nginx snippet, which passes `X-authentik-username` to the upstream), add to the
+`solidcraft.lan.homedc.xyz` in Nginx Proxy Manager: paste `packaging/docker/auth/header/npm-advanced.conf.example`
+into the proxy host's Advanced tab (Authentik's own recipe; it passes `X-authentik-username` and
+the groups to the upstream), add to the
 `solidcraft` service in `W:\docker-compose.yml`
 `- /mnt/Apps/Apps/solidcraft/packaging/docker/auth/header:/etc/nginx/solidcraft:ro` and
 `docker compose up -d solidcraft`. NPM keeps forwarding to the host port 8781, so anyone on the LAN
