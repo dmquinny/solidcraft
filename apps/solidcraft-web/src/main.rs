@@ -23,7 +23,7 @@ mod web {
 
     use solidcraft_engine::Session;
     use solidcraft_engine::io::vfs;
-    use solidcraft_ui_egui::{Services, SolveApp};
+    use solidcraft_ui_egui::{HostPage, Services, SolveApp};
     use wasm_bindgen::JsCast as _;
 
     use crate::api::Api;
@@ -63,6 +63,94 @@ mod web {
 
     /// Seconds between autosaves of unsaved work.
     const AUTOSAVE_S: f64 = 30.0;
+
+    /// The Users page's fields: a new user (name, password, admin) and this user's new password.
+    #[derive(Default)]
+    struct UsersForm {
+        new_user: (String, String, bool),
+        my_password: String,
+    }
+
+    /// Preferences › Users (files::users): everyone changes their own password; admins add and
+    /// remove users and say who else is an admin. Only with the storage service.
+    fn users_page(ui: &mut egui::Ui, files: &Rc<Files>, form: &Rc<std::cell::RefCell<UsersForm>>) {
+        if !files::remote_only() {
+            ui.label("Designs are kept in this browser. Users apply when they are kept on the server.");
+            return;
+        }
+        if files::remote_user().is_empty() {
+            ui.label("This server keeps designs only, not users (plain nginx storage).");
+            return;
+        }
+        if !files.users_asked.get() {
+            files::users(files);
+        }
+        let Some(users) = files.users.borrow().clone() else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Asking the server\u{2026}");
+            });
+            return;
+        };
+        let mut form = form.borrow_mut();
+        let mut act: Option<(&'static str, String, bool)> = None;
+        ui.horizontal(|ui| {
+            ui.label(format!("Signed in as {}{}", users.me, if users.admin { " (admin)" } else { "" }));
+            if ui.small_button("Refresh").clicked() {
+                files::users(files);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("New password:");
+            ui.add(egui::TextEdit::singleline(&mut form.my_password).password(true).desired_width(160.0));
+            if ui.small_button("Change").clicked() && !form.my_password.is_empty() {
+                act = Some(("password", std::mem::take(&mut form.my_password), false));
+            }
+        });
+        ui.separator();
+        ui.label("Who can sign in (everyone who has, with a proxy doing the sign-in):");
+        egui::Grid::new("users").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+            for (name, admin) in &users.list {
+                ui.label(name);
+                if users.admin && *name != users.me {
+                    let mut is_admin = *admin;
+                    if ui.checkbox(&mut is_admin, "admin").changed() {
+                        act = Some(("admin", name.clone(), is_admin));
+                    }
+                    if ui.small_button("Remove").clicked() {
+                        act = Some(("remove", name.clone(), false));
+                    }
+                } else {
+                    ui.label(if *admin { "admin" } else { "" });
+                    ui.label("");
+                }
+                ui.end_row();
+            }
+        });
+        if users.admin {
+            ui.separator();
+            ui.label("Add a user, or give one a new password:");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut form.new_user.0).hint_text("name").desired_width(120.0));
+                ui.add(egui::TextEdit::singleline(&mut form.new_user.1).hint_text("password").password(true).desired_width(140.0));
+                ui.checkbox(&mut form.new_user.2, "admin");
+                if ui.small_button("Add").clicked() && !form.new_user.0.trim().is_empty() && !form.new_user.1.is_empty() {
+                    act = Some(("add", form.new_user.0.trim().to_string(), form.new_user.2));
+                }
+            });
+        }
+        match act {
+            Some(("password", password, _)) => files::set_password(files, &password),
+            Some(("admin", name, admin)) => files::set_user(files, &name, None, Some(admin)),
+            Some(("remove", name, _)) => files::remove_user(files, &name),
+            Some(("add", name, admin)) => {
+                let password = std::mem::take(&mut form.new_user.1);
+                files::set_user(files, &name, Some(&password), Some(admin));
+                form.new_user = Default::default();
+            }
+            _ => {}
+        }
+    }
 
     thread_local! {
         /// An open design has unsaved changes: leaving the page asks first.
@@ -235,6 +323,12 @@ mod web {
                         if ui.button("Download open design").clicked() {
                             act = Some(("download_open", String::new()));
                         }
+                        if remote
+                            && !user.is_empty()
+                            && ui.button("Users\u{2026}").on_hover_text("Who can sign in; your password (Preferences)").clicked()
+                        {
+                            act = Some(("users", String::new()));
+                        }
                     });
                     if remote {
                         // The subfolder of the server's design folder designs are filed in (files.rs).
@@ -374,6 +468,10 @@ mod web {
                     self.app.home.recent.retain(|r| *r != path);
                 }
                 "history" => files::history(&self.files, &name),
+                "users" => {
+                    self.files.panel.set(false);
+                    solidcraft_ui_egui::prefs::open_host_page(&mut self.app, 0);
+                }
                 "folder" => match files::set_remote_folder(&self.files, &name) {
                     Ok(()) => {
                         self.folder = files::remote_folder();
@@ -701,6 +799,7 @@ mod web {
                         let files = Rc::new(Files::default());
                         files::start(&files);
                         let panel = files.clone();
+                        let (page_files, form) = (files.clone(), Rc::new(std::cell::RefCell::new(UsersForm::default())));
                         let services = Services {
                             // Open shows the browser's files (and the computer's, from there).
                             pick_open: Some(Box::new(move |_: &[&str]| {
@@ -713,6 +812,8 @@ mod web {
                                 Box::pin(std::future::ready(Some(format!("{}{name}", if design { files::OPFS } else { files::DOWNLOADS }))))
                             })),
                             install_app: Some(crate::install::service(&cc.egui_ctx)),
+                            // Preferences › Users: who can sign in to the server (files::users).
+                            host_pages: vec![HostPage { title: "Users".into(), show: Box::new(move |ui| users_page(ui, &page_files, &form)) }],
                             ..Default::default()
                         };
                         // Thumbnails of saves and start-page cards.

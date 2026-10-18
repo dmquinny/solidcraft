@@ -1,6 +1,7 @@
 //! The HTTP side: routes under `/files/` onto the store (see the crate doc for the contract).
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use percent_encoding::percent_decode_str;
@@ -10,6 +11,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use crate::Settings;
 use crate::ops::Refused;
 use crate::store::{Change, Entry, Meta, Store, Version, Written, clean_path};
+use crate::users;
 
 /// The largest design accepted (nginx has the same limit).
 const MAX_BODY: usize = 200 << 20;
@@ -19,27 +21,83 @@ const LOG_ENTRIES: usize = 30;
 const USER_HEADER: &str = "X-Remote-User";
 const ANONYMOUS: &str = "anonymous";
 
+/// What every request handler sees.
+struct Service {
+    store: Store,
+    users_file: PathBuf,
+    allow_anonymous: bool,
+    admin_group: String,
+    /// Everyone who ever signed in (kept in `seen_file`).
+    seen: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    seen_file: PathBuf,
+}
+
+impl Service {
+    /// Remember a name that signed in; `true` when it is new.
+    fn saw(&self, user: &str) -> bool {
+        let Ok(mut seen) = self.seen.lock() else { return false };
+        if !seen.insert(user.to_string()) {
+            return false;
+        }
+        let text: String = seen.iter().map(|u| format!("{u}\n")).collect();
+        if let Err(e) = std::fs::write(&self.seen_file, text) {
+            log::warn!("{}: {e}", self.seen_file.display());
+        }
+        true
+    }
+
+    /// Is this user an admin: by the users file, or by a group the proxy passed?
+    fn is_admin(&self, user: &str, groups: Option<&str>) -> bool {
+        users::is_admin(&self.users_file, user) || groups.is_some_and(|g| g.split(',').any(|g| g.trim() == self.admin_group))
+    }
+}
+
 pub fn serve(settings: &Settings) -> Result<(), String> {
-    let store = Arc::new(Store::open(&settings.designs, &settings.history)?);
+    let seen_file = settings.seen_file();
+    let seen = std::fs::read_to_string(&seen_file)
+        .map(|t| t.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let service = Arc::new(Service {
+        store: Store::open(&settings.designs, &settings.history)?,
+        users_file: settings.users_file(),
+        allow_anonymous: settings.allow_anonymous,
+        admin_group: settings.admin_group.clone(),
+        seen: std::sync::Mutex::new(seen),
+        seen_file,
+    });
     let server = Server::http(&settings.listen).map_err(|e| format!("listen on {}: {e}", settings.listen))?;
     log::info!("serving {} on http://{}/files/ (history in {})", settings.designs.display(), settings.listen, settings.history.display());
     for request in server.incoming_requests() {
-        let store = store.clone();
-        std::thread::spawn(move || handle(&store, request));
+        let service = service.clone();
+        std::thread::spawn(move || handle(&service, request));
     }
     Ok(())
 }
 
-fn handle(store: &Store, mut request: Request) {
+fn handle(service: &Service, mut request: Request) {
+    let store = &service.store;
     let method = request.method().clone();
     let url = request.url().to_string();
-    let user = header(&request, USER_HEADER).filter(|u| !u.is_empty()).unwrap_or_else(|| ANONYMOUS.to_string());
+    let named = header(&request, USER_HEADER).filter(|u| !u.is_empty() && users::check_name(u).is_ok());
+    if named.is_none() && !service.allow_anonymous && url != "/healthz" {
+        log::info!("- {method} {url} -> 401 (no user name from the proxy)");
+        let _ = request.respond(Response::from_string("sign in first (the proxy passed no user name)\n").with_status_code(401));
+        return;
+    }
+    let user = named.unwrap_or_else(|| ANONYMOUS.to_string());
+    if user != ANONYMOUS && service.saw(&user) {
+        log::info!("{user}: first sign-in");
+    }
+    let admin = service.is_admin(&user, header(&request, "X-Remote-Groups").as_deref());
     let if_match = header(&request, "If-Match").map(|v| v.trim().trim_start_matches("W/").trim_matches('"').to_string());
     let only_new = header(&request, "If-None-Match").is_some_and(|v| v.trim() == "*");
     let fingerprint = header(&request, "X-Fingerprint").filter(|f| !f.is_empty() && f.len() <= 64);
-    let body = if matches!(method, Method::Put | Method::Post) { read_body(&mut request) } else { Ok(Vec::new()) };
+    let body = if matches!(method, Method::Put | Method::Post | Method::Delete) { read_body(&mut request) } else { Ok(Vec::new()) };
     let reply = match body {
-        Ok(body) => route(store, &method, &url, &user, if_match.as_deref(), only_new, fingerprint.as_deref(), body),
+        Ok(body) => match users_route(service, admin, &method, &url, &user, &body) {
+            Some(reply) => reply,
+            None => route(store, &method, &url, &user, if_match.as_deref(), only_new, fingerprint.as_deref(), body),
+        },
         Err(e) => Reply::text(413, &e),
     };
     log::info!("{user} {method} {url} -> {}", reply.status);
@@ -230,6 +288,65 @@ fn route(
             Reply::text(500, &e)
         }
     }
+}
+
+/// The users requests (`?users`, `?password`, on any folder URL), or `None` for anything else.
+/// The list is everyone in the users file plus everyone who ever signed in through the proxy.
+fn users_route(service: &Service, admin: bool, method: &Method, url: &str, user: &str, body: &[u8]) -> Option<Reply> {
+    let file: &Path = &service.users_file;
+    let (path, query) = split_url(url);
+    if !path.starts_with("/files/") {
+        return None;
+    }
+    let get = |k: &str| query.iter().find(|(q, _)| q == k).map(|(_, v)| v.as_str());
+    let field = |k: &str| serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get(k).cloned());
+    let listing = |status: u16| match users::list(file) {
+        Ok(mut list) => {
+            let seen = service.seen.lock().map(|s| s.clone()).unwrap_or_default();
+            for name in seen.into_iter().filter(|n| n != ANONYMOUS) {
+                if !list.iter().any(|u| u.name == name) {
+                    list.push(users::User { name, admin: false });
+                }
+            }
+            list.sort_by_key(|u| u.name.to_lowercase());
+            Reply::json(
+                status,
+                &json!({"me": user, "admin": admin, "users": list.iter().map(|u| json!({"name": u.name, "admin": u.admin || u.name == user && admin})).collect::<Vec<_>>()}),
+            )
+        }
+        Err(e) => Reply::text(500, &e),
+    };
+    let outcome = |r: Result<(), String>| match r {
+        Ok(()) => listing(200),
+        Err(e) => Reply::text(400, &e),
+    };
+    Some(match (method, get("users"), get("password")) {
+        (Method::Get, Some(_), _) => listing(200),
+        (Method::Post, Some(_), _) if !admin => Reply::text(403, "only an admin manages users"),
+        (Method::Post, Some(_), _) => {
+            let Some(name) = field("name").and_then(|v| v.as_str().map(str::to_string)) else { return Some(Reply::text(400, "a user needs a name")) };
+            let password = field("password").and_then(|v| v.as_str().map(str::to_string));
+            let make_admin = field("admin").and_then(|v| v.as_bool());
+            if name == user && make_admin == Some(false) {
+                return Some(Reply::text(400, "you can't take your own admin away"));
+            }
+            outcome(match (password, make_admin) {
+                (Some(password), admin) => users::set(file, &name, &password, admin),
+                (None, Some(admin)) => users::set_admin(file, &name, admin),
+                (None, None) => Err("a new user needs a password".to_string()),
+            })
+        }
+        (Method::Delete, Some(name), _) if !admin => Reply::text(403, &format!("only an admin removes users ({name})")),
+        (Method::Delete, Some(name), _) if name == user => Reply::text(400, "you can't remove yourself"),
+        (Method::Delete, Some(name), _) => outcome(users::remove(file, name)),
+        (Method::Post, None, Some(_)) => {
+            let Some(password) = field("password").and_then(|v| v.as_str().map(str::to_string)) else {
+                return Some(Reply::text(400, "a password is needed"));
+            };
+            outcome(users::set(file, user, &password, None))
+        }
+        _ => return None,
+    })
 }
 
 /// nginx's autoindex JSON, which the app already reads.

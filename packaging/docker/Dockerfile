@@ -38,6 +38,7 @@ COPY --from=build /src/dist/web/ /
 
 FROM nginxinc/nginx-unprivileged:1.29-alpine
 COPY packaging/docker/nginx.conf /etc/nginx/conf.d/default.conf
+COPY packaging/docker/auth/basic/ /etc/nginx/solidcraft/
 COPY LICENSE-MIT LICENSE-APACHE NOTICE THIRD-PARTY-LICENSES.txt /usr/share/doc/solidcraft/
 COPY --from=site / /srv/solidcraft/
 EXPOSE 8080

@@ -81,6 +81,15 @@ pub struct Version {
     pub size: u64,
 }
 
+/// The site's users, as the storage service tells them.
+#[derive(Clone, Debug, Default)]
+pub struct Users {
+    pub me: String,
+    pub admin: bool,
+    /// (name, admin).
+    pub list: Vec<(String, bool)>,
+}
+
 /// State shared between the async browser calls and the app's frames.
 #[derive(Default)]
 pub struct Files {
@@ -92,6 +101,9 @@ pub struct Files {
     /// The history window: a server design's name and its versions, newest first (empty while
     /// they are being fetched); `None` when it is closed.
     pub history: RefCell<Option<(String, Vec<Version>)>>,
+    /// The users were asked for; what the server answered (the Users page).
+    pub users_asked: Cell<bool>,
+    pub users: RefCell<Option<Users>>,
     /// Files read from the computer: (name, bytes, what to do).
     pub incoming: RefCell<Vec<(String, Vec<u8>, Intent)>>,
     /// Messages for the status line (errors and confirmations).
@@ -293,15 +305,68 @@ pub(crate) fn remote_url(name: &str) -> String {
     format!("{}{}", remote_dir(), String::from(js_sys::encode_uri_component(name)))
 }
 
-/// A JSON answer from the server (any status but 2xx is an error).
+/// A JSON answer from the server (any status but 2xx is an error, with the server's words).
 pub(crate) async fn remote_json(method: &str, url: &str, body: Option<&[u8]>) -> Result<serde_json::Value, String> {
     let headers: &[(&str, &str)] = if body.is_some() { &[("Content-Type", "application/json")] } else { &[] };
     let r = remote_request(method, url, body, headers).await?;
-    if !r.ok() {
-        return Err(format!("HTTP {}", r.status()));
-    }
+    let status = r.status();
     let text = JsFuture::from(r.text().map_err(err)?).await.map_err(err)?.as_string().unwrap_or_default();
+    if !r.ok() {
+        let why = text.trim();
+        return Err(if why.is_empty() || why.starts_with('{') { format!("HTTP {status}") } else { format!("HTTP {status}: {why}") });
+    }
     serde_json::from_str(&text).map_err(|e| format!("not JSON: {e}"))
+}
+
+/// Ask the server who is who (the Users page).
+pub fn users(files: &Rc<Files>) {
+    files.users_asked.set(true);
+    users_request(files, "GET", &format!("{REMOTE_DIR}?users"), None, None);
+}
+
+/// Add a user, give one a new password, or change whether they are an admin (admins only).
+pub fn set_user(files: &Rc<Files>, name: &str, password: Option<&str>, admin: Option<bool>) {
+    let body = serde_json::json!({"name": name.trim(), "password": password, "admin": admin}).to_string();
+    users_request(files, "POST", &format!("{REMOTE_DIR}?users"), Some(body), Some(format!("{}: done", name.trim())));
+}
+
+/// Remove a user (admins only).
+pub fn remove_user(files: &Rc<Files>, name: &str) {
+    let url = format!("{REMOTE_DIR}?users={}", String::from(js_sys::encode_uri_component(name)));
+    users_request(files, "DELETE", &url, None, Some(format!("{name}: removed")));
+}
+
+/// Change this user's own password (the browser asks for it again on the next request).
+pub fn set_password(files: &Rc<Files>, password: &str) {
+    let body = serde_json::json!({"password": password}).to_string();
+    users_request(
+        files,
+        "POST",
+        &format!("{REMOTE_DIR}?password"),
+        Some(body),
+        Some("Your password is changed: the browser will ask for it again".to_string()),
+    );
+}
+
+fn users_request(files: &Rc<Files>, method: &'static str, url: &str, body: Option<String>, done: Option<String>) {
+    let (files, url) = (files.clone(), url.to_string());
+    spawn_local(async move {
+        match remote_json(method, &url, body.as_deref().map(str::as_bytes)).await {
+            Ok(v) => {
+                let list = v["users"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|u| Some((u["name"].as_str()?.to_string(), u["admin"].as_bool().unwrap_or(false)))).collect())
+                    .unwrap_or_default();
+                *files.users.borrow_mut() =
+                    Some(Users { me: v["me"].as_str().unwrap_or_default().to_string(), admin: v["admin"].as_bool().unwrap_or(false), list });
+                if let Some(d) = done {
+                    files.say(d, false);
+                }
+            }
+            Err(e) => files.say(format!("users: {e}"), true),
+        }
+        files.wake();
+    });
 }
 
 /// Bytes from the server (any status but 2xx is an error).

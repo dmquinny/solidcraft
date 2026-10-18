@@ -1,5 +1,7 @@
-//! The users file nginx signs people in against (`auth_basic_user_file`): one `name:{SSHA}…`
-//! line per user, the salted SHA-1 form nginx understands on every platform.
+//! The users file nginx signs people in against (`auth_basic_user_file`): one line per user,
+//! `name:{SSHA}…` (the salted SHA-1 form nginx understands on every platform), with `:admin`
+//! as the third field for those who may manage users. The command line and the web app's
+//! Users window (`http`) both edit it; the first user ever added is an admin.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -7,37 +9,34 @@ use std::path::Path;
 use base64::Engine as _;
 use sha1::{Digest, Sha1};
 
-/// `user add|remove|list [NAME] [--password-stdin]`.
+/// Shortest password accepted.
+pub const MIN_PASSWORD: usize = 6;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct User {
+    pub name: String,
+    pub admin: bool,
+}
+
+/// `user add NAME [--admin] [--password-stdin]`, `user remove NAME`, `user list`.
 pub fn command(file: &Path, args: &[String]) -> Result<(), String> {
-    let name = args.get(1).map(String::as_str);
+    let name = args.get(1).filter(|a| !a.starts_with("--")).map(String::as_str);
     match (args.first().map(String::as_str), name) {
         (Some("add"), Some(name)) => {
-            check_name(name)?;
             let password = if args.iter().any(|a| a == "--password-stdin") { read_line()? } else { ask_password()? };
-            if password.len() < 4 {
-                return Err("the password needs at least 4 characters".into());
-            }
-            let mut entries = read(file)?;
-            entries.retain(|(n, _)| n != name);
-            entries.push((name.to_string(), hash(&password)));
-            write(file, &entries)?;
-            println!("{name}: added to {}", file.display());
+            let admin = args.iter().any(|a| a == "--admin");
+            set(file, name, &password, admin.then_some(true))?;
+            println!("{name}: added to {}{}", file.display(), if is_admin(file, name) { " (admin)" } else { "" });
             Ok(())
         }
         (Some("remove"), Some(name)) => {
-            let mut entries = read(file)?;
-            let before = entries.len();
-            entries.retain(|(n, _)| n != name);
-            if entries.len() == before {
-                return Err(format!("no user named {name}"));
-            }
-            write(file, &entries)?;
+            remove(file, name)?;
             println!("{name}: removed");
             Ok(())
         }
         (Some("list"), None) => {
-            for (n, _) in read(file)? {
-                println!("{n}");
+            for u in list(file)? {
+                println!("{}{}", u.name, if u.admin { " (admin)" } else { "" });
             }
             Ok(())
         }
@@ -45,8 +44,54 @@ pub fn command(file: &Path, args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Every user.
+pub fn list(file: &Path) -> Result<Vec<User>, String> {
+    Ok(read(file)?.into_iter().map(|(name, _, admin)| User { name, admin }).collect())
+}
+
+pub fn is_admin(file: &Path, name: &str) -> bool {
+    read(file).ok().is_some_and(|us| us.iter().any(|(n, _, a)| n == name && *a))
+}
+
+/// Add a user, or give an existing one a new password. `admin`: `Some` sets the flag, `None`
+/// keeps it (a new user is not an admin, unless the file was empty: the first user is).
+pub fn set(file: &Path, name: &str, password: &str, admin: Option<bool>) -> Result<(), String> {
+    check_name(name)?;
+    if password.chars().count() < MIN_PASSWORD {
+        return Err(format!("the password needs at least {MIN_PASSWORD} characters"));
+    }
+    let mut entries = read(file)?;
+    let first = entries.is_empty();
+    let was = entries.iter().find(|(n, _, _)| n == name).map(|(_, _, a)| *a);
+    entries.retain(|(n, _, _)| n != name);
+    entries.push((name.to_string(), hash(password), admin.or(was).unwrap_or(first)));
+    write(file, &entries)
+}
+
+/// Make a user an admin, or not (never the last admin).
+pub fn set_admin(file: &Path, name: &str, admin: bool) -> Result<(), String> {
+    let mut entries = read(file)?;
+    let Some(i) = entries.iter().position(|(n, _, _)| n == name) else { return Err(format!("no user named {name}")) };
+    if !admin && entries[i].2 && entries.iter().filter(|(_, _, a)| *a).count() == 1 {
+        return Err("that is the only admin; make someone else an admin first".into());
+    }
+    entries[i].2 = admin;
+    write(file, &entries)
+}
+
+/// Remove a user (never the last admin).
+pub fn remove(file: &Path, name: &str) -> Result<(), String> {
+    let mut entries = read(file)?;
+    let Some((_, _, admin)) = entries.iter().find(|(n, _, _)| n == name) else { return Err(format!("no user named {name}")) };
+    if *admin && entries.iter().filter(|(_, _, a)| *a).count() == 1 {
+        return Err("that is the only admin; make someone else an admin first".into());
+    }
+    entries.retain(|(n, _, _)| n != name);
+    write(file, &entries)
+}
+
 /// Names nginx and URLs are happy with.
-fn check_name(name: &str) -> Result<(), String> {
+pub fn check_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty() && name.len() <= 32 && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if ok { Ok(()) } else { Err("a user name is 1 to 32 letters, digits, '.', '_' or '-'".into()) }
 }
@@ -97,7 +142,8 @@ fn salt() -> [u8; 8] {
     salt
 }
 
-fn read(file: &Path) -> Result<Vec<(String, String)>, String> {
+/// (name, hash, admin) per line.
+fn read(file: &Path) -> Result<Vec<(String, String, bool)>, String> {
     let text = match std::fs::read_to_string(file) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -105,23 +151,49 @@ fn read(file: &Path) -> Result<Vec<(String, String)>, String> {
     };
     Ok(text
         .lines()
-        .filter_map(|l| l.split_once(':'))
-        .map(|(n, h)| (n.trim().to_string(), h.trim().to_string()))
-        .filter(|(n, _)| !n.is_empty())
+        .filter_map(|l| {
+            let mut f = l.splitn(3, ':');
+            let (name, hash) = (f.next()?.trim(), f.next()?.trim());
+            let admin = f.next().is_some_and(|c| c.trim() == "admin");
+            (!name.is_empty()).then(|| (name.to_string(), hash.to_string(), admin))
+        })
         .collect())
 }
 
 /// Written whole, through a temporary file, readable by nginx's user.
-fn write(file: &Path, entries: &[(String, String)]) -> Result<(), String> {
+fn write(file: &Path, entries: &[(String, String, bool)]) -> Result<(), String> {
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let tmp = file.with_extension("tmp");
     let mut out = std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    for (n, h) in entries {
-        writeln!(out, "{n}:{h}").map_err(|e| e.to_string())?;
+    for (n, h, admin) in entries {
+        writeln!(out, "{n}:{h}{}", if *admin { ":admin" } else { "" }).map_err(|e| e.to_string())?;
     }
     out.sync_all().map_err(|e| e.to_string())?;
     drop(out);
     std::fs::rename(&tmp, file).map_err(|e| format!("{}: {e}", file.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_user_is_the_admin_and_the_last_admin_stays() {
+        let file = std::env::temp_dir().join(format!("solidcraft-users-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        set(&file, "ben", "secret-1", None).unwrap();
+        set(&file, "felix", "secret-2", None).unwrap();
+        assert!(is_admin(&file, "ben") && !is_admin(&file, "felix"));
+        assert!(set(&file, "x", "short", None).is_err());
+        assert!(set(&file, "bad name", "secret-3", None).is_err());
+        assert!(remove(&file, "ben").is_err(), "the only admin stays");
+        set(&file, "felix", "secret-2", Some(true)).unwrap();
+        remove(&file, "ben").unwrap();
+        assert_eq!(list(&file).unwrap(), vec![User { name: "felix".into(), admin: true }]);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("felix:{SSHA}") && text.trim_end().ends_with(":admin"), "{text}");
+        let _ = std::fs::remove_file(&file);
+    }
 }

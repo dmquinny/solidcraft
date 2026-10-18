@@ -274,6 +274,15 @@ pub struct Services {
     pub agent_http: Option<agent_chat::backend::HttpFn>,
     /// The system keychain, for API agents' keys; None: keys can't be stored.
     pub secrets: Option<std::sync::Arc<dyn agent_chat::backend::Secrets>>,
+    /// Preferences pages of the host's own (a web host's server settings, say), listed after the
+    /// built-in ones and drawn by the host (`prefs::open_host_page` opens one).
+    pub host_pages: Vec<HostPage>,
+}
+
+/// A Preferences page the host adds (`Services::host_pages`).
+pub struct HostPage {
+    pub title: String,
+    pub show: Box<dyn FnMut(&mut egui::Ui)>,
 }
 
 pub struct SolveApp {

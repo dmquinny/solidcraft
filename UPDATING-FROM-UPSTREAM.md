@@ -37,6 +37,8 @@ And on `collab`:
 | `apps/solidcraft-server/src/ops.rs` | One log per design (`<history>/ops/<design>.jsonl`): the commands clients ran, and a marker for every saved version (etag, commit, the saver's fingerprint). `POST ?ops` appends; `GET ?ops&since=N&wait=S&client=C` answers what came after N, waiting up to S seconds, with who else is polling. A design's `GET`/`PUT` carry `X-Ops-Seq` / `X-Ops-Commit`, the marker its bytes correspond to. |
 | `apps/solidcraft-web/src/sync.rs` (new) | The client side: the open server design is marked `shared`; commands run here are batched and posted; others' commands come back through a long poll and are applied with `sync::apply`; the client's own entries are skipped by its id. A command that fails to apply, or a fingerprint that disagrees with the one another session reported (after its command, or with its save), makes the session start afresh: load the design's last saved version and replay the log after it. Status messages say who joined, who left and when a catch-up happened. Locks come with every poll and go to the engine (`sync::set_locks`); `lock`/`unlock` hold the active component; `merge` fetches a branch's commands and replays them onto the target as this user's edits. |
 | Locks (`crates/engine/src/sync.rs`, `apps/solidcraft-server/src/ops.rs`) | `sync::touched` says which components a command changed (0 = the design as a whole: parameters, components, placements, joints, settings); `Session::execute` refuses, and undoes, a change to a component someone else holds ("component X is locked by felix"), the server refuses such commands too (409). `POST ?lock=<component>&client=C` / `?unlock=` hold and release; the holder's polls renew the lock, which lapses two minutes after they stop. The live panel (top right while a shared design is open) shows who else is here and holds or releases the active component. |
+| Users (`users.rs`, `http.rs`, `files.rs`, `main.rs`) | The users file has an admin flag (`name:hash:admin`; the first user ever added is an admin; `user add NAME --admin`). Over HTTP: `GET /files/?users`, `POST /files/?users` (`{"name","password","admin"}`: add, new password, or just the flag; admins only), `DELETE /files/?users=<name>` (admins only, never yourself or the last admin), `POST /files/?password` (your own). Preferences › Users (the panel's "Users…" button opens it) is a page the web app adds through `Services::host_pages`, a small hook in the UI crate: everyone changes their own password, admins add and remove users and tick who else is an admin. Without a user name from nginx the service answers 401 (`SOLIDCRAFT_ALLOW_ANONYMOUS=1` turns that off). |
+| Sign-in snippets (`packaging/docker/auth/`, `nginx.conf`, `Dockerfile`) | nginx.conf includes `/etc/nginx/solidcraft/server.conf` (server level) and `files.conf` (the `/files/` location). The image ships `auth/basic` (nginx's own sign-in against the users file, `X-Remote-User $remote_user`). Mounting `auth/header` over that folder makes nginx trust a proxy that already signed the user in: Authentik's forward auth at Nginx Proxy Manager sets `X-authentik-username`, which becomes `X-Remote-User` (Authelia: edit the snippet to `$http_remote_user`). In that mode drop the container's `ports:` mapping, so only the proxy reaches it. |
 | Branches (`store.rs`, `files.rs`, `sync.rs`) | `POST ?branch=<new path>` copies the design (commit "branched … from …"); the branch's first marker carries `from`. "Branch as" in the history window makes one in the current folder; "Merge into" fetches the branch's whole command log and replays it onto the chosen design, which is opened and left unsaved; commands that no longer apply are counted and skipped. |
 
 Outside the repo, `W:\docker-compose.yml` runs two services: `solidcraft` (nginx, the site) and
@@ -59,10 +61,20 @@ way to avoid stepping on each other in the same component: lock it, work, unlock
 for longer detours: branch, work on the copy (alone or together), merge back when done; a merge
 is a replay, so edits that no longer fit the target are skipped and reported.
 
-Users: in the TrueNAS root shell, `cd /mnt/Apps/Apps && docker compose exec -it solidcraft-server
-solidcraft-server user add NAME` (it asks for the password twice); `user list` and `user remove NAME`
-likewise. The site asks for a sign-in until at least one user exists. Browsers remember the
-sign-in for the session; closing the browser signs out.
+Users: the first one from the TrueNAS root shell, `cd /mnt/Apps/Apps && docker compose exec -it
+solidcraft-server solidcraft-server user add NAME` (it asks for the password twice; the first user
+is an admin); after that the app's Users window (file panel › Users…) does the rest, and `user
+list` / `user remove NAME` still work. The site asks for a sign-in until at least one user exists.
+Browsers remember the sign-in for the session; closing the browser signs out.
+
+Authentik (or another identity provider) instead of nginx's own sign-in: set up forward auth for
+`solidcraft.lan.homedc.xyz` in Nginx Proxy Manager as Authentik's documentation describes (the
+outpost's nginx snippet, which passes `X-authentik-username` to the upstream), add to the
+`solidcraft` service in `W:\docker-compose.yml`
+`- /mnt/Apps/Apps/solidcraft/packaging/docker/auth/header:/etc/nginx/solidcraft:ro`, remove its
+`ports:` mapping (NPM reaches it on the compose network), and `docker compose up -d solidcraft`.
+User names then come from Authentik; the users file is only consulted for who is an admin (add
+the Authentik names there with `user add NAME --admin`, any password).
 
 Remotes: `origin` is the fork (github.com/dmquinny/solidcraft), `upstream` is tangency-labs.
 

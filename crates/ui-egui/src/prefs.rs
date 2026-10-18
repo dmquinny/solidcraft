@@ -478,7 +478,12 @@ pub struct PrefsWindow {
 /// Open the dialog at a page.
 pub fn open_at(app: &mut SolveApp, page: usize) {
     app.prefs_window.open = true;
-    app.prefs_window.section = page.min(PAGES.len() - 1);
+    app.prefs_window.section = page.min((PAGES.len() + app.services.host_pages.len()).saturating_sub(1));
+}
+
+/// Open the dialog at the host's `index`th page (`Services::host_pages`).
+pub fn open_host_page(app: &mut SolveApp, index: usize) {
+    open_at(app, PAGES.len() + index);
 }
 
 /// Every setting the dialog changes, for Cancel and Restore Defaults.
@@ -957,13 +962,32 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         app.keymap.read_only = false;
                     }
                 }
+                // The host's pages come after the built-in ones.
+                for j in 0..app.services.host_pages.len() {
+                    let title = app.services.host_pages[j].title.clone();
+                    if ui.selectable_label(app.prefs_window.section == PAGES.len() + j, title).clicked() {
+                        app.prefs_window.section = PAGES.len() + j;
+                        app.keymap.read_only = false;
+                    }
+                }
             });
             ui_body.separator();
             ui_body.vertical(|ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(app.tr_label(PAGES.get(app.prefs_window.section).copied().unwrap_or_default())).strong().size(14.0));
+                let host_page = app.prefs_window.section.checked_sub(PAGES.len());
+                let heading: String = match host_page {
+                    Some(j) => app.services.host_pages.get(j).map(|p| p.title.clone()).unwrap_or_default(),
+                    None => app.tr_label(PAGES.get(app.prefs_window.section).copied().unwrap_or_default()).to_string(),
+                };
+                ui.label(RichText::new(heading).strong().size(14.0));
                 ui.add_space(6.0);
-                if app.prefs_window.section == PAGE_SHORTCUTS {
+                if let Some(j) = host_page {
+                    egui::ScrollArea::vertical().id_salt("sc_prefs_page").auto_shrink([false, false]).show(ui, |ui| {
+                        if let Some(p) = app.services.host_pages.get_mut(j) {
+                            (p.show)(ui);
+                        }
+                    });
+                } else if app.prefs_window.section == PAGE_SHORTCUTS {
                     // The shortcuts table scrolls by itself.
                     page(app, ui, &t);
                 } else {

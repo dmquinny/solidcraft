@@ -30,7 +30,17 @@
 //!   holds are refused with 409. `POST /files/<path>?branch=<new path>` copies the design under
 //!   the new name, whose log's first marker says where it came from (merging is the client's:
 //!   it replays the branch's commands onto the target).
+//! - Users: `GET /files/?users` → who is signed in, whether they are an admin, and everyone's
+//!   names; `POST /files/?users` `{"name","password","admin"}` adds a user or gives one a new
+//!   password (admins only); `DELETE /files/?users=<name>` removes one (admins only, never the
+//!   last admin); `POST /files/?password` `{"password"}` changes the caller's own.
 //! - `GET /healthz` → 200.
+//!
+//! Without a name from nginx a request is refused (401), unless `SOLIDCRAFT_ALLOW_ANONYMOUS=1`.
+//! A proxy that signed the user in may also pass their groups (`X-Remote-Groups`, comma
+//! separated): members of `SOLIDCRAFT_ADMIN_GROUP` (default `solidcraft-admins`) are admins
+//! too. Every name that ever signed in is remembered (`<history>/users-seen`), so the Users
+//! page lists people the proxy knows even when the users file does not.
 //!
 //! Command line: `solidcraft-server` serves; `solidcraft-server user add|remove|list [NAME]`
 //! maintains the users file. Settings come from the environment: `SOLIDCRAFT_DESIGNS`
@@ -51,6 +61,10 @@ pub struct Settings {
     pub designs: PathBuf,
     pub history: PathBuf,
     pub listen: String,
+    /// Serve requests that carry no user name (nginx without sign-in).
+    pub allow_anonymous: bool,
+    /// The group (in `X-Remote-Groups`) whose members are admins.
+    pub admin_group: String,
 }
 
 impl Settings {
@@ -60,12 +74,19 @@ impl Settings {
             designs: PathBuf::from(var("SOLIDCRAFT_DESIGNS", "/srv/designs")),
             history: PathBuf::from(var("SOLIDCRAFT_HISTORY", "/srv/history")),
             listen: var("SOLIDCRAFT_LISTEN", "0.0.0.0:8782"),
+            allow_anonymous: matches!(var("SOLIDCRAFT_ALLOW_ANONYMOUS", "0").as_str(), "1" | "true" | "yes"),
+            admin_group: var("SOLIDCRAFT_ADMIN_GROUP", "solidcraft-admins"),
         }
     }
 
     /// nginx's `auth_basic_user_file`.
     pub fn users_file(&self) -> PathBuf {
         self.history.join("htpasswd")
+    }
+
+    /// Every name that ever signed in, one per line.
+    pub fn seen_file(&self) -> PathBuf {
+        self.history.join("users-seen")
     }
 }
 
@@ -102,6 +123,6 @@ fn health(settings: &Settings) -> Result<(), String> {
 }
 
 const USAGE: &str = "usage: solidcraft-server [serve|health]
-       solidcraft-server user add NAME [--password-stdin]
+       solidcraft-server user add NAME [--admin] [--password-stdin]
        solidcraft-server user remove NAME
        solidcraft-server user list";
