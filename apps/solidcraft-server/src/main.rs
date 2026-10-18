@@ -34,6 +34,13 @@
 //!   names; `POST /files/?users` `{"name","password","admin"}` adds a user or gives one a new
 //!   password (admins only); `DELETE /files/?users=<name>` removes one (admins only, never the
 //!   last admin); `POST /files/?password` `{"password"}` changes the caller's own.
+//! - Sharing (`access`): `GET /files/<path>?access` (a folder: with the trailing slash) → who
+//!   owns it, who may view and edit it, what it inherits; `POST` `{"view": null|[names],
+//!   "edit": null|[names]}` sets it (owners, admins, and the creator of a design that has no
+//!   entry yet); `DELETE` removes its own entry so it follows its folder again. Requests for a
+//!   design someone may not view answer 403, and so do changes from someone who may only view.
+//!   `SOLIDCRAFT_DEFAULT_ACCESS` is `everyone` (the default) or `owner` (new designs start as
+//!   their creator's own).
 //! - `GET /healthz` → 200.
 //!
 //! Without a name from nginx a request is refused (401), unless `SOLIDCRAFT_ALLOW_ANONYMOUS=1`.
@@ -49,6 +56,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod access;
 mod http;
 mod ops;
 mod store;
@@ -65,6 +73,8 @@ pub struct Settings {
     pub allow_anonymous: bool,
     /// The group (in `X-Remote-Groups`) whose members are admins.
     pub admin_group: String,
+    /// Designs without sharing of their own are everyone's (else their creator's).
+    pub default_open: bool,
 }
 
 impl Settings {
@@ -76,6 +86,7 @@ impl Settings {
             listen: var("SOLIDCRAFT_LISTEN", "0.0.0.0:8782"),
             allow_anonymous: matches!(var("SOLIDCRAFT_ALLOW_ANONYMOUS", "0").as_str(), "1" | "true" | "yes"),
             admin_group: var("SOLIDCRAFT_ADMIN_GROUP", "solidcraft-admins"),
+            default_open: var("SOLIDCRAFT_DEFAULT_ACCESS", "everyone") != "owner",
         }
     }
 

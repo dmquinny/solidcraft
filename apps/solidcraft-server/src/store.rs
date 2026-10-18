@@ -171,6 +171,12 @@ impl Store {
         Ok(Some(self.head()))
     }
 
+    /// Who first saved a design, by the history (`None` when it has none).
+    pub fn first_author(&self, path: &str) -> Option<String> {
+        let out = self.git(&["log", "--diff-filter=A", "--format=%an", "--", path]).ok()?;
+        out.lines().last().map(str::trim).filter(|a| !a.is_empty()).map(str::to_string)
+    }
+
     /// The latest commit ("" in an empty repository).
     fn head(&self) -> String {
         self.git(&["rev-parse", "HEAD"]).map(|h| h.trim().to_string()).unwrap_or_default()

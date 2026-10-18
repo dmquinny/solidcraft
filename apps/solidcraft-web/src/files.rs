@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
+use serde_json::Value;
 use solidcraft_engine::io::vfs;
 use wasm_bindgen::{JsCast as _, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -81,6 +82,28 @@ pub struct Version {
     pub size: u64,
 }
 
+/// What a sharing is about.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    /// A design of the current folder, by name.
+    Design(String),
+    /// The current folder itself.
+    Folder,
+}
+
+/// The sharing of a design or folder, as the storage service tells it. `owner` is `None` when
+/// it has no sharing of its own (then `inherited_from` says what it follows, if anything).
+/// In `view` / `edit`, `None` means everyone.
+#[derive(Clone, Debug, Default)]
+pub struct Access {
+    pub owner: Option<String>,
+    pub view: Option<Vec<String>>,
+    pub edit: Option<Vec<String>>,
+    pub inherited_from: Option<String>,
+    pub default_open: bool,
+    pub can_manage: bool,
+}
+
 /// The site's users, as the storage service tells them.
 #[derive(Clone, Debug, Default)]
 pub struct Users {
@@ -104,6 +127,9 @@ pub struct Files {
     /// The users were asked for; what the server answered (the Users page).
     pub users_asked: Cell<bool>,
     pub users: RefCell<Option<Users>>,
+    /// The Sharing window: what it is about (a design's name, or a folder: the current one), a
+    /// label for it, and what the server said; `None` when closed.
+    pub sharing: RefCell<Option<(Target, String, Option<Access>)>>,
     /// Files read from the computer: (name, bytes, what to do).
     pub incoming: RefCell<Vec<(String, Vec<u8>, Intent)>>,
     /// Messages for the status line (errors and confirmations).
@@ -316,6 +342,70 @@ pub(crate) async fn remote_json(method: &str, url: &str, body: Option<&[u8]>) ->
         return Err(if why.is_empty() || why.starts_with('{') { format!("HTTP {status}") } else { format!("HTTP {status}: {why}") });
     }
     serde_json::from_str(&text).map_err(|e| format!("not JSON: {e}"))
+}
+
+fn access_url(target: &Target) -> String {
+    match target {
+        Target::Design(name) => format!("{}?access", remote_url(name)),
+        Target::Folder => format!("{}?access", remote_dir()),
+    }
+}
+
+/// Open the Sharing window on a design or the current folder and ask the server about it.
+pub fn sharing(files: &Rc<Files>, target: Target) {
+    let label = match &target {
+        Target::Design(n) => n.clone(),
+        Target::Folder => {
+            let f = remote_folder();
+            if f.is_empty() { "the whole design folder".to_string() } else { format!("the folder {f}") }
+        }
+    };
+    *files.sharing.borrow_mut() = Some((target.clone(), label, None));
+    if !files.users_asked.get() {
+        users(files);
+    }
+    sharing_request(files, target, "GET", None);
+}
+
+/// Set who may view and who may edit (`None`: everyone); owners and admins only.
+pub fn set_sharing(files: &Rc<Files>, target: Target, view: Option<Vec<String>>, edit: Option<Vec<String>>) {
+    let body = serde_json::json!({"view": view, "edit": edit}).to_string();
+    sharing_request(files, target, "POST", Some(body));
+}
+
+/// Drop a sharing of its own: it follows its folder (or the default) again.
+pub fn clear_sharing(files: &Rc<Files>, target: Target) {
+    sharing_request(files, target, "DELETE", None);
+}
+
+fn sharing_request(files: &Rc<Files>, target: Target, method: &'static str, body: Option<String>) {
+    let files = files.clone();
+    spawn_local(async move {
+        match remote_json(method, &access_url(&target), body.as_deref().map(str::as_bytes)).await {
+            Ok(v) => {
+                let names =
+                    |k: &str| v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(|n| n.as_str().map(str::to_string)).collect::<Vec<_>>());
+                let access = Access {
+                    owner: v["owner"].as_str().map(str::to_string),
+                    view: names("view"),
+                    edit: names("edit"),
+                    inherited_from: v["inherited_from"].as_str().map(str::to_string),
+                    default_open: v["default_open"].as_bool().unwrap_or(true),
+                    can_manage: v["can_manage"].as_bool().unwrap_or(false),
+                };
+                if let Some((t, _, a)) = files.sharing.borrow_mut().as_mut()
+                    && *t == target
+                {
+                    *a = Some(access);
+                }
+                if method != "GET" {
+                    files.say("Sharing changed", false);
+                }
+            }
+            Err(e) => files.say(format!("sharing: {e}"), true),
+        }
+        files.wake();
+    });
 }
 
 /// Ask the server who is who (the Users page).
@@ -568,6 +658,9 @@ async fn remote_write(name: &str, bytes: &[u8]) -> Result<(), String> {
     if r.ok() {
         remember_etag(name, &r);
         return Ok(());
+    }
+    if r.status() == 403 {
+        return Err("you may only view this design here: ask its owner to share it for editing, or save it under another name".into());
     }
     if r.status() == 412 {
         // Someone else saved since the version here: the next save overwrites.

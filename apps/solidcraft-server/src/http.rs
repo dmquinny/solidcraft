@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::Settings;
+use crate::access::{self, Acl, Level};
 use crate::ops::Refused;
 use crate::store::{Change, Entry, Meta, Store, Version, Written, clean_path};
 use crate::users;
@@ -30,6 +31,8 @@ struct Service {
     /// Everyone who ever signed in (kept in `seen_file`).
     seen: std::sync::Mutex<std::collections::BTreeSet<String>>,
     seen_file: PathBuf,
+    /// Who may see and change what.
+    acl: Acl,
 }
 
 impl Service {
@@ -64,6 +67,7 @@ pub fn serve(settings: &Settings) -> Result<(), String> {
         admin_group: settings.admin_group.clone(),
         seen: std::sync::Mutex::new(seen),
         seen_file,
+        acl: Acl::open(&settings.history.join("access.json"), settings.default_open),
     });
     let server = Server::http(&settings.listen).map_err(|e| format!("listen on {}: {e}", settings.listen))?;
     log::info!("serving {} on http://{}/files/ (history in {})", settings.designs.display(), settings.listen, settings.history.display());
@@ -75,7 +79,6 @@ pub fn serve(settings: &Settings) -> Result<(), String> {
 }
 
 fn handle(service: &Service, mut request: Request) {
-    let store = &service.store;
     let method = request.method().clone();
     let url = request.url().to_string();
     let named = header(&request, USER_HEADER).filter(|u| !u.is_empty() && users::check_name(u).is_ok());
@@ -96,7 +99,7 @@ fn handle(service: &Service, mut request: Request) {
     let reply = match body {
         Ok(body) => match users_route(service, admin, &method, &url, &user, &body) {
             Some(reply) => reply,
-            None => route(store, &method, &url, &user, if_match.as_deref(), only_new, fingerprint.as_deref(), body),
+            None => route(service, admin, &method, &url, &user, if_match.as_deref(), only_new, fingerprint.as_deref(), body),
         },
         Err(e) => Reply::text(413, &e),
     };
@@ -189,7 +192,8 @@ fn split_url(url: &str) -> (String, Vec<(String, String)>) {
 
 #[allow(clippy::too_many_arguments)]
 fn route(
-    store: &Store,
+    service: &Service,
+    admin: bool,
     method: &Method,
     url: &str,
     user: &str,
@@ -211,13 +215,31 @@ fn route(
         Ok(p) => p,
         Err(e) => return Reply::text(400, &e),
     };
+    let store = &service.store;
     store.sweep(false);
+    // Sharing: what may this user do here? (Branching only reads the source; its target folder
+    // is checked below.)
+    let acl = &service.acl;
+    let key = access::key(&clean, folder);
+    let level = acl.level(user, admin, &key);
+    if get("access").is_some() {
+        return access_route(service, admin, method, &key, user, &body, level);
+    }
+    let changes = matches!(method, Method::Put | Method::Delete | Method::Post) && get("branch").is_none();
+    if level == Level::None || (changes && level != Level::Edit) {
+        return Reply::text(403, if level == Level::None { "not shared with you" } else { "shared with you to view, not to change" });
+    }
+    let may_view = |path: &str, dir: bool| acl.level(user, admin, &access::key(path, dir)) > Level::None;
     let result = match (method, folder) {
-        (Method::Get, true) if get("log").is_some() => {
-            store.log(&clean, LOG_ENTRIES).map(|c| Reply::json(200, &changes_json(&c)).with(USER_HEADER, user))
-        }
+        (Method::Get, true) if get("log").is_some() => store.log(&clean, LOG_ENTRIES).map(|mut c| {
+            c.retain(|c| may_view(&c.path, false));
+            Reply::json(200, &changes_json(&c)).with(USER_HEADER, user)
+        }),
         (Method::Get, true) => store.list(&clean).map(|l| match l {
-            Some(entries) => Reply::json(200, &listing_json(&entries)).with(USER_HEADER, user),
+            Some(mut entries) => {
+                entries.retain(|e| may_view(&if clean.is_empty() { e.name.clone() } else { format!("{clean}/{}", e.name) }, e.dir));
+                Reply::json(200, &listing_json(&entries)).with(USER_HEADER, user)
+            }
             None => Reply::text(404, "no such folder"),
         }),
         (Method::Get, false) if get("ops").is_some() => {
@@ -239,8 +261,16 @@ fn route(
             Err(e) => Ok(Reply::text(400, &format!("not a command list: {e}"))),
         },
         (Method::Post, false) if get("branch").is_some() => match clean_path(get("branch").unwrap_or("")) {
+            Ok(to) if acl.level(user, admin, &access::key(to.rsplit_once('/').map_or("", |(d, _)| d), true)) < Level::Edit => {
+                Ok(Reply::text(403, "you may not add designs to that folder"))
+            }
             Ok(to) => store.branch(&clean, &to, user).map(|r| match r {
-                Some(meta) => Reply::new(201).with_meta(&meta),
+                Some(meta) => {
+                    if !acl.default_open {
+                        acl.set(&to, access::Entry { owner: user.to_string(), view: Some(Vec::new()), edit: Some(Vec::new()) });
+                    }
+                    Reply::new(201).with_meta(&meta)
+                }
                 None => Reply::text(404, "no such design"),
             }),
             Err(e) => Ok(Reply::text(400, &e)),
@@ -269,11 +299,24 @@ fn route(
         }),
         (Method::Put, false) if clean.is_empty() => Ok(Reply::text(400, "a design needs a name")),
         (Method::Put, false) => store.write(&clean, &body, user, if_match, only_new, fingerprint).map(|w| match w {
-            Written::Created(meta) => Reply::new(201).with_meta(&meta),
+            Written::Created(meta) => {
+                // In the "owner" mode a new design starts as its creator's own.
+                if !acl.default_open && acl.get(&key).is_none() {
+                    acl.set(&key, access::Entry { owner: user.to_string(), view: Some(Vec::new()), edit: Some(Vec::new()) });
+                }
+                Reply::new(201).with_meta(&meta)
+            }
             Written::Updated(meta) | Written::Unchanged(meta) => Reply::new(204).with_meta(&meta),
             Written::Stale(meta) => Reply::json(412, &json!({"author": meta.author, "date": meta.date})).with_meta(&meta),
         }),
-        (Method::Delete, false) => store.delete(&clean, user).map(|gone| if gone { Reply::new(204) } else { Reply::text(404, "no such design") }),
+        (Method::Delete, false) => store.delete(&clean, user).map(|gone| {
+            if gone {
+                acl.remove(&key);
+                Reply::new(204)
+            } else {
+                Reply::text(404, "no such design")
+            }
+        }),
         (Method::Post, false) if get("restore").is_some() => store.restore(&clean, get("restore").unwrap_or(""), user).map(|r| match r {
             Some(meta) => Reply::new(200).with_meta(&meta),
             None => Reply::text(404, "no such version of that design"),
@@ -287,6 +330,53 @@ fn route(
             log::error!("{method} {url}: {e}");
             Reply::text(500, &e)
         }
+    }
+}
+
+/// `?access`: the sharing of a design or folder. Anyone who may view it sees it; owners, admins
+/// and the creator of a design without an entry of its own set it (`POST`) or let it follow its
+/// folder again (`DELETE`).
+fn access_route(service: &Service, admin: bool, method: &Method, key: &str, user: &str, body: &[u8], level: Level) -> Reply {
+    let acl = &service.acl;
+    let own = acl.get(key);
+    let creator = || !key.ends_with('/') && service.store.first_author(key).as_deref() == Some(user);
+    // A folder nobody owns yet is taken by whoever may change it (the top folder by admins only).
+    let claimable = key.ends_with('/') && key != "/" && level == Level::Edit;
+    let can_manage = acl.manages(user, admin, key) || (own.is_none() && (admin || creator() || claimable));
+    if level == Level::None && !can_manage {
+        return Reply::text(403, "not shared with you");
+    }
+    let show = |own: Option<access::Entry>| {
+        let inherited = acl.effective(key).filter(|(k, _)| k != key);
+        json!({
+            "owner": own.as_ref().map(|e| e.owner.clone()),
+            "view": own.as_ref().map(|e| e.view.clone()),
+            "edit": own.as_ref().map(|e| e.edit.clone()),
+            "inherited_from": inherited.as_ref().map(|(k, _)| k.clone()),
+            "inherited": inherited.as_ref().map(|(_, e)| json!({"owner": e.owner, "view": e.view, "edit": e.edit})),
+            "default_open": acl.default_open,
+            "can_manage": can_manage,
+        })
+    };
+    let names = |v: &Value, k: &str| -> Option<Vec<String>> {
+        v.get(k)?.as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(str::to_string)).collect())
+    };
+    match method {
+        Method::Get => Reply::json(200, &show(own)),
+        Method::Post | Method::Delete if !can_manage => Reply::text(403, "only its owner (or an admin) shares it"),
+        Method::Post => {
+            let Ok(v) = serde_json::from_slice::<Value>(body) else {
+                return Reply::text(400, "not a sharing: {\"view\": null|[names], \"edit\": null|[names]}");
+            };
+            let owner = own.as_ref().map(|e| e.owner.clone()).or_else(|| service.store.first_author(key)).unwrap_or_else(|| user.to_string());
+            acl.set(key, access::Entry { owner, view: names(&v, "view"), edit: names(&v, "edit") });
+            Reply::json(200, &show(acl.get(key)))
+        }
+        Method::Delete => {
+            acl.remove(key);
+            Reply::json(200, &show(None))
+        }
+        _ => Reply::text(405, "method not allowed"),
     }
 }
 

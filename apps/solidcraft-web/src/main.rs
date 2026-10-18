@@ -193,6 +193,10 @@ mod web {
         /// The history window's branch name and merge target fields.
         branch_name: String,
         merge_target: String,
+        /// The Sharing window's choices (`None`: everyone), and what they were made for.
+        share_for: Option<files::Target>,
+        share_view: Option<std::collections::BTreeSet<String>>,
+        share_edit: Option<std::collections::BTreeSet<String>>,
         /// The start page's recent designs were filled from the stored ones.
         recents_synced: bool,
         /// On-demand CJK font: fetched only when a CJK language is selected.
@@ -343,6 +347,14 @@ mod web {
                                     self.folder = current.clone();
                                 }
                             }
+                            if !user.is_empty()
+                                && ui
+                                    .small_button("Share folder\u{2026}")
+                                    .on_hover_text("Who may see and change the designs in this folder")
+                                    .clicked()
+                            {
+                                act = Some(("share_folder", String::new()));
+                            }
                             if !current.is_empty() && ui.small_button("Up").on_hover_text("The folder above").clicked() {
                                 act = Some(("folder", current.rsplit_once('/').map_or(String::new(), |(p, _)| p.to_string())));
                             }
@@ -412,6 +424,12 @@ mod web {
                                     if remote && ui.small_button("History").on_hover_text("Every version saved on the server").clicked() {
                                         act = Some(("history", e.name.clone()));
                                     }
+                                    if remote
+                                        && !user.is_empty()
+                                        && ui.small_button("Share").on_hover_text("Who may see and change this design").clicked()
+                                    {
+                                        act = Some(("share", e.name.clone()));
+                                    }
                                 });
                                 ui.end_row();
                             }
@@ -468,6 +486,8 @@ mod web {
                     self.app.home.recent.retain(|r| *r != path);
                 }
                 "history" => files::history(&self.files, &name),
+                "share" => files::sharing(&self.files, files::Target::Design(name.clone())),
+                "share_folder" => files::sharing(&self.files, files::Target::Folder),
                 "users" => {
                     self.files.panel.set(false);
                     solidcraft_ui_egui::prefs::open_host_page(&mut self.app, 0);
@@ -571,6 +591,101 @@ mod web {
                     self.sync.merge(&self.files, &name, &target);
                     *self.files.history.borrow_mut() = None;
                     self.files.panel.set(false);
+                }
+                _ => {}
+            }
+        }
+
+        /// The Sharing window (files::sharing): who may view and who may change a design or the
+        /// current folder; everyone, or only the people ticked.
+        fn sharing_window(&mut self, ctx: &egui::Context) {
+            let Some((target, label, access)) = self.files.sharing.borrow().clone() else { return };
+            if self.share_for.as_ref() != Some(&target) {
+                // Fresh choices for a new subject, from what the server said (once it has).
+                let Some(a) = &access else { return };
+                self.share_for = Some(target.clone());
+                self.share_view = a.view.clone().map(|v| v.into_iter().collect());
+                self.share_edit = a.edit.clone().map(|v| v.into_iter().collect());
+            }
+            let users: Vec<String> = self.files.users.borrow().as_ref().map(|u| u.list.iter().map(|(n, _)| n.clone()).collect()).unwrap_or_default();
+            let mut open = true;
+            let mut act: Option<&'static str> = None;
+            egui::Window::new(format!("Sharing of {label}")).open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(
+                ctx,
+                |ui| {
+                    let Some(a) = &access else {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Asking the server\u{2026}");
+                        });
+                        return;
+                    };
+                    match (&a.owner, &a.inherited_from) {
+                        (Some(owner), _) => ui.label(format!("Owner: {owner}")),
+                        (None, Some(from)) => ui.label(format!(
+                            "No sharing of its own: it follows {}",
+                            if from == "/" { "the whole design folder".to_string() } else { format!("the folder {from}") }
+                        )),
+                        (None, None) => ui.label(if a.default_open {
+                            "No sharing of its own: everyone may see and change it"
+                        } else {
+                            "No sharing of its own: only its creator and the admins"
+                        }),
+                    };
+                    if !a.can_manage {
+                        ui.label("Only its owner or an admin can change this.");
+                    }
+                    ui.add_enabled_ui(a.can_manage, |ui| {
+                        for (what, chosen) in [("Can see it:", &mut self.share_view), ("Can change it:", &mut self.share_edit)] {
+                            ui.separator();
+                            ui.label(what);
+                            ui.horizontal(|ui| {
+                                if ui.radio(chosen.is_none(), "everyone").clicked() {
+                                    *chosen = None;
+                                }
+                                if ui.radio(chosen.is_some(), "only these people (and the owner)").clicked() && chosen.is_none() {
+                                    *chosen = Some(Default::default());
+                                }
+                            });
+                            if let Some(set) = chosen {
+                                ui.horizontal_wrapped(|ui| {
+                                    for u in &users {
+                                        let mut on = set.contains(u);
+                                        if ui.checkbox(&mut on, u).changed() {
+                                            if on {
+                                                set.insert(u.clone());
+                                            } else {
+                                                set.remove(u);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Apply").clicked() {
+                                act = Some("apply");
+                            }
+                            if a.owner.is_some() && ui.button("Follow the folder").on_hover_text("Drop this sharing of its own").clicked() {
+                                act = Some("clear");
+                            }
+                        });
+                    });
+                },
+            );
+            if !open {
+                *self.files.sharing.borrow_mut() = None;
+                self.share_for = None;
+            }
+            match act {
+                Some("apply") => {
+                    let as_vec = |s: &Option<std::collections::BTreeSet<String>>| s.as_ref().map(|s| s.iter().cloned().collect::<Vec<_>>());
+                    files::set_sharing(&self.files, target, as_vec(&self.share_view), as_vec(&self.share_edit));
+                }
+                Some("clear") => {
+                    self.share_for = None;
+                    files::clear_sharing(&self.files, target);
                 }
                 _ => {}
             }
@@ -721,6 +836,7 @@ mod web {
             let ctx = ui.ctx().clone();
             self.file_panel(&ctx);
             self.history_window(&ctx);
+            self.sharing_window(&ctx);
             self.live_panel(&ctx);
             self.recovery_prompt(&ctx);
             self.watch_text_for_font(&ctx);
@@ -854,6 +970,9 @@ mod web {
                             sync: crate::sync::Sync::new(),
                             branch_name: String::new(),
                             merge_target: String::new(),
+                            share_for: None,
+                            share_view: None,
+                            share_edit: None,
                             recents_synced: false,
                             font: Default::default(),
                             font_result: Rc::new(std::cell::RefCell::new(None)),
