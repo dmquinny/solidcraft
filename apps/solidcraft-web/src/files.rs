@@ -73,7 +73,7 @@ pub struct Change {
 }
 
 /// Something another user shared with this one by name.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Shared {
     /// A design's path, or a folder's ("" for the design folder itself).
     pub path: String,
@@ -133,6 +133,14 @@ pub struct Files {
     pub changes: RefCell<Vec<Change>>,
     /// What others shared with this user by name (the storage service only).
     pub shared: RefCell<Vec<Shared>>,
+    /// When the shared list was last asked for (ms since 1970): the start page asks again.
+    pub shared_at: Cell<f64>,
+    /// Who the storage service says we are (`?me`); None before it answered, and with plain
+    /// nginx storage (no sign-in).
+    pub me: RefCell<Option<Me>>,
+    /// What this user may do in the current server folder, as its listing said: "edit", "view",
+    /// "none" (not shared with them: only designs shared with them are listed) or "" (unknown).
+    pub folder_access: RefCell<String>,
     /// A stored design to open as soon as the entries are loaded (after a folder change).
     pub open_next: RefCell<Option<String>>,
     /// The history window: a server design's name and its versions, newest first (empty while
@@ -227,6 +235,15 @@ thread_local! {
     static REMOTE: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The signed-in user as the storage service sees them (`?me`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Me {
+    pub name: String,
+    pub admin: bool,
+    /// Where Sign out goes (the proxy's sign-out page); None: no such page (a password sign-in).
+    pub logout: Option<String>,
+}
+
 /// The server's design folder, relative to the page (same origin: no CORS, no configuration).
 const REMOTE_DIR: &str = "files/";
 /// Local storage key of the subfolder designs are filed in.
@@ -271,6 +288,37 @@ pub fn set_fingerprint(name: &str, fingerprint: &str) {
 /// The signed-in user (empty when the server doesn't say).
 pub fn remote_user() -> String {
     REMOTE_USER.with(|u| u.borrow().clone())
+}
+
+/// Ask again what others shared with this user (the start page does, every half minute).
+pub fn refresh_shared(files: &Rc<Files>) {
+    if !remote_only() {
+        return;
+    }
+    files.shared_at.set(js_sys::Date::now());
+    let files = files.clone();
+    spawn_local(async move {
+        let shared = remote_shared().await;
+        fetch_shared_files(&files, &shared);
+        if *files.shared.borrow() != shared {
+            *files.shared.borrow_mut() = shared;
+            files.wake();
+        }
+    });
+}
+
+/// Go to the proxy's sign-out page; false when there is none (a password sign-in: closing the
+/// browser ends it).
+pub fn sign_out(files: &Files) -> bool {
+    let Some(url) = files.me.borrow().as_ref().and_then(|m| m.logout.clone()) else { return false };
+    web_sys::window().is_some_and(|w| w.location().assign(&url).is_ok())
+}
+
+/// Load the page again (a new build, or a sign-in that lapsed).
+pub fn reload() {
+    if let Some(w) = web_sys::window() {
+        let _ = w.location().reload();
+    }
 }
 
 /// "just now", "5 min ago", "3 h ago", "2 d ago", or the date.
@@ -578,6 +626,9 @@ struct Listing {
     folders: Vec<String>,
     changes: Vec<Change>,
     shared: Vec<Shared>,
+    me: Option<Me>,
+    /// `X-Folder-Access` ("" when the server doesn't say).
+    access: String,
 }
 
 /// A JSON array response as its objects' string fields, by key.
@@ -602,6 +653,24 @@ async fn json_rows(r: web_sys::Response) -> Result<Vec<HashMap<String, String>>,
 
 fn date_of(row: &HashMap<String, String>, key: &str) -> f64 {
     row.get(key).map(|m| js_sys::Date::parse(m)).filter(|t| !t.is_nan()).unwrap_or(0.0)
+}
+
+/// Who the storage service says we are (None from plain nginx storage, or when nobody is).
+async fn remote_me() -> Option<Me> {
+    let r = remote_request("GET", &format!("{REMOTE_DIR}?me"), None, &[]).await.ok()?;
+    if !is_listing(&r) {
+        return None;
+    }
+    let text = JsFuture::from(r.text().ok()?).await.ok()?.as_string()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    if v["anonymous"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    Some(Me {
+        name: v["name"].as_str().unwrap_or_default().to_string(),
+        admin: v["admin"].as_bool().unwrap_or(false),
+        logout: v["logout"].as_str().filter(|u| u.starts_with('/') || u.starts_with("https://")).map(str::to_string),
+    })
 }
 
 /// What others shared with this user (none from plain nginx storage).
@@ -667,7 +736,7 @@ async fn remote_list() -> Result<Option<Listing>, String> {
     if let Some(user) = r.headers().get("x-remote-user").ok().flatten() {
         REMOTE_USER.with(|u| *u.borrow_mut() = user);
     }
-    let mut listing = Listing::default();
+    let mut listing = Listing { access: r.headers().get("x-folder-access").ok().flatten().unwrap_or_default(), ..Listing::default() };
     for row in json_rows(r).await? {
         let Some(name) = row.get("name").cloned() else { continue };
         if name.starts_with('.') || stays_local(&name) {
@@ -682,6 +751,10 @@ async fn remote_list() -> Result<Option<Listing>, String> {
     listing.folders.sort_by_key(|f| f.to_lowercase());
     listing.changes = remote_log(&dir).await;
     listing.shared = remote_shared().await;
+    listing.me = remote_me().await;
+    if let Some(m) = &listing.me {
+        REMOTE_USER.with(|u| *u.borrow_mut() = m.name.clone());
+    }
     Ok(Some(listing))
 }
 
@@ -1020,6 +1093,8 @@ struct Loaded {
     folders: Vec<String>,
     changes: Vec<Change>,
     shared: Vec<Shared>,
+    me: Option<Me>,
+    access: String,
 }
 
 /// Every stored file, and the server folder's subfolders. With server storage, the server's files
@@ -1048,7 +1123,7 @@ async fn read_remote(listing: Listing) -> Loaded {
             Err(e) => log::warn!("{name}: {e}"),
         }
     }
-    Loaded { files, folders: listing.folders, changes: listing.changes, shared: listing.shared }
+    Loaded { files, folders: listing.folders, changes: listing.changes, shared: listing.shared, me: listing.me, access: listing.access }
 }
 
 /// Every file in the browser's storage. Without OPFS, local storage takes over from here on.
@@ -1113,7 +1188,10 @@ pub fn start(files: &Rc<Files>) {
 /// The loaded files go into the engine's files and the panel's entries; the app may open them.
 fn install(files: &Files, loaded: Result<Loaded, String>) {
     match loaded {
-        Ok(Loaded { files: all, folders, changes, shared }) => {
+        Ok(Loaded { files: all, folders, changes, shared, me, access }) => {
+            *files.me.borrow_mut() = me;
+            *files.folder_access.borrow_mut() = access;
+            files.shared_at.set(js_sys::Date::now());
             let mut entries = Vec::new();
             let has_recovery = all.iter().any(|(n, _, _)| n == RECOVERY);
             for (name, bytes, modified) in all {

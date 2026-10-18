@@ -281,11 +281,22 @@ pub struct Services {
     /// the host between Recent and Samples with `home::section`, `home::grid` and
     /// `home::design_card`; each draws its own heading when it has something to show.
     pub home_sections: Vec<Box<dyn FnMut(&mut SolveApp, &mut egui::Ui)>>,
+    /// The account button at the right of the title bar (a web host's signed-in user, with Sign
+    /// out), left of Report a bug; None: no such button (the desktop).
+    pub account: Option<AccountMenu>,
 }
 
 /// A Preferences page the host adds (`Services::host_pages`).
 pub struct HostPage {
     pub title: String,
+    pub show: Box<dyn FnMut(&mut egui::Ui)>,
+}
+
+/// The title bar's account button and its menu (`Services::account`).
+pub struct AccountMenu {
+    /// The text beside the icon when the bar has room (the user's name; "" for the icon alone).
+    pub label: Box<dyn Fn() -> String>,
+    /// The menu's contents.
     pub show: Box<dyn FnMut(&mut egui::Ui)>,
 }
 

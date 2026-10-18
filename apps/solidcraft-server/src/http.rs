@@ -36,6 +36,8 @@ struct Service {
     acl: Acl,
     /// The identity provider's users, when it is configured.
     directory: Option<Directory>,
+    /// Where Sign out goes when the proxy's `X-Remote-Logout` doesn't say.
+    logout_url: Option<String>,
 }
 
 impl Service {
@@ -75,6 +77,7 @@ pub fn serve(settings: &Settings) -> Result<(), String> {
         seen_file,
         acl: Acl::open(&settings.history.join("access.json"), settings.default_open),
         directory: Directory::new(&settings.authentik_url, &settings.authentik_token, &settings.admin_group),
+        logout_url: Some(settings.logout_url.trim().to_string()).filter(|u| !u.is_empty()),
     });
     if let Some(d) = &service.directory {
         log::info!("users also come from {} ({} known now)", d.source(), d.users().len());
@@ -103,12 +106,15 @@ fn handle(service: &Service, mut request: Request) {
         log::info!("{user}: first sign-in");
     }
     let admin = service.is_admin(&user, header(&request, "X-Remote-Groups").as_deref());
+    // The proxy's sign-out page (`?me`): on this site, or https; never anything else.
+    let logout =
+        header(&request, "X-Remote-Logout").filter(|u| u.starts_with('/') || u.starts_with("https://")).or_else(|| service.logout_url.clone());
     let if_match = header(&request, "If-Match").map(|v| v.trim().trim_start_matches("W/").trim_matches('"').to_string());
     let only_new = header(&request, "If-None-Match").is_some_and(|v| v.trim() == "*");
     let fingerprint = header(&request, "X-Fingerprint").filter(|f| !f.is_empty() && f.len() <= 64);
     let body = if matches!(method, Method::Put | Method::Post | Method::Delete) { read_body(&mut request) } else { Ok(Vec::new()) };
     let reply = match body {
-        Ok(body) => match users_route(service, admin, &method, &url, &user, &body) {
+        Ok(body) => match users_route(service, admin, &method, &url, &user, &body, logout.as_deref()) {
             Some(reply) => reply,
             None => route(service, admin, &method, &url, &user, if_match.as_deref(), only_new, fingerprint.as_deref(), body),
         },
@@ -237,7 +243,10 @@ fn route(
         return access_route(service, admin, method, &key, user, &body, level);
     }
     let changes = matches!(method, Method::Put | Method::Delete | Method::Post) && get("branch").is_none();
-    if level == Level::None || (changes && level != Level::Edit) {
+    // Reading a folder is never refused: its listing and log show only what this user may see
+    // (a design shared with them from a folder that isn't), and `?shared` is their own.
+    let reads_folder = *method == Method::Get && folder;
+    if (level == Level::None && !reads_folder) || (changes && level != Level::Edit) {
         return Reply::text(403, if level == Level::None { "not shared with you" } else { "shared with you to view, not to change" });
     }
     let may_view = |path: &str, dir: bool| acl.level(user, admin, &access::key(path, dir)) > Level::None;
@@ -258,7 +267,7 @@ fn route(
         (Method::Get, true) => store.list(&clean).map(|l| match l {
             Some(mut entries) => {
                 entries.retain(|e| may_view(&if clean.is_empty() { e.name.clone() } else { format!("{clean}/{}", e.name) }, e.dir));
-                Reply::json(200, &listing_json(&entries)).with(USER_HEADER, user)
+                Reply::json(200, &listing_json(&entries)).with(USER_HEADER, user).with("X-Folder-Access", level_name(level))
             }
             None => Reply::text(404, "no such folder"),
         }),
@@ -402,13 +411,17 @@ fn access_route(service: &Service, admin: bool, method: &Method, key: &str, user
 
 /// The users requests (`?users`, `?password`, on any folder URL), or `None` for anything else.
 /// The list is everyone in the users file plus everyone who ever signed in through the proxy.
-fn users_route(service: &Service, admin: bool, method: &Method, url: &str, user: &str, body: &[u8]) -> Option<Reply> {
+fn users_route(service: &Service, admin: bool, method: &Method, url: &str, user: &str, body: &[u8], logout: Option<&str>) -> Option<Reply> {
     let file: &Path = &service.users_file;
     let (path, query) = split_url(url);
     if !path.starts_with("/files/") {
         return None;
     }
     let get = |k: &str| query.iter().find(|(q, _)| q == k).map(|(_, v)| v.as_str());
+    // Who am I (the app's account menu): the name, whether an admin, and where Sign out goes.
+    if *method == Method::Get && get("me").is_some() {
+        return Some(Reply::json(200, &json!({"name": user, "admin": admin, "anonymous": user == ANONYMOUS, "logout": logout})));
+    }
     let field = |k: &str| serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get(k).cloned());
     let listing = |status: u16| match users::list(file) {
         Ok(mut list) => {
@@ -464,6 +477,15 @@ fn users_route(service: &Service, admin: bool, method: &Method, url: &str, user:
         }
         _ => return None,
     })
+}
+
+/// A level as the `X-Folder-Access` header says it.
+fn level_name(level: Level) -> &'static str {
+    match level {
+        Level::None => "none",
+        Level::View => "view",
+        Level::Edit => "edit",
+    }
 }
 
 /// nginx's autoindex JSON, which the app already reads.

@@ -85,6 +85,8 @@ pub struct Settings {
     /// Authentik's address and an API token that may read its users (both empty: no directory).
     pub authentik_url: String,
     pub authentik_token: String,
+    /// Where the app's Sign out goes when the proxy doesn't say (`X-Remote-Logout`); empty: nowhere.
+    pub logout_url: String,
 }
 
 impl Settings {
@@ -99,6 +101,7 @@ impl Settings {
             default_open: var("SOLIDCRAFT_DEFAULT_ACCESS", "everyone") != "owner",
             authentik_url: var("SOLIDCRAFT_AUTHENTIK_URL", ""),
             authentik_token: var("SOLIDCRAFT_AUTHENTIK_TOKEN", ""),
+            logout_url: var("SOLIDCRAFT_LOGOUT_URL", ""),
         }
     }
 

@@ -168,6 +168,23 @@ https://solidcraft.lan.homedc.xyz afterwards (the service worker picks up the ne
 next launch). Check that `GET https://solidcraft.lan.homedc.xyz/files/` still answers a JSON
 list: that is what switches the app to server storage.
 
+## Account menu and sign-out
+
+The title bar has an account button (left of Report a bug; `Services::account`, drawn by the web
+host): who is signed in and whether an admin, what they may do in the current folder, **Sign
+out**, **Reload the app** and the build id (the checkout's git commit, `apps/solidcraft-web/build.rs`,
+so a browser can say which build it runs). The service answers `GET /files/?me` with
+`{"name", "admin", "anonymous", "logout"}`; the sign-out page comes from the proxy in
+`X-Remote-Logout` (the `auth/header` snippet sets `/outpost.goauthentik.io/sign_out` behind
+Authentik's forward auth and `/cdn-cgi/access/logout` behind Cloudflare Access), else from
+`SOLIDCRAFT_LOGOUT_URL` on the service, else the menu says to close the browser (basic auth).
+
+Reading a folder is never refused: its listing shows what the user may see (a design shared with
+them from a folder that isn't), its `?log` likewise, `?shared` is their own; the listing says
+their level in `X-Folder-Access` (`edit`, `view`, `none`), which the menu explains. Writes to a
+folder that isn't theirs are still 403. The start page's "Shared with you" always shows with
+server storage (an empty state names the user) and asks again every half minute.
+
 ## Going back
 
 To the small `server-storage` build (nginx WebDAV, no sign-in, no history): check out

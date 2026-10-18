@@ -209,6 +209,22 @@ fn menu_commands(
 /// Help, Preferences and the version.
 const RIGHT_GROUP: f32 = 120.0;
 
+/// A person (head and shoulders) for the account button, drawn in code like every icon.
+fn paint_person(p: &egui::Painter, r: Rect, ink: Color32) {
+    let c = r.center();
+    let s = r.height() / 18.0;
+    let stroke = Stroke::new(1.6 * s, ink);
+    p.circle_stroke(pos2(c.x, c.y - 3.5 * s), 3.2 * s, stroke);
+    let n = 16;
+    let shoulders: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = std::f32::consts::PI * (1.0 + i as f32 / n as f32);
+            pos2(c.x + 6.5 * s * a.cos(), c.y + 7.5 * s + 6.5 * s * a.sin())
+        })
+        .collect();
+    p.add(egui::Shape::line(shoulders, stroke));
+}
+
 /// The centre of the Help (?) button: left of Preferences.
 fn help_x(bar: Rect, captions: f32) -> f32 {
     bar.right() - captions - 101.0
@@ -390,11 +406,40 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 d.insert_temp(egui::Id::new("sc_help_anchor"), at);
             });
         }
-        // A newer release: its Update button, left of Report a bug (`update`), in the space up to
-        // the bar's own buttons on the left (File, Undo and Redo, which end before `x`).
-        let span = Rect::from_min_max(pos2(x, report.top()), pos2(report.left() - 6.0, report.bottom()));
+        // The host's account button (`Services::account`), left of Report a bug: the icon, and
+        // the name when the bar has room for Report a bug's text too.
+        let mut account_left = report.left();
+        if let Some(mut menu) = app.services.account.take() {
+            let label = if report_label { (menu.label)() } else { String::new() };
+            let galley = ui.painter().layout_no_wrap(label, FontId::proportional(13.0), t.app_bar_text);
+            let text_width = galley.size().x;
+            let width = 28.0 + if text_width > 0.0 { text_width + 8.0 } else { 0.0 };
+            let rect = Rect::from_min_size(pos2(report.left() - 6.0 - width, report.top()), vec2(width, 26.0));
+            account_left = rect.left();
+            let resp = ui.interact(rect, ui.id().with("sc_account_button"), Sense::click());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Account"));
+            crate::scenario::publish_handle("titlebar:account", rect.center());
+            crate::scenario::publish_rect("titlebar:account", rect);
+            if resp.hovered() {
+                ui.painter().rect_filled(rect, 4.0, t.hover);
+            }
+            paint_person(ui.painter(), Rect::from_center_size(pos2(rect.left() + 14.0, rect.center().y), vec2(18.0, 18.0)), t.app_bar_text);
+            if text_width > 0.0 {
+                ui.painter().galley(pos2(rect.left() + 26.0, rect.center().y - galley.size().y / 2.0), galley, t.app_bar_text);
+            }
+            let resp = resp.on_hover_text(crate::i18n::tr_label("Account"));
+            egui::Popup::menu(&resp).show(|ui| {
+                ui.set_min_width(260.0);
+                (menu.show)(ui);
+            });
+            app.services.account = Some(menu);
+        }
+        // A newer release: its Update button, left of the account button and Report a bug
+        // (`update`), in the space up to the bar's own buttons on the left (File, Undo and Redo,
+        // which end before `x`).
+        let span = Rect::from_min_max(pos2(x, report.top()), pos2(account_left - 6.0, report.bottom()));
         let update = crate::update::button(app, ui, span, report_label);
-        let tabs_end = update.map_or(report.left(), |u| u.left()) - 8.0;
+        let tabs_end = update.map_or(account_left, |u| u.left()) - 8.0;
         // Narrow title bars can fit only part of the tab strip. Its hit regions must not
         // extend into the persistent report and window controls.
         let tabs_rect = Rect::from_min_max(pos2(tabs_start.min(tabs_end), r.top()), pos2(tabs_end, r.bottom()));

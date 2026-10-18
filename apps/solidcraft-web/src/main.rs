@@ -23,7 +23,7 @@ mod web {
 
     use solidcraft_engine::Session;
     use solidcraft_engine::io::vfs;
-    use solidcraft_ui_egui::{HostPage, Services, SolveApp};
+    use solidcraft_ui_egui::{AccountMenu, HostPage, Services, SolveApp};
     use wasm_bindgen::JsCast as _;
 
     use crate::api::Api;
@@ -64,6 +64,12 @@ mod web {
     /// Seconds between autosaves of unsaved work.
     const AUTOSAVE_S: f64 = 30.0;
 
+    /// The build (the checkout's git commit, from build.rs), for the account menu.
+    const BUILD: &str = match option_env!("SOLIDCRAFT_BUILD") {
+        Some(b) => b,
+        None => "dev",
+    };
+
     /// The Users page's fields: a new user (name, password, admin) and this user's new password.
     #[derive(Default)]
     struct UsersForm {
@@ -72,15 +78,23 @@ mod web {
     }
 
     /// The start page's "Shared with you" (files::open_shared): what others shared with this
-    /// user by name, as cards like Recent's, opened with one click. Nothing is drawn when there
-    /// is nothing to show.
+    /// user by name, as cards like Recent's, opened with one click; asked for again every half
+    /// minute while the page shows. Only with server storage.
     fn shared_section(app: &mut SolveApp, ui: &mut egui::Ui, files: &Rc<Files>) {
-        let shared = files.shared.borrow().clone();
-        if !files::remote_only() || shared.is_empty() {
+        if !files::remote_only() {
             return;
         }
+        if js_sys::Date::now() - files.shared_at.get() > 30_000.0 {
+            files::refresh_shared(files);
+        }
+        let shared = files.shared.borrow().clone();
         ui.add_space(24.0);
         solidcraft_ui_egui::home::section(ui, "Shared with you");
+        if shared.is_empty() {
+            let who = files.me.borrow().as_ref().map(|m| format!(" You are signed in as {}.", m.name)).unwrap_or_default();
+            ui.label(egui::RichText::new(format!("Designs others share with you appear here.{who}")).weak());
+            return;
+        }
         let mut picked: Option<files::Shared> = None;
         solidcraft_ui_egui::home::grid(ui, shared.len(), |ui, i| {
             let Some(s) = shared.get(i) else { return };
@@ -101,6 +115,52 @@ mod web {
         }
     }
 
+    /// The title bar's account menu (Services::account): who is signed in and what they may do
+    /// in the folder, Sign out (the proxy's sign-out page), a reload, and the build for support.
+    fn account_menu(ui: &mut egui::Ui, files: &Rc<Files>) {
+        let me = files.me.borrow().clone();
+        match (&me, files::remote_only(), files.ready.get()) {
+            (Some(m), _, _) => {
+                ui.label(egui::RichText::new(format!("Signed in as {}{}", m.name, if m.admin { " (admin)" } else { "" })).strong());
+                match files.folder_access.borrow().as_str() {
+                    "none" => {
+                        ui.label(egui::RichText::new("The design folder isn't shared with you: only designs shared with you are listed.").weak());
+                    }
+                    "view" => {
+                        ui.label(egui::RichText::new("You can see the design folder, not save into it.").weak());
+                    }
+                    _ => {}
+                }
+                ui.separator();
+                if m.logout.is_some() {
+                    if ui.button("Sign out").clicked() {
+                        files::sign_out(files);
+                        ui.close();
+                    }
+                } else {
+                    ui.label(egui::RichText::new("Signed in with a password: closing the browser signs you out.").weak());
+                }
+            }
+            (None, true, true) => {
+                ui.label("Nobody is signed in: this server has no sign-in (plain nginx storage).");
+                ui.separator();
+            }
+            (None, true, false) => {
+                ui.label("Asking the server who you are\u{2026}");
+                ui.separator();
+            }
+            (None, false, _) => {
+                ui.label("Designs are kept in this browser; there is no sign-in.");
+                ui.separator();
+            }
+        }
+        if ui.button("Reload the app").on_hover_text("Loads the page again: a new build, or a sign-in that lapsed").clicked() {
+            files::reload();
+            ui.close();
+        }
+        ui.label(egui::RichText::new(format!("SolidCraft {} \u{b7} build {BUILD}", env!("CARGO_PKG_VERSION"))).weak().small());
+    }
+
     /// Preferences › Users (files::users): everyone changes their own password; admins add and
     /// remove users and say who else is an admin. Only with the storage service.
     fn users_page(ui: &mut egui::Ui, files: &Rc<Files>, form: &Rc<std::cell::RefCell<UsersForm>>) {
@@ -108,7 +168,14 @@ mod web {
             ui.label("Designs are kept in this browser. Users apply when they are kept on the server.");
             return;
         }
-        if files::remote_user().is_empty() {
+        if !files.ready.get() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Asking the server\u{2026}");
+            });
+            return;
+        }
+        if files.me.borrow().is_none() {
             ui.label("This server keeps designs only, not users (plain nginx storage).");
             return;
         }
@@ -1002,6 +1069,17 @@ mod web {
                             // Preferences › Users: who can sign in to the server (files::users).
                             host_pages: vec![HostPage { title: "Users".into(), show: Box::new(move |ui| users_page(ui, &page_files, &form)) }],
                             home_sections: vec![Box::new(move |app, ui| shared_section(app, ui, &home_files))],
+                            // The title bar's account menu: who is signed in, Sign out.
+                            account: Some(AccountMenu {
+                                label: Box::new({
+                                    let f = files.clone();
+                                    move || f.me.borrow().as_ref().map(|m| m.name.clone()).unwrap_or_default()
+                                }),
+                                show: Box::new({
+                                    let f = files.clone();
+                                    move |ui| account_menu(ui, &f)
+                                }),
+                            }),
                             ..Default::default()
                         };
                         // Thumbnails of saves and start-page cards.
