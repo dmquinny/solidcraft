@@ -27,7 +27,9 @@
 //!   `X-Ops-Seq` and `X-Ops-Commit`: the marker its bytes correspond to. `POST ?lock=<component>
 //!   &client=C` holds a component (0 = the whole design) for the user, 409 when someone else
 //!   does; `POST ?unlock=<component>` lets it go; commands touching a component someone else
-//!   holds are refused with 409.
+//!   holds are refused with 409. `POST /files/<path>?branch=<new path>` copies the design under
+//!   the new name, whose log's first marker says where it came from (merging is the client's:
+//!   it replays the branch's commands onto the target).
 //! - `GET /healthz` → 200.
 //!
 //! Command line: `solidcraft-server` serves; `solidcraft-server user add|remove|list [NAME]`

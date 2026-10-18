@@ -102,6 +102,9 @@ mod web {
         folder: String,
         /// Live collaboration on the open server design (sync.rs).
         sync: Rc<crate::sync::Sync>,
+        /// The history window's branch name and merge target fields.
+        branch_name: String,
+        merge_target: String,
         /// The start page's recent designs were filled from the stored ones.
         recents_synced: bool,
         /// On-demand CJK font: fetched only when a CJK language is selected.
@@ -405,7 +408,31 @@ mod web {
             let Some((name, versions)) = self.files.history.borrow().clone() else { return };
             let mut open = true;
             let mut act: Option<(&'static str, String, f64)> = None;
+            let others: Vec<String> = self.files.entries.borrow().iter().map(|e| e.name.clone()).filter(|n| *n != name).collect();
             egui::Window::new(format!("History of {name}")).open(&mut open).collapsible(false).resizable(true).default_width(620.0).show(ctx, |ui| {
+                // Work apart and bring it back: a branch is a copy whose edits can be replayed onto another design.
+                ui.horizontal(|ui| {
+                    ui.label("Branch as:");
+                    if self.branch_name.is_empty() {
+                        let (stem, ext) = name.rsplit_once('.').map(|(s, e)| (s.to_string(), format!(".{e}"))).unwrap_or((name.clone(), String::new()));
+                        self.branch_name = format!("{stem} (branch){ext}");
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut self.branch_name).desired_width(220.0));
+                    if ui.small_button("Branch").on_hover_text("A copy to work on apart; merge it back here later").clicked() {
+                        act = Some(("branch", self.branch_name.clone(), 0.0));
+                    }
+                    ui.separator();
+                    ui.label("Merge into:");
+                    egui::ComboBox::from_id_salt("merge_target").selected_text(if self.merge_target.is_empty() { "\u{2026}" } else { self.merge_target.as_str() }).show_ui(ui, |ui| {
+                        for n in &others {
+                            ui.selectable_value(&mut self.merge_target, n.clone(), n);
+                        }
+                    });
+                    if !self.merge_target.is_empty() && ui.small_button("Merge").on_hover_text("Replays this design's edits onto that one (opens it, unsaved)").clicked() {
+                        act = Some(("merge", self.merge_target.clone(), 0.0));
+                    }
+                });
+                ui.separator();
                 if versions.is_empty() {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -435,10 +462,18 @@ mod web {
             });
             if !open {
                 *self.files.history.borrow_mut() = None;
+                self.branch_name.clear();
+                self.merge_target.clear();
             }
             match act {
                 Some(("restore", hash, _)) => files::restore(&self.files, &name, &hash),
                 Some(("copy", hash, date)) => files::copy_version(&self.files, &name, &hash, date),
+                Some(("branch", new_name, _)) => files::branch(&self.files, &name, &new_name),
+                Some(("merge", target, _)) => {
+                    self.sync.merge(&self.files, &name, &target);
+                    *self.files.history.borrow_mut() = None;
+                    self.files.panel.set(false);
+                }
                 _ => {}
             }
         }
@@ -716,6 +751,8 @@ mod web {
                             rename_focus: false,
                             folder: files::remote_folder(),
                             sync: crate::sync::Sync::new(),
+                            branch_name: String::new(),
+                            merge_target: String::new(),
                             recents_synced: false,
                             font: Default::default(),
                             font_result: Rc::new(std::cell::RefCell::new(None)),

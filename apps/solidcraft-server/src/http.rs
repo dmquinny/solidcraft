@@ -180,6 +180,13 @@ fn route(
             }
             Err(e) => Ok(Reply::text(400, &format!("not a command list: {e}"))),
         },
+        (Method::Post, false) if get("branch").is_some() => match clean_path(get("branch").unwrap_or("")) {
+            Ok(to) => store.branch(&clean, &to, user).map(|r| match r {
+                Some(meta) => Reply::new(201).with_meta(&meta),
+                None => Reply::text(404, "no such design"),
+            }),
+            Err(e) => Ok(Reply::text(400, &e)),
+        },
         (Method::Post, false) if get("lock").is_some() => {
             let component = get("lock").and_then(|c| c.parse().ok()).unwrap_or(0);
             let client = get("client").unwrap_or("");

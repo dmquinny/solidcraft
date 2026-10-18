@@ -66,6 +66,8 @@ pub struct Sync {
     locks: RefCell<Vec<(u64, String)>>,
     /// The design's fingerprint, by the document it was taken from (serialising is not free).
     fingerprint: RefCell<Option<(usize, String)>>,
+    /// A merge, fetched: the branch's name, the target's name, the branch's commands to replay.
+    merge: RefCell<Option<(String, String, Vec<Value>)>>,
     /// This browser's id in the log: its own entries come back and are skipped.
     client: String,
 }
@@ -113,6 +115,8 @@ impl Sync {
     /// Once a frame, after the app ran its commands: share the open server design, send what ran
     /// here, apply what came in.
     pub fn tick(self: &Rc<Self>, app: &mut SolveApp, files: &Rc<Files>) {
+        let name = app.session.path.as_deref().filter(|_| files::remote_only()).and_then(|p| p.strip_prefix(files::OPFS)).map(str::to_string);
+        self.finish_merge(app, files);
         let name = app.session.path.as_deref().filter(|_| files::remote_only()).and_then(|p| p.strip_prefix(files::OPFS)).map(str::to_string);
         self.follow(name.as_deref(), files);
         self.finish_fresh(app, files);
@@ -260,6 +264,60 @@ impl Sync {
             }
             files.wake();
         });
+    }
+
+    /// Merge a branch into `target`: the branch's commands (everything in its log since it was
+    /// made) are fetched, then (next frame) replayed onto the target as this user's own edits,
+    /// so they reach the target's log and everyone on it. Commands that no longer apply are
+    /// counted and skipped; the target is left open, unsaved.
+    pub fn merge(self: &Rc<Self>, files: &Rc<Files>, branch: &str, target: &str) {
+        let (me, files, branch, target) = (self.clone(), files.clone(), branch.to_string(), target.to_string());
+        spawn_local(async move {
+            match files::remote_json("GET", &format!("{}?ops&since=0", files::remote_url(&branch)), None).await {
+                Ok(v) => {
+                    let ops: Vec<Value> = v["ops"]
+                        .as_array()
+                        .map(|a| a.iter().filter(|e| e.get("saved").is_none() && e["id"].is_string()).cloned().collect())
+                        .unwrap_or_default();
+                    if ops.is_empty() {
+                        files.say(format!("{branch}: nothing to merge (no edits since it was made)"), false);
+                    } else {
+                        *me.merge.borrow_mut() = Some((branch, target, ops));
+                    }
+                }
+                Err(e) => files.say(format!("{branch}: {e}"), true),
+            }
+            files.wake();
+        });
+    }
+
+    fn finish_merge(self: &Rc<Self>, app: &mut SolveApp, files: &Rc<Files>) {
+        let Some((branch, target, ops)) = self.merge.borrow_mut().take() else { return };
+        let path = format!("{}{target}", files::OPFS);
+        if !vfs::exists(&path) {
+            files.say(format!("{target}: not here any more"), true);
+            return;
+        }
+        if app.session.path.as_deref() != Some(path.as_str()) {
+            app.open_path(&path);
+        }
+        // Sharing follows the target before its commands are recorded as this user's.
+        let name = app.session.path.as_deref().and_then(|p| p.strip_prefix(files::OPFS)).map(str::to_string);
+        self.follow(name.as_deref(), files);
+        app.session.shared = self.shared.borrow().is_some();
+        let (mut done, mut skipped) = (0, 0);
+        for e in &ops {
+            let Some(id) = e["id"].as_str() else { continue };
+            match app.run(id, e["params"].clone()) {
+                Ok(_) => done += 1,
+                Err(err) => {
+                    log::warn!("merge: {id}: {err}");
+                    skipped += 1;
+                }
+            }
+        }
+        let note = if skipped > 0 { format!(" ({skipped} no longer applied and were skipped)") } else { String::new() };
+        files.say(format!("Merged {done} edit(s) from {branch} into {target}{note}; save to keep them"), skipped > 0);
     }
 
     /// Hold (or let go of) a component for this user; the server answers with the design's locks.

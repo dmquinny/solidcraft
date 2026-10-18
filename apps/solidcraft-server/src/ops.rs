@@ -121,11 +121,13 @@ impl Ops {
     }
 
     /// A version of the design was saved (or found changed on disk): a marker every client
-    /// takes as the state the following commands apply to. Returns its position.
-    pub fn saved(&self, path: &str, etag: &str, commit: &str, user: &str, fingerprint: Option<&str>) -> u64 {
+    /// takes as the state the following commands apply to. A branch's first marker says which
+    /// design it was copied from, and where that design's log stood. Returns its position.
+    pub fn saved(&self, path: &str, etag: &str, commit: &str, user: &str, fingerprint: Option<&str>, from: Option<(&str, u64)>) -> u64 {
         let Ok(mut logs) = self.logs.lock() else { return 0 };
         let log = self.log(&mut logs, path);
-        let seq = self.push(log, json!({"user": user, "saved": {"etag": etag, "commit": commit, "fp": fingerprint}}));
+        let from = from.map(|(p, seq)| json!({"path": p, "seq": seq}));
+        let seq = self.push(log, json!({"user": user, "saved": {"etag": etag, "commit": commit, "fp": fingerprint, "from": from}}));
         self.changed.notify_all();
         seq
     }
@@ -248,7 +250,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("solidcraft-ops-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let ops = Ops::open(&dir).unwrap();
-        let m = ops.saved("a/b.solidcraft", "e1", "c1", "ben", Some("fp0"));
+        let m = ops.saved("a/b.solidcraft", "e1", "c1", "ben", Some("fp0"), None);
         let last =
             ops.append("a/b.solidcraft", "ben", "k1", &[json!({"id": "x", "params": {"n": 1}, "after": "fp1", "components": [3]})]).ok().unwrap();
         assert!(last > m);

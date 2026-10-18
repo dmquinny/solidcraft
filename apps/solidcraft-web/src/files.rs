@@ -596,6 +596,44 @@ pub fn restore(files: &Rc<Files>, name: &str, hash: &str) {
     });
 }
 
+/// A branch of a server design: a copy under `new_name` (in the current folder) whose log
+/// remembers where it came from, to work on apart and merge back later (sync.rs).
+pub fn branch(files: &Rc<Files>, name: &str, new_name: &str) {
+    let new_name = new_name.trim().to_string();
+    if new_name.is_empty() || new_name.contains(['/', '\\']) {
+        files.say("give the branch a name without slashes", true);
+        return;
+    }
+    let (files, name) = (files.clone(), name.to_string());
+    spawn_local(async move {
+        let folder = remote_folder();
+        let to = if folder.is_empty() { new_name.clone() } else { format!("{folder}/{new_name}") };
+        let r = async {
+            let url = format!("{}?branch={}", remote_url(&name), String::from(js_sys::encode_uri_component(&to)));
+            let r = remote_request("POST", &url, None, &[]).await?;
+            if !r.ok() {
+                let why = JsFuture::from(r.text().map_err(err)?).await.ok().and_then(|t| t.as_string()).unwrap_or_default();
+                return Err(format!("the server refused the branch (HTTP {}): {}", r.status(), why.trim()));
+            }
+            let bytes = remote_read(&new_name).await?;
+            let size = bytes.len() as u64;
+            vfs::insert(&format!("{OPFS}{new_name}"), bytes);
+            let mut e = files.entries.borrow_mut();
+            e.retain(|x| x.name != new_name);
+            e.push(Entry { name: new_name.clone(), size, modified: js_sys::Date::now() });
+            e.sort_by_key(|a| a.name.to_lowercase());
+            Ok::<(), String>(())
+        };
+        match r.await {
+            Ok(()) => {
+                files.say(format!("{new_name}: a branch of {name}; open it to work apart, merge it back from its history"), false);
+                refresh_changes(&files);
+            }
+            Err(e) => files.say(format!("{name}: {e}"), true),
+        }
+    });
+}
+
 /// Bring a version in as a separate design beside the current one, named after its date.
 pub fn copy_version(files: &Rc<Files>, name: &str, hash: &str, date: f64) {
     let (files, name, hash) = (files.clone(), name.to_string(), hash.to_string());

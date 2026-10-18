@@ -12,7 +12,8 @@ self-hosting patches on top of upstream `main`:
   and can restore or copy an earlier version; a save over someone else's newer save is refused
   once. Live collaboration: people with the same server design open see each other's edits as
   they happen (the commands they run go through a log on the server, in one order for everyone).
-  Further stages (component locks, branches) build on it.
+  A user can lock a component (or the whole design) so only they change it. A design can be
+  branched (a copy that remembers where it came from) and merged back by replaying its edits.
 
 ## What the patch changes
 
@@ -34,7 +35,9 @@ And on `collab`:
 | `apps/solidcraft-web/src/main.rs` | The user in the panel's title, a History button per design, a "Recent changes" list, and the history window (`history_window`). The `Shell` drives `sync.rs` once a frame and shows "Also here: …" while others have the design open. |
 | `crates/engine/src/sync.rs` (new), `crates/engine/src/lib.rs` | The one change below the apps: a `shared` flag on `Session`, and three lines in `Session::execute` that record each outermost command that changed the design of a shared session (`sync::record`), unless it is being applied on another session's behalf (`sync::apply`). `sync::fingerprint` digests a document. `doc.*`, `file.*` and the checkpoint commands are never shared. |
 | `apps/solidcraft-server/src/ops.rs` | One log per design (`<history>/ops/<design>.jsonl`): the commands clients ran, and a marker for every saved version (etag, commit, the saver's fingerprint). `POST ?ops` appends; `GET ?ops&since=N&wait=S&client=C` answers what came after N, waiting up to S seconds, with who else is polling. A design's `GET`/`PUT` carry `X-Ops-Seq` / `X-Ops-Commit`, the marker its bytes correspond to. |
-| `apps/solidcraft-web/src/sync.rs` (new) | The client side: the open server design is marked `shared`; commands run here are batched and posted; others' commands come back through a long poll and are applied with `sync::apply`; the client's own entries are skipped by its id. A command that fails to apply, or a fingerprint that disagrees with the one another session reported (after its command, or with its save), makes the session start afresh: load the design's last saved version and replay the log after it. Status messages say who joined, who left and when a catch-up happened. |
+| `apps/solidcraft-web/src/sync.rs` (new) | The client side: the open server design is marked `shared`; commands run here are batched and posted; others' commands come back through a long poll and are applied with `sync::apply`; the client's own entries are skipped by its id. A command that fails to apply, or a fingerprint that disagrees with the one another session reported (after its command, or with its save), makes the session start afresh: load the design's last saved version and replay the log after it. Status messages say who joined, who left and when a catch-up happened. Locks come with every poll and go to the engine (`sync::set_locks`); `lock`/`unlock` hold the active component; `merge` fetches a branch's commands and replays them onto the target as this user's edits. |
+| Locks (`crates/engine/src/sync.rs`, `apps/solidcraft-server/src/ops.rs`) | `sync::touched` says which components a command changed (0 = the design as a whole: parameters, components, placements, joints, settings); `Session::execute` refuses, and undoes, a change to a component someone else holds ("component X is locked by felix"), the server refuses such commands too (409). `POST ?lock=<component>&client=C` / `?unlock=` hold and release; the holder's polls renew the lock, which lapses two minutes after they stop. The live panel (top right while a shared design is open) shows who else is here and holds or releases the active component. |
+| Branches (`store.rs`, `files.rs`, `sync.rs`) | `POST ?branch=<new path>` copies the design (commit "branched … from …"); the branch's first marker carries `from`. "Branch as" in the history window makes one in the current folder; "Merge into" fetches the branch's whole command log and replays it onto the chosen design, which is opened and left unsaved; commands that no longer apply are counted and skipped. |
 
 Outside the repo, `W:\docker-compose.yml` runs two services: `solidcraft` (nginx, the site) and
 `solidcraft-server` (the storage service). The designs folder `/mnt/Apps/Backup/Maker/SolidCraft`
@@ -51,7 +54,10 @@ on their own; two people editing the very same thing at the same moment means on
 a refused command (its status line says so) and their session catches up with the server's
 order. Every save is a checkpoint: a session that disagrees with a save reloads from it. Undo
 and redo are shared like any other command. The log is per design and per browser tab; a design
-that never came from the server (new, unsaved) is shared once it is saved there.
+that never came from the server (new, unsaved) is shared once it is saved there. Locks are the
+way to avoid stepping on each other in the same component: lock it, work, unlock. Branches are
+for longer detours: branch, work on the copy (alone or together), merge back when done; a merge
+is a replay, so edits that no longer fit the target are skipped and reported.
 
 Users: in the TrueNAS root shell, `cd /mnt/Apps/Apps && docker compose exec -it solidcraft-server
 solidcraft-server user add NAME` (it asks for the password twice); `user list` and `user remove NAME`

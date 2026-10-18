@@ -190,7 +190,35 @@ impl Store {
         {
             return (seq, c);
         }
-        (self.ops.saved(path, &tag, commit, user, fingerprint), commit.to_string())
+        (self.ops.saved(path, &tag, commit, user, fingerprint, None), commit.to_string())
+    }
+
+    /// A copy of a design under a new name, to work on apart and merge back later: its log
+    /// remembers where it came from. `None` when there is no such design; an error when the
+    /// new name is taken.
+    pub fn branch(&self, from: &str, to: &str, user: &str) -> Result<Option<Meta>, String> {
+        if to.is_empty() || to == from {
+            return Err("a branch needs a name of its own".into());
+        }
+        let _guard = self.lock.lock().map_err(|_| "the store is poisoned".to_string())?;
+        let source = self.disk(from);
+        let bytes = match std::fs::read(&source) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io(&source, e)),
+        };
+        let file = self.disk(to);
+        if file.exists() {
+            return Err(format!("there is already a design named {to}"));
+        }
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+        }
+        std::fs::write(&file, &bytes).map_err(|e| io(&file, e))?;
+        let commit = self.commit(user, &format!("branched {to} from {from}"), &[to])?.unwrap_or_else(|| self.head());
+        let at = self.ops.base(from).map_or(0, |b| b.0);
+        let seq = self.ops.saved(to, &etag(&bytes), &commit, user, None, Some((from, at)));
+        Ok(Some(Meta { etag: etag(&bytes), base: Some((seq, commit)), ..Default::default() }))
     }
 
     /// Commit whatever changed outside the app (at most every few seconds unless forced).
