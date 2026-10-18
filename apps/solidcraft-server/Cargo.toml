@@ -1,0 +1,25 @@
+[package]
+name = "solidcraft-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Design storage for the self-hosted SolidCraft web app: files on the server, users, history and restore"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+log = { workspace = true }
+# a plain-threads HTTP server: the service sits behind nginx, which does TLS and the sign-in
+tiny_http = "0.12"
+httpdate = "1"
+percent-encoding = "2"
+env_logger = "0.11"
+# the users file for nginx's auth_basic ({SSHA} entries)
+sha1 = "0.10"
+base64 = "0.22"
+rpassword = "7"

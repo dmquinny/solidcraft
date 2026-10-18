@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+# The design storage service of the self-hosted SolidCraft site (apps/solidcraft-server): the
+# web app's `files/` endpoint, users and history. A self-hosting patch, not upstream. nginx
+# (packaging/docker/Dockerfile, nginx.conf) proxies /files/ to it on the container network.
+#
+#   docker build -f packaging/docker/Dockerfile.server -t solidcraft-server .
+#
+# Mount the designs folder at /srv/designs and a folder for the history (the git repository
+# and the users file) at /srv/history, both writable by the user the container runs as.
+# Add users with: docker compose exec -it solidcraft-server solidcraft-server user add NAME
+
+ARG RUST_VERSION=1.95
+
+FROM rust:${RUST_VERSION}-slim-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p solidcraft-server \
+ && cp /src/target/release/solidcraft-server /usr/local/bin/solidcraft-server
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/solidcraft-server /usr/local/bin/solidcraft-server
+COPY LICENSE-MIT LICENSE-APACHE NOTICE /usr/share/doc/solidcraft/
+ENV SOLIDCRAFT_DESIGNS=/srv/designs SOLIDCRAFT_HISTORY=/srv/history SOLIDCRAFT_LISTEN=0.0.0.0:8782
+EXPOSE 8782
+HEALTHCHECK --interval=30s --timeout=5s CMD ["/usr/local/bin/solidcraft-server", "health"]
+ENTRYPOINT ["/usr/local/bin/solidcraft-server"]
+CMD ["serve"]

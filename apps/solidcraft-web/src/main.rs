@@ -204,7 +204,13 @@ mod web {
             let mut open = true;
             let mut act: Option<(&'static str, String)> = None;
             let remote = files::remote_only();
-            egui::Window::new(if remote { "Files on the server" } else { "Files in this browser" })
+            let user = files::remote_user();
+            let title = match (remote, user.is_empty()) {
+                (false, _) => "Files in this browser".to_string(),
+                (true, true) => "Files on the server".to_string(),
+                (true, false) => format!("Files on the server \u{b7} {user}"),
+            };
+            egui::Window::new(title)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
@@ -302,11 +308,24 @@ mod web {
                                     if ui.small_button("Delete").clicked() {
                                         act = Some(("delete", e.name.clone()));
                                     }
+                                    if remote && ui.small_button("History").on_hover_text("Every version saved on the server").clicked() {
+                                        act = Some(("history", e.name.clone()));
+                                    }
                                 });
                                 ui.end_row();
                             }
                         });
                     });
+                    // Who did what in this folder (the storage service's log).
+                    let changes = self.files.changes.borrow().clone();
+                    if remote && !changes.is_empty() {
+                        ui.separator();
+                        egui::CollapsingHeader::new("Recent changes").default_open(true).show(ui, |ui| {
+                            for c in changes.iter().take(12) {
+                                ui.label(format!("{} {} \u{b7} {}", c.author, c.message, files::ago(c.date))).on_hover_text(files::when(c.date));
+                            }
+                        });
+                    }
                 });
             if !open {
                 self.files.panel.set(false);
@@ -347,6 +366,7 @@ mod web {
                     files::delete(&self.files, &name);
                     self.app.home.recent.retain(|r| *r != path);
                 }
+                "history" => files::history(&self.files, &name),
                 "folder" => match files::set_remote_folder(&self.files, &name) {
                     Ok(()) => {
                         self.folder = files::remote_folder();
@@ -372,6 +392,49 @@ mod web {
                         }
                     }
                 }
+                _ => {}
+            }
+        }
+
+        /// The versions of a server design (files::history): put one back, or bring it in as a copy.
+        fn history_window(&mut self, ctx: &egui::Context) {
+            let Some((name, versions)) = self.files.history.borrow().clone() else { return };
+            let mut open = true;
+            let mut act: Option<(&'static str, String, f64)> = None;
+            egui::Window::new(format!("History of {name}")).open(&mut open).collapsible(false).resizable(true).default_width(620.0).show(ctx, |ui| {
+                if versions.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Asking the server\u{2026}");
+                    });
+                    return;
+                }
+                ui.label("Every save, newest first. Restore makes a version the current one again (as a new version: nothing is lost); Copy brings it in as a separate design.");
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    egui::Grid::new("design_history").num_columns(4).spacing([12.0, 6.0]).show(ui, |ui| {
+                        for (i, v) in versions.iter().enumerate() {
+                            ui.label(format!("{} \u{b7} {}", files::ago(v.date), v.author)).on_hover_text(files::when(v.date));
+                            ui.label(&v.message);
+                            ui.label(format!("{:.1} KB", v.size as f64 / 1024.0));
+                            ui.horizontal(|ui| {
+                                if v.size > 0 && i > 0 && ui.small_button("Restore").clicked() {
+                                    act = Some(("restore", v.hash.clone(), v.date));
+                                }
+                                if v.size > 0 && ui.small_button("Copy").clicked() {
+                                    act = Some(("copy", v.hash.clone(), v.date));
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+            if !open {
+                *self.files.history.borrow_mut() = None;
+            }
+            match act {
+                Some(("restore", hash, _)) => files::restore(&self.files, &name, &hash),
+                Some(("copy", hash, date)) => files::copy_version(&self.files, &name, &hash, date),
                 _ => {}
             }
         }
@@ -470,6 +533,7 @@ mod web {
             self.app.ui(ui);
             let ctx = ui.ctx().clone();
             self.file_panel(&ctx);
+            self.history_window(&ctx);
             self.recovery_prompt(&ctx);
             self.watch_text_for_font(&ctx);
         }

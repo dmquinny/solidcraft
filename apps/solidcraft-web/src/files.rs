@@ -13,8 +13,16 @@
 //! listing) nothing changes. Designs can be filed in a subfolder of the server's folder (the
 //! file panel's folder field, remembered per browser in local storage; nginx makes the folder on
 //! the first save). The autosave stays in the browser: it is written on every edit.
+//!
+//! With the storage service (apps/solidcraft-server) behind `files/`, saves carry the version
+//! they replace (`If-Match`): when someone else saved in between, the server answers 412, the
+//! save is refused with their name, and the next save overwrites. The service also answers who
+//! we are (`X-Remote-User`), a folder's recent changes (`?log`), a design's versions
+//! (`?history`), any version's bytes (`?at=`) and a restore (`POST ?restore=`), which the
+//! history window uses. Plain nginx storage answers none of that, and the app works as before.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
@@ -54,12 +62,36 @@ pub struct Entry {
     pub modified: f64,
 }
 
+/// One change on the server (a folder's log): who did what, when (ms since 1970).
+#[derive(Clone, Debug)]
+pub struct Change {
+    pub author: String,
+    pub date: f64,
+    pub message: String,
+    pub path: String,
+}
+
+/// One version of a server design.
+#[derive(Clone, Debug)]
+pub struct Version {
+    pub hash: String,
+    pub author: String,
+    pub date: f64,
+    pub message: String,
+    pub size: u64,
+}
+
 /// State shared between the async browser calls and the app's frames.
 #[derive(Default)]
 pub struct Files {
     pub entries: RefCell<Vec<Entry>>,
     /// The subfolders of the server's current folder (server storage only): the panel offers them.
     pub folders: RefCell<Vec<String>>,
+    /// The current folder's recent changes, newest first (the storage service only).
+    pub changes: RefCell<Vec<Change>>,
+    /// The history window: a server design's name and its versions, newest first (empty while
+    /// they are being fetched); `None` when it is closed.
+    pub history: RefCell<Option<(String, Vec<Version>)>>,
     /// Files read from the computer: (name, bytes, what to do).
     pub incoming: RefCell<Vec<(String, Vec<u8>, Intent)>>,
     /// Messages for the status line (errors and confirmations).
@@ -152,6 +184,38 @@ thread_local! {
     /// The subfolder of the server's design folder designs are filed in ("" is the folder itself,
     /// else a relative path like "projects/bracket"), remembered per browser.
     static REMOTE_FOLDER: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Who the server says we are (empty without the storage service).
+    static REMOTE_USER: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The server version each design here came from, by name: `Some(etag)` is sent as
+    /// `If-Match` on a save; `None` means the next save overwrites whatever is there (the server
+    /// gave no ETag, or refused a save once); a name not here is saved as a new design only.
+    static ETAGS: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
+}
+
+/// The signed-in user (empty when the server doesn't say).
+pub fn remote_user() -> String {
+    REMOTE_USER.with(|u| u.borrow().clone())
+}
+
+/// "just now", "5 min ago", "3 h ago", "2 d ago", or the date.
+pub fn ago(ms: f64) -> String {
+    let s = ((js_sys::Date::now() - ms) / 1000.0).max(0.0);
+    if s < 60.0 {
+        "just now".into()
+    } else if s < 3600.0 {
+        format!("{} min ago", (s / 60.0) as u64)
+    } else if s < 86_400.0 {
+        format!("{} h ago", (s / 3600.0) as u64)
+    } else if s < 30.0 * 86_400.0 {
+        format!("{} d ago", (s / 86_400.0) as u64)
+    } else {
+        when(ms).chars().take(10).collect()
+    }
+}
+
+/// A moment (ms since 1970) as the browser's local date and time.
+pub fn when(ms: f64) -> String {
+    String::from(js_sys::Date::new(&JsValue::from_f64(ms)).to_locale_string("default", &JsValue::UNDEFINED))
 }
 
 /// Are designs kept on the server?
@@ -206,13 +270,20 @@ fn remote_url(name: &str) -> String {
 }
 
 /// One request to the server's design folder: the response, whatever its status.
-async fn remote_request(method: &str, url: &str, body: Option<&[u8]>) -> Result<web_sys::Response, String> {
+async fn remote_request(method: &str, url: &str, body: Option<&[u8]>, headers: &[(&str, &str)]) -> Result<web_sys::Response, String> {
     let window = web_sys::window().ok_or("no window")?;
     let init = web_sys::RequestInit::new();
     init.set_method(method);
     init.set_cache(web_sys::RequestCache::NoStore);
     if let Some(b) = body {
         init.set_body(&Uint8Array::from(b));
+    }
+    if !headers.is_empty() {
+        let h = web_sys::Headers::new().map_err(err)?;
+        for (k, v) in headers {
+            h.set(k, v).map_err(err)?;
+        }
+        init.set_headers(&h);
     }
     JsFuture::from(window.fetch_with_str_and_init(url, &init))
         .await
@@ -221,8 +292,54 @@ async fn remote_request(method: &str, url: &str, body: Option<&[u8]>) -> Result<
         .map_err(|_| "no response".to_string())
 }
 
-/// A server folder's files (name, modified) and its subfolders.
-type Listing = (Vec<(String, f64)>, Vec<String>);
+/// A server folder's files (name, modified), its subfolders, and its recent changes.
+#[derive(Default)]
+struct Listing {
+    files: Vec<(String, f64)>,
+    folders: Vec<String>,
+    changes: Vec<Change>,
+}
+
+/// A JSON array response as its objects' string fields, by key.
+async fn json_rows(r: web_sys::Response) -> Result<Vec<HashMap<String, String>>, String> {
+    let list: Array = JsFuture::from(r.json().map_err(err)?).await.map_err(err)?.dyn_into().map_err(|_| "the answer isn't a list".to_string())?;
+    let mut rows = Vec::new();
+    for e in list.iter() {
+        let mut row = HashMap::new();
+        let obj: Object = e.clone().unchecked_into();
+        for k in Object::keys(&obj).iter().filter_map(|k| k.as_string()) {
+            if let Some(v) = Reflect::get(&e, &k.clone().into()).ok().and_then(|v| v.as_string().or_else(|| v.as_f64().map(|n| n.to_string()))) {
+                row.insert(k, v);
+            }
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn date_of(row: &HashMap<String, String>, key: &str) -> f64 {
+    row.get(key).map(|m| js_sys::Date::parse(m)).filter(|t| !t.is_nan()).unwrap_or(0.0)
+}
+
+/// A folder's recent changes (none from plain nginx storage).
+async fn remote_log(dir: &str) -> Vec<Change> {
+    let Ok(r) = remote_request("GET", &format!("{dir}?log"), None, &[]).await else { return Vec::new() };
+    if !is_listing(&r) {
+        return Vec::new();
+    }
+    let Ok(rows) = json_rows(r).await else { return Vec::new() };
+    rows.iter()
+        .filter_map(|row| {
+            let author = row.get("author")?.clone();
+            Some(Change {
+                author,
+                date: date_of(row, "date"),
+                message: row.get("message").cloned().unwrap_or_default(),
+                path: row.get("path").cloned().unwrap_or_default(),
+            })
+        })
+        .collect()
+}
 
 /// Does the response carry nginx's JSON listing?
 fn is_listing(r: &web_sys::Response) -> bool {
@@ -233,11 +350,11 @@ fn is_listing(r: &web_sys::Response) -> bool {
 /// has not (404, or no JSON listing: the upstream site), an error when it failed.
 async fn remote_list() -> Result<Option<Listing>, String> {
     let dir = remote_dir();
-    let r = remote_request("GET", &dir, None).await?;
+    let r = remote_request("GET", &dir, None, &[]).await?;
     if r.status() == 404 && dir != REMOTE_DIR {
         // A subfolder the server hasn't got yet (nginx makes it on the first save) is empty, as
         // long as the site has server storage at all.
-        return Ok(is_listing(&remote_request("GET", REMOTE_DIR, None).await?).then(Listing::default));
+        return Ok(is_listing(&remote_request("GET", REMOTE_DIR, None, &[]).await?).then(Listing::default));
     }
     if r.status() == 404 || (r.ok() && !is_listing(&r)) {
         return Ok(None);
@@ -245,45 +362,209 @@ async fn remote_list() -> Result<Option<Listing>, String> {
     if !r.ok() {
         return Err(format!("the server's design folder answered HTTP {}", r.status()));
     }
-    let list: Array = JsFuture::from(r.json().map_err(err)?).await.map_err(err)?.dyn_into().map_err(|_| "the listing isn't a list".to_string())?;
-    let (mut files, mut folders) = Listing::default();
-    for e in list.iter() {
-        let get = |k: &str| Reflect::get(&e, &k.into()).ok().and_then(|v| v.as_string());
-        let Some(name) = get("name") else { continue };
+    if let Some(user) = r.headers().get("x-remote-user").ok().flatten() {
+        REMOTE_USER.with(|u| *u.borrow_mut() = user);
+    }
+    let mut listing = Listing::default();
+    for row in json_rows(r).await? {
+        let Some(name) = row.get("name").cloned() else { continue };
         if name.starts_with('.') || stays_local(&name) {
             continue;
         }
-        match get("type").as_deref() {
-            Some("directory") => folders.push(name),
-            Some("file") | None => {
-                let modified = get("mtime").map(|m| js_sys::Date::parse(&m)).filter(|t| !t.is_nan()).unwrap_or(0.0);
-                files.push((name, modified));
-            }
+        match row.get("type").map(String::as_str) {
+            Some("directory") => listing.folders.push(name),
+            Some("file") | None => listing.files.push((name, date_of(&row, "mtime"))),
             _ => {}
         }
     }
-    folders.sort_by_key(|f| f.to_lowercase());
-    Ok(Some((files, folders)))
+    listing.folders.sort_by_key(|f| f.to_lowercase());
+    listing.changes = remote_log(&dir).await;
+    Ok(Some(listing))
+}
+
+/// Keep the version a response says a design is at.
+fn remember_etag(name: &str, r: &web_sys::Response) {
+    let tag = r.headers().get("etag").ok().flatten().map(|t| t.trim().trim_start_matches("W/").trim_matches('"').to_string());
+    ETAGS.with(|e| {
+        e.borrow_mut().insert(name.to_string(), tag);
+    });
+}
+
+/// A design's versions, newest first.
+async fn remote_versions(name: &str) -> Result<Vec<Version>, String> {
+    let r = remote_request("GET", &format!("{}?history", remote_url(name)), None, &[]).await?;
+    if !is_listing(&r) {
+        return Err(if r.ok() { "this server keeps no history".to_string() } else { format!("HTTP {}", r.status()) });
+    }
+    Ok(json_rows(r)
+        .await?
+        .iter()
+        .filter_map(|row| {
+            Some(Version {
+                hash: row.get("hash")?.clone(),
+                author: row.get("author").cloned().unwrap_or_default(),
+                date: date_of(row, "date"),
+                message: row.get("message").cloned().unwrap_or_default(),
+                size: row.get("size").and_then(|s| s.parse().ok()).unwrap_or(0),
+            })
+        })
+        .collect())
 }
 
 async fn remote_read(name: &str) -> Result<Vec<u8>, String> {
-    let r = remote_request("GET", &remote_url(name), None).await?;
+    let r = remote_request("GET", &remote_url(name), None, &[]).await?;
     if !r.ok() {
         return Err(format!("HTTP {}", r.status()));
     }
+    remember_etag(name, &r);
     let buf = JsFuture::from(r.array_buffer().map_err(err)?).await.map_err(err)?;
     Ok(Uint8Array::new(&buf).to_vec())
 }
 
+/// Save to the server, replacing the version this browser holds and no other: a design nobody
+/// here has seen is written only where there is none yet.
 async fn remote_write(name: &str, bytes: &[u8]) -> Result<(), String> {
-    let r = remote_request("PUT", &remote_url(name), Some(bytes)).await?;
-    if r.ok() { Ok(()) } else { Err(format!("the server's design folder refused the write (HTTP {})", r.status())) }
+    let known = ETAGS.with(|e| e.borrow().get(name).cloned());
+    let precondition = match &known {
+        Some(Some(tag)) => Some(("If-Match", format!("\"{tag}\""))),
+        Some(None) => None,
+        None => Some(("If-None-Match", "*".to_string())),
+    };
+    let headers: Vec<(&str, &str)> = precondition.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let r = remote_request("PUT", &remote_url(name), Some(bytes), &headers).await?;
+    if r.ok() {
+        remember_etag(name, &r);
+        return Ok(());
+    }
+    if r.status() == 412 {
+        // Someone else saved since the version here: the next save overwrites.
+        ETAGS.with(|e| {
+            e.borrow_mut().insert(name.to_string(), None);
+        });
+        let who = r.headers().get("x-author").ok().flatten().unwrap_or_else(|| "someone else".into());
+        let when = r
+            .headers()
+            .get("x-author-date")
+            .ok()
+            .flatten()
+            .map(|d| js_sys::Date::parse(&d))
+            .filter(|t| !t.is_nan())
+            .map(|t| format!(" {}", ago(t)))
+            .unwrap_or_default();
+        return Err(format!("{who} saved this design on the server{when}. Save again to overwrite it, or save it under another name"));
+    }
+    Err(format!("the server's design folder refused the write (HTTP {})", r.status()))
 }
 
 async fn remote_remove(name: &str) -> Result<(), String> {
-    let r = remote_request("DELETE", &remote_url(name), None).await?;
+    ETAGS.with(|e| e.borrow_mut().remove(name));
+    let r = remote_request("DELETE", &remote_url(name), None, &[]).await?;
     // Gone already is gone.
     if r.ok() || r.status() == 404 { Ok(()) } else { Err(format!("the server's design folder refused the delete (HTTP {})", r.status())) }
+}
+
+/// Fetch the current folder's recent changes again (after a save, delete or restore).
+fn refresh_changes(files: &Rc<Files>) {
+    if !remote_only() {
+        return;
+    }
+    let files = files.clone();
+    spawn_local(async move {
+        let changes = remote_log(&remote_dir()).await;
+        *files.changes.borrow_mut() = changes;
+        files.wake();
+    });
+}
+
+/// Open the history window on a server design: its versions arrive when the server answers.
+pub fn history(files: &Rc<Files>, name: &str) {
+    *files.history.borrow_mut() = Some((name.to_string(), Vec::new()));
+    let (files, name) = (files.clone(), name.to_string());
+    spawn_local(async move {
+        match remote_versions(&name).await {
+            Ok(versions) => {
+                if let Some((n, v)) = files.history.borrow_mut().as_mut()
+                    && *n == name
+                {
+                    *v = versions;
+                }
+            }
+            Err(e) => {
+                *files.history.borrow_mut() = None;
+                files.say(format!("{name}: {e}"), true);
+            }
+        }
+        files.wake();
+    });
+}
+
+/// Make a version the current one again on the server (a new version: nothing is lost), and
+/// bring it in here. A copy of the design open in the app is not changed: reopen it.
+pub fn restore(files: &Rc<Files>, name: &str, hash: &str) {
+    let (files, name, hash) = (files.clone(), name.to_string(), hash.to_string());
+    spawn_local(async move {
+        let r = async {
+            let r = remote_request("POST", &format!("{}?restore={hash}", remote_url(&name)), None, &[]).await?;
+            if !r.ok() {
+                return Err(format!("the server refused the restore (HTTP {})", r.status()));
+            }
+            let bytes = remote_read(&name).await?;
+            let size = bytes.len() as u64;
+            vfs::insert(&format!("{OPFS}{name}"), bytes);
+            if let Some(e) = files.entries.borrow_mut().iter_mut().find(|e| e.name == name) {
+                e.size = size;
+                e.modified = js_sys::Date::now();
+            }
+            Ok::<(), String>(())
+        };
+        match r.await {
+            Ok(()) => {
+                files.say(format!("{name}: that version is the current one again (reopen the design to see it)"), false);
+                history(&files, &name);
+                refresh_changes(&files);
+            }
+            Err(e) => files.say(format!("{name}: {e}"), true),
+        }
+    });
+}
+
+/// Bring a version in as a separate design beside the current one, named after its date.
+pub fn copy_version(files: &Rc<Files>, name: &str, hash: &str, date: f64) {
+    let (files, name, hash) = (files.clone(), name.to_string(), hash.to_string());
+    spawn_local(async move {
+        let r = async {
+            let r = remote_request("GET", &format!("{}?at={hash}", remote_url(&name)), None, &[]).await?;
+            if !r.ok() {
+                return Err(format!("the server has no such version (HTTP {})", r.status()));
+            }
+            let buf = JsFuture::from(r.array_buffer().map_err(err)?).await.map_err(err)?;
+            let bytes = Uint8Array::new(&buf).to_vec();
+            let (stem, ext) = name.rsplit_once('.').map(|(s, e)| (s.to_string(), format!(".{e}"))).unwrap_or((name.clone(), String::new()));
+            let stamp: String = String::from(js_sys::Date::new(&JsValue::from_f64(date)).to_iso_string())
+                .chars()
+                .take(16)
+                .map(|c| {
+                    if c == 'T' {
+                        ' '
+                    } else if c == ':' {
+                        '.'
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            let path = free_name(&format!("{stem} ({stamp}){ext}"));
+            vfs::write(&path, &bytes).map_err(|e| e.to_string())?;
+            Ok::<String, String>(path)
+        };
+        match r.await {
+            Ok(path) => {
+                flush(&files);
+                files.say(format!("{}: a copy of that version", path.trim_start_matches(OPFS)), false);
+            }
+            Err(e) => files.say(format!("{name}: {e}"), true),
+        }
+    });
 }
 
 fn err(e: JsValue) -> String {
@@ -374,33 +655,42 @@ fn read_local() -> Result<Vec<(String, Vec<u8>, f64)>, String> {
 /// A stored file: name, bytes, modified.
 type Stored = (String, Vec<u8>, f64);
 
+/// What a load brings in: the stored files, and with server storage the folder's subfolders and
+/// recent changes.
+#[derive(Default)]
+struct Loaded {
+    files: Vec<Stored>,
+    folders: Vec<String>,
+    changes: Vec<Change>,
+}
+
 /// Every stored file, and the server folder's subfolders. With server storage, the server's files
 /// and the browser's autosave; a server that is there but fails keeps designs out of the browser
 /// (saves report the failure) rather than hiding them in it until the next reload.
-async fn read_all() -> Result<(Vec<Stored>, Vec<String>), String> {
+async fn read_all() -> Result<Loaded, String> {
     let list = match remote_list().await {
-        Ok(None) => return Ok((read_browser().await?, Vec::new())),
+        Ok(None) => return Ok(Loaded { files: read_browser().await?, ..Default::default() }),
         r => r,
     };
     REMOTE.with(|r| r.set(true));
-    let (mut out, folders) = read_remote(list?.unwrap_or_default()).await;
+    let mut loaded = read_remote(list?.unwrap_or_default()).await;
     match read_browser().await {
-        Ok(b) => out.extend(b.into_iter().filter(|(n, _, _)| stays_local(n))),
+        Ok(b) => loaded.files.extend(b.into_iter().filter(|(n, _, _)| stays_local(n))),
         Err(e) => log::warn!("browser storage: {e}"),
     }
-    Ok((out, folders))
+    Ok(loaded)
 }
 
-/// The listed server files, read; the subfolders as they are.
-async fn read_remote((list, folders): Listing) -> (Vec<Stored>, Vec<String>) {
-    let mut out = Vec::new();
-    for (name, modified) in list {
+/// The listed server files, read; the subfolders and changes as they are.
+async fn read_remote(listing: Listing) -> Loaded {
+    let mut files = Vec::new();
+    for (name, modified) in listing.files {
         match remote_read(&name).await {
-            Ok(b) => out.push((name, b, modified)),
+            Ok(b) => files.push((name, b, modified)),
             Err(e) => log::warn!("{name}: {e}"),
         }
     }
-    (out, folders)
+    Loaded { files, folders: listing.folders, changes: listing.changes }
 }
 
 /// Every file in the browser's storage. Without OPFS, local storage takes over from here on.
@@ -463,9 +753,9 @@ pub fn start(files: &Rc<Files>) {
 }
 
 /// The loaded files go into the engine's files and the panel's entries; the app may open them.
-fn install(files: &Files, loaded: Result<(Vec<Stored>, Vec<String>), String>) {
+fn install(files: &Files, loaded: Result<Loaded, String>) {
     match loaded {
-        Ok((all, folders)) => {
+        Ok(Loaded { files: all, folders, changes }) => {
             let mut entries = Vec::new();
             let has_recovery = all.iter().any(|(n, _, _)| n == RECOVERY);
             for (name, bytes, modified) in all {
@@ -489,6 +779,7 @@ fn install(files: &Files, loaded: Result<(Vec<Stored>, Vec<String>), String>) {
             entries.sort_by_key(|a| a.name.to_lowercase());
             *files.entries.borrow_mut() = entries;
             *files.folders.borrow_mut() = folders;
+            *files.changes.borrow_mut() = changes;
             // An autosave without its design file is nothing to recover.
             if !vfs::exists(&format!("{OPFS}{RECOVERY}")) {
                 *files.recovery.borrow_mut() = None;
@@ -517,6 +808,8 @@ pub fn set_remote_folder(files: &Rc<Files>, folder: &str) -> Result<(), String> 
         let _ = vfs::remove(&format!("{OPFS}{}", e.name));
     }
     files.folders.borrow_mut().clear();
+    files.changes.borrow_mut().clear();
+    *files.history.borrow_mut() = None;
     files.ready.set(false);
     let files = files.clone();
     spawn_local(async move {
@@ -544,8 +837,10 @@ pub fn flush(files: &Rc<Files>) {
             }
             let files = files.clone();
             spawn_local(async move {
-                if let Err(e) = write_file(&name, &bytes).await {
-                    files.say(format!("{name}: {e}"), true);
+                match write_file(&name, &bytes).await {
+                    Ok(()) if !stays_local(&name) => refresh_changes(&files),
+                    Ok(()) => {}
+                    Err(e) => files.say(format!("{name}: {e}"), true),
                 }
             });
         } else if let Some(name) = path.strip_prefix(DOWNLOADS)
@@ -585,8 +880,9 @@ pub fn delete(files: &Rc<Files>, name: &str) {
     files.entries.borrow_mut().retain(|e| e.name != name);
     let (files, name) = (files.clone(), name.to_string());
     spawn_local(async move {
-        if let Err(e) = remove_file(&name).await {
-            files.say(format!("{name}: {e}"), true);
+        match remove_file(&name).await {
+            Ok(()) => refresh_changes(&files),
+            Err(e) => files.say(format!("{name}: {e}"), true),
         }
     });
 }
