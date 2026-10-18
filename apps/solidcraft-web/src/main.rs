@@ -441,7 +441,11 @@ mod web {
                         ui.separator();
                         egui::CollapsingHeader::new("Recent changes").default_open(true).show(ui, |ui| {
                             for c in changes.iter().take(12) {
-                                ui.label(format!("{} {} \u{b7} {}", c.author, c.message, files::ago(c.date))).on_hover_text(files::when(c.date));
+                                ui.label(format!("{} {} \u{b7} {}", c.author, c.message, files::ago(c.date))).on_hover_text(format!(
+                                    "{} \u{b7} {}",
+                                    files::when(c.date),
+                                    c.path
+                                ));
                             }
                         });
                     }

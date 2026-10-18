@@ -115,7 +115,6 @@ impl Sync {
     /// Once a frame, after the app ran its commands: share the open server design, send what ran
     /// here, apply what came in.
     pub fn tick(self: &Rc<Self>, app: &mut SolveApp, files: &Rc<Files>) {
-        let name = app.session.path.as_deref().filter(|_| files::remote_only()).and_then(|p| p.strip_prefix(files::OPFS)).map(str::to_string);
         self.finish_merge(app, files);
         let name = app.session.path.as_deref().filter(|_| files::remote_only()).and_then(|p| p.strip_prefix(files::OPFS)).map(str::to_string);
         self.follow(name.as_deref(), files);
