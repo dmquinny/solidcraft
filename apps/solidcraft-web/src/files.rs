@@ -1220,6 +1220,8 @@ pub fn start(files: &Rc<Files>) {
 fn install(files: &Rc<Files>, loaded: Result<Loaded, String>) {
     match loaded {
         Ok(Loaded { files: all, folders, changes, shared, me, access }) => {
+            // New features are the signed-in user's (the timeline says whose each is).
+            solidcraft_engine::sync::set_author(me.as_ref().map(|m| m.name.clone()));
             *files.me.borrow_mut() = me;
             *files.folder_access.borrow_mut() = access;
             files.shared_at.set(js_sys::Date::now());

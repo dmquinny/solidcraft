@@ -2223,6 +2223,11 @@ pub struct Feature {
     /// where newer ones number them after the first name (`Ribs (4)`, #373).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shell_piece_order: bool,
+    /// Who added the feature: the signed-in user's name where designs are shared on a server
+    /// (the engine sets it as a command adds the feature); None when unknown (older designs, no
+    /// sign-in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     #[serde(flatten)]
     pub kind: FeatureKind,
 }
@@ -2786,6 +2791,7 @@ impl Document {
             face_names: Vec::new(),
             participants: Vec::new(),
             shell_piece_order: false,
+            author: None,
             kind,
         };
         self.place_feature(f);

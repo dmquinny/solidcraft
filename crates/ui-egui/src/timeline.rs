@@ -174,6 +174,16 @@ pub(crate) fn clipboard_buttons(app: &mut SolveApp, ui: &mut egui::Ui, id: u64) 
     }
 }
 
+/// A colour for a person's features' marks: the same for the same name, well apart for
+/// different ones (a hue from the name).
+fn author_colour(name: &str) -> Color32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    let hue = (h.finish() % 360) as f32 / 360.0;
+    egui::ecolor::Hsva::new(hue, 0.7, 0.95, 1.0).into()
+}
+
 /// What a feature's error or warning mark says, as its tooltip shows it (name and type, then
 /// the error and the warning), for the clipboard. `None` when it has neither.
 pub(crate) fn feature_message(app: &SolveApp, id: u64) -> Option<String> {
@@ -263,8 +273,12 @@ pub fn timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
                     .doc
                     .features
                     .iter()
-                    .map(|f| (f.id, f.name.clone(), icon_of(&f.kind), f.suppressed, f.kind.type_name(), f.kind.clone()))
+                    .map(|f| (f.id, f.name.clone(), icon_of(&f.kind), f.suppressed, f.kind.type_name(), f.kind.clone(), f.author.clone()))
                     .collect();
+                // Several people's features: each one's author gets a colour mark (one person's
+                // design needs none; the tooltip says who in any case).
+                let authors: std::collections::BTreeSet<&str> = feats.iter().filter_map(|f| f.6.as_deref()).collect();
+                let mark_authors = authors.len() > 1;
                 // The feature whose body is under the cursor in the viewport.
                 let st = app.session.world_state();
                 let from_view = match &app.viewport.hover {
@@ -280,7 +294,7 @@ pub fn timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
                 let mut hovered: Option<u64> = None;
                 let mut edit: Option<u64> = None;
                 let mut marker_rect: Option<Rect> = None;
-                for (i, (id, name, icon, suppressed, ty, kind)) in feats.iter().enumerate() {
+                for (i, (id, name, icon, suppressed, ty, kind, author)) in feats.iter().enumerate() {
                     if i == marker {
                         marker_rect = Some(Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(6.0, r.height() - 10.0)));
                         x += 10.0;
@@ -341,7 +355,13 @@ pub fn timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
                             t.warning,
                         );
                     }
+                    if let (true, Some(a)) = (mark_authors, author) {
+                        p.circle_filled(br.left_bottom() + vec2(4.0, -4.0), 3.5, author_colour(a));
+                    }
                     let mut tip = format!("{name}  ({ty})");
+                    if let Some(a) = author {
+                        tip += &format!("\nby {a}");
+                    }
                     if let Some(e) = &err {
                         tip += &format!("\nError: {e}");
                     }

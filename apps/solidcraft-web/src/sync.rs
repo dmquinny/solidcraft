@@ -307,7 +307,7 @@ impl Sync {
         let (mut done, mut skipped) = (0, 0);
         for e in &ops {
             let Some(id) = e["id"].as_str() else { continue };
-            match app.run(id, e["params"].clone()) {
+            match engine::as_author(e["user"].as_str(), || app.run(id, e["params"].clone())) {
                 Ok(_) => done += 1,
                 Err(err) => {
                     log::warn!("merge: {id}: {err}");
@@ -382,7 +382,7 @@ impl Sync {
                 continue;
             }
             let (Some(id), params) = (e["id"].as_str(), e["params"].clone()) else { continue };
-            if let Err(err) = engine::apply(|| app.run(id, params)) {
+            if let Err(err) = engine::apply(|| engine::as_author(e["user"].as_str(), || app.run(id, params))) {
                 log::warn!("live: {id} from {}: {err}", e["user"].as_str().unwrap_or("?"));
                 stale = true;
             } else {
@@ -466,7 +466,7 @@ impl Sync {
                     continue;
                 }
                 if let Some(id) = e["id"].as_str()
-                    && let Err(err) = app.run(id, e["params"].clone())
+                    && let Err(err) = engine::as_author(e["user"].as_str(), || app.run(id, e["params"].clone()))
                 {
                     log::warn!("live: replaying {id}: {err}");
                 }

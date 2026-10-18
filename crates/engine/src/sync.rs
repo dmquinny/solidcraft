@@ -71,6 +71,32 @@ pub fn applying() -> bool {
     APPLYING.with(Cell::get)
 }
 
+thread_local! {
+    /// Who runs commands here (the host's signed-in user): new features are theirs.
+    static AUTHOR: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Whose commands are being run right now when they are someone else's (`as_author`).
+    static AS: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The host says who is signed in (None: nobody in particular): new features are theirs.
+pub fn set_author(name: Option<String>) {
+    AUTHOR.with(|a| *a.borrow_mut() = name.filter(|n| !n.is_empty()));
+}
+
+/// Who new features are by right now.
+pub fn author() -> Option<String> {
+    AS.with(|a| a.borrow().clone()).or_else(|| AUTHOR.with(|a| a.borrow().clone()))
+}
+
+/// Run `f` as `user`'s own commands (received from them, or replayed from their branch): the
+/// features it adds are theirs. Recording is as usual: wrap in `apply` for what must not be sent.
+pub fn as_author<T>(user: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let was = AS.with(|a| a.replace(user.filter(|u| !u.is_empty()).map(str::to_string)));
+    let r = f();
+    AS.with(|a| *a.borrow_mut() = was);
+    r
+}
+
 /// Run `f` (commands from another session) without recording what it runs; locks don't apply.
 pub fn apply<T>(f: impl FnOnce() -> T) -> T {
     let was = APPLYING.with(|a| a.replace(true));

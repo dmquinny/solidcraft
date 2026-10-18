@@ -721,6 +721,26 @@ impl Session {
             crash::command_done(self.crash_journal, changed, &before.doc, after, spec.id, given, failed.map_or(Ok(()), Err));
         }
         let changed = !Arc::ptr_eq(&self.doc, &before.doc);
+        // Who added a feature: the features a command adds are the current author's (the host's
+        // signed-in user, or the other user whose commands are being applied), kept in the
+        // design. Not for commands that replace the design (open, new: not undoable).
+        if changed
+            && outermost
+            && spec.undoable
+            && r.is_ok()
+            && let Some(author) = sync::author()
+        {
+            let known: std::collections::HashSet<u64> = before.doc.features.iter().map(|f| f.id).collect();
+            let fresh = |f: &solidcraft_doc::Feature| !known.contains(&f.id) && f.author.is_none();
+            if self.doc.features.iter().any(fresh) {
+                let doc = Arc::make_mut(&mut self.doc);
+                for f in doc.features.iter_mut() {
+                    if !known.contains(&f.id) && f.author.is_none() {
+                        f.author = Some(author.clone());
+                    }
+                }
+            }
+        }
         // Live collaboration (`sync`): a change to a component someone else holds fails like any
         // other refused command (the design is restored below); the rest is handed to the host.
         let r = match r {
