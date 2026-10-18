@@ -10,6 +10,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::Settings;
 use crate::access::{self, Acl, Level};
+use crate::directory::Directory;
 use crate::ops::Refused;
 use crate::store::{Change, Entry, Meta, Store, Version, Written, clean_path};
 use crate::users;
@@ -33,6 +34,8 @@ struct Service {
     seen_file: PathBuf,
     /// Who may see and change what.
     acl: Acl,
+    /// The identity provider's users, when it is configured.
+    directory: Option<Directory>,
 }
 
 impl Service {
@@ -49,9 +52,12 @@ impl Service {
         true
     }
 
-    /// Is this user an admin: by the users file, or by a group the proxy passed?
+    /// Is this user an admin: by the users file, by a group the proxy passed, or by the
+    /// directory (a superuser, or a member of the admin group)?
     fn is_admin(&self, user: &str, groups: Option<&str>) -> bool {
-        users::is_admin(&self.users_file, user) || groups.is_some_and(|g| g.split(',').any(|g| g.trim() == self.admin_group))
+        users::is_admin(&self.users_file, user)
+            || groups.is_some_and(|g| g.split(',').any(|g| g.trim() == self.admin_group))
+            || self.directory.as_ref().is_some_and(|d| d.is_admin(user))
     }
 }
 
@@ -68,7 +74,11 @@ pub fn serve(settings: &Settings) -> Result<(), String> {
         seen: std::sync::Mutex::new(seen),
         seen_file,
         acl: Acl::open(&settings.history.join("access.json"), settings.default_open),
+        directory: Directory::new(&settings.authentik_url, &settings.authentik_token, &settings.admin_group),
     });
+    if let Some(d) = &service.directory {
+        log::info!("users also come from {} ({} known now)", d.source(), d.users().len());
+    }
     let server = Server::http(&settings.listen).map_err(|e| format!("listen on {}: {e}", settings.listen))?;
     log::info!("serving {} on http://{}/files/ (history in {})", settings.designs.display(), settings.listen, settings.history.display());
     for request in server.incoming_requests() {
@@ -392,6 +402,13 @@ fn users_route(service: &Service, admin: bool, method: &Method, url: &str, user:
     let field = |k: &str| serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get(k).cloned());
     let listing = |status: u16| match users::list(file) {
         Ok(mut list) => {
+            // The directory's people first (they may be admins there), then everyone who signed in.
+            for (name, is_admin) in service.directory.as_ref().map(Directory::users).unwrap_or_default() {
+                match list.iter_mut().find(|u| u.name == name) {
+                    Some(u) => u.admin |= is_admin,
+                    None => list.push(users::User { name, admin: is_admin }),
+                }
+            }
             let seen = service.seen.lock().map(|s| s.clone()).unwrap_or_default();
             for name in seen.into_iter().filter(|n| n != ANONYMOUS) {
                 if !list.iter().any(|u| u.name == name) {

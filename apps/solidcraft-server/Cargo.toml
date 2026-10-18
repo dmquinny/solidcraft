@@ -23,3 +23,5 @@ env_logger = "0.11"
 sha1 = "0.10"
 base64 = "0.22"
 rpassword = "7"
+# reads the identity provider's directory (Authentik's API) when one is configured
+ureq = "3"

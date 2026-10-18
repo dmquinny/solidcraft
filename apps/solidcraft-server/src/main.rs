@@ -47,7 +47,10 @@
 //! A proxy that signed the user in may also pass their groups (`X-Remote-Groups`, comma
 //! separated): members of `SOLIDCRAFT_ADMIN_GROUP` (default `solidcraft-admins`) are admins
 //! too. Every name that ever signed in is remembered (`<history>/users-seen`), so the Users
-//! page lists people the proxy knows even when the users file does not.
+//! page lists people the proxy knows even when the users file does not. With
+//! `SOLIDCRAFT_AUTHENTIK_URL` and `SOLIDCRAFT_AUTHENTIK_TOKEN` the whole directory is read from
+//! Authentik's API (`directory`), so everyone appears before they ever sign in, and Authentik's
+//! superusers and the admin group's members are admins.
 //!
 //! Command line: `solidcraft-server` serves; `solidcraft-server user add|remove|list [NAME]`
 //! maintains the users file. Settings come from the environment: `SOLIDCRAFT_DESIGNS`
@@ -57,6 +60,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod access;
+mod directory;
 mod http;
 mod ops;
 mod store;
@@ -75,6 +79,9 @@ pub struct Settings {
     pub admin_group: String,
     /// Designs without sharing of their own are everyone's (else their creator's).
     pub default_open: bool,
+    /// Authentik's address and an API token that may read its users (both empty: no directory).
+    pub authentik_url: String,
+    pub authentik_token: String,
 }
 
 impl Settings {
@@ -87,6 +94,8 @@ impl Settings {
             allow_anonymous: matches!(var("SOLIDCRAFT_ALLOW_ANONYMOUS", "0").as_str(), "1" | "true" | "yes"),
             admin_group: var("SOLIDCRAFT_ADMIN_GROUP", "solidcraft-admins"),
             default_open: var("SOLIDCRAFT_DEFAULT_ACCESS", "everyone") != "owner",
+            authentik_url: var("SOLIDCRAFT_AUTHENTIK_URL", ""),
+            authentik_token: var("SOLIDCRAFT_AUTHENTIK_TOKEN", ""),
         }
     }
 

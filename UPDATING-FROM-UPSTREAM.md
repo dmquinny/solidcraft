@@ -84,8 +84,12 @@ the groups to the upstream), add to the
 who reaches that port directly could name themselves in the header: bind it to the host only
 (`127.0.0.1:8781:8080` is not enough for NPM in a bridge network; use the container name
 `solidcraft:8080` as NPM's forward host and drop the mapping) when that matters.
-User names then come from Authentik; the users file is only consulted for who is an admin (add
-the Authentik names there with `user add NAME --admin`, any password).
+User names then come from Authentik. To list everyone Authentik knows before they sign in (the
+Users page and the Sharing window), give the `solidcraft-server` service `SOLIDCRAFT_AUTHENTIK_URL`
+(Authentik's address as seen from the container) and `SOLIDCRAFT_AUTHENTIK_TOKEN` (Authentik ›
+Directory › Tokens and App passwords › Create: intent API, for a user or service account that may
+view users). Admins are then Authentik's superusers, the members of `SOLIDCRAFT_ADMIN_GROUP`
+(default `solidcraft-admins`), and whoever the users file flags (`user add NAME --admin`).
 
 Remotes: `origin` is the fork (github.com/dmquinny/solidcraft), `upstream` is tangency-labs.
 
