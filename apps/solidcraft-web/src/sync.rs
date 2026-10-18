@@ -346,6 +346,11 @@ impl Sync {
             None => return,
         };
         let quiet = self.pending.borrow().is_empty() && !self.sending.get();
+        // Only this user's own commands make the document "modified": what the others do
+        // arrives here already recorded on the server, and their save is this document's too
+        // when it agrees with it. So a clean document stays clean through their changes.
+        let was_dirty = app.session.is_dirty();
+        let mut theirs = false;
         let mut stale = false;
         let mut last_foreign_after: Option<String> = None;
         let mut seq = 0;
@@ -357,13 +362,17 @@ impl Sync {
                 if let Some(tag) = saved["etag"].as_str() {
                     files::note_version(&name, tag);
                 }
-                // Someone's save is a checkpoint: a session that disagrees with it starts afresh.
+                // Someone's save is a checkpoint: a session that agrees with it is saved too; one
+                // that disagrees starts afresh.
                 if let Some(fp) = saved["fp"].as_str()
                     && quiet
                     && e["user"].as_str() != Some(&files::remote_user())
-                    && fp != self.fingerprint_of(app)
                 {
-                    stale = true;
+                    if fp == self.fingerprint_of(app) {
+                        app.session.mark_saved();
+                    } else {
+                        stale = true;
+                    }
                 }
                 last_foreign_after = None;
                 continue;
@@ -376,8 +385,13 @@ impl Sync {
             if let Err(err) = engine::apply(|| app.run(id, params)) {
                 log::warn!("live: {id} from {}: {err}", e["user"].as_str().unwrap_or("?"));
                 stale = true;
+            } else {
+                theirs = true;
             }
             last_foreign_after = e["after"].as_str().map(str::to_string);
+        }
+        if theirs && !was_dirty && !stale {
+            app.session.mark_saved();
         }
         if let Some(fp) = last_foreign_after
             && quiet
@@ -466,6 +480,10 @@ impl Sync {
                 }
             }
         });
+        // Nothing of this user's own on top of the server's version: nothing to save here.
+        if pending.is_empty() {
+            app.session.mark_saved();
+        }
         self.pending.borrow_mut().extend(pending);
         self.received.set(self.received.get().max(seq));
         if let Some(s) = self.shared.borrow_mut().as_mut() {
