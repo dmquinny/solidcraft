@@ -270,6 +270,7 @@ fn offscreen(
         hl_slot: Arc::new(Mutex::new(highlight)),
         pv_key: 0,
         pv_slot: none(),
+        pv_hide: false,
         view_proj,
         back,
         size_px: [size as f32; 2],
@@ -281,6 +282,7 @@ fn offscreen(
         access: None,
         outline: false,
         eye,
+        ao_radius: 0.0,
         ssaa,
     });
     let texture = |format, usage| {

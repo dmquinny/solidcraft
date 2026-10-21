@@ -3,11 +3,11 @@
 
 use std::cell::RefCell;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const MAX_EVENTS: usize = 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BooleanStrategy {
     RefinedTolerance,
@@ -18,6 +18,8 @@ pub enum BooleanStrategy {
     GrownBoss,
     PlanarFallback,
     ToolNudge,
+    /// A rotationally symmetric tool turned about its own axis; its volume is unchanged.
+    ToolReseam,
     Piecewise,
     /// No retry gave a result, and the answer from sample points was kept although the bodies'
     /// facetings disagree with it.
@@ -27,7 +29,7 @@ pub enum BooleanStrategy {
 /// Numerical adjustments used by a successful retry, in millimetres/radians.
 /// Operand shifts are reversed on the result; face shifts are temporary working
 /// offsets. A tool nudge, in contrast, changes the relative operand placement.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BooleanFallback {
     pub strategy: BooleanStrategy,
     pub translation_mm: f64,
@@ -61,6 +63,7 @@ impl BooleanFallback {
             BooleanStrategy::GrownBoss => format!("boss grown {:.6e} mm into the material around the bore it fills", self.face_shift_mm),
             BooleanStrategy::PlanarFallback => "exact planar fallback (no displacement)".into(),
             BooleanStrategy::ToolNudge => format!("tool displacement {:.6e} mm, rotation {:.6e} rad", self.translation_mm, self.rotation_rad),
+            BooleanStrategy::ToolReseam => format!("axisymmetric tool reseamed by {:.6e} rad (no displacement)", self.rotation_rad),
             BooleanStrategy::Piecewise => "piecewise retry (no displacement)".into(),
             BooleanStrategy::UnverifiedShortcut => format!(
                 "not verified: the bodies' facets pass through each other by more than {:.6e} mm, but they could not be intersected there; that part is ignored",
@@ -70,16 +73,33 @@ impl BooleanFallback {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BooleanDiagnostics {
     pub events: Vec<BooleanFallback>,
     pub truncated: bool,
+    /// Why candidates of the retries that led to the result were discarded before they were
+    /// measured (#3020: a coarse candidate whose edges run far outside the operands, which
+    /// meshing never finished). Left out of the report when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<String>,
 }
 
 impl BooleanDiagnostics {
     pub(crate) fn push(&mut self, event: BooleanFallback) {
         if self.events.len() < MAX_EVENTS {
             self.events.push(event);
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    fn push_rejected(&mut self, reason: String) {
+        // A candidate checked twice (picked, then taken) is noted once.
+        if self.rejected.contains(&reason) {
+            return;
+        }
+        if self.rejected.len() < MAX_EVENTS {
+            self.rejected.push(reason);
         } else {
             self.truncated = true;
         }
@@ -160,9 +180,23 @@ pub(crate) fn record(event: BooleanFallback) {
     });
 }
 
+/// Note a candidate discarded before it was measured, and why.
+pub(crate) fn reject(reason: String) {
+    REPORT.with(|cell| {
+        if let Ok(mut report) = cell.try_borrow_mut()
+            && let Some(report) = report.as_mut()
+        {
+            report.push_rejected(reason);
+        }
+    });
+}
+
 pub(crate) fn merge(report: BooleanDiagnostics) {
     for event in report.events {
         record(event);
+    }
+    for reason in report.rejected {
+        reject(reason);
     }
     if report.truncated {
         REPORT.with(|cell| {
@@ -192,6 +226,26 @@ mod tests {
         assert!(capture_boolean_diagnostics(|| {}).1.events.is_empty());
         record(BooleanFallback::new(BooleanStrategy::ToolNudge));
         assert!(capture_boolean_diagnostics(|| {}).1.events.is_empty());
+    }
+
+    /// Candidates discarded unmeasured (#3020) are reported with the attempt that led to the
+    /// result, once each, and not at all when there are none.
+    #[test]
+    fn rejected_candidates_follow_the_accepted_attempt() {
+        let (_, report) = capture_boolean_diagnostics(|| {
+            let (_, discarded) = capture_boolean_diagnostics(|| reject("from a discarded attempt".into()));
+            assert_eq!(discarded.rejected.len(), 1);
+            let (_, accepted) = capture_boolean_diagnostics(|| {
+                reject("runaway edge".into());
+                reject("runaway edge".into());
+                record(BooleanFallback::new(BooleanStrategy::ToolNudge));
+            });
+            merge(accepted);
+        });
+        assert_eq!(report.rejected, vec!["runaway edge".to_string()]);
+        assert!(serde_json::to_string(&report).unwrap().contains("\"rejected\":[\"runaway edge\"]"));
+        let plain = capture_boolean_diagnostics(|| record(BooleanFallback::new(BooleanStrategy::ToolNudge))).1;
+        assert!(!serde_json::to_string(&plain).unwrap().contains("rejected"));
     }
 
     /// Only retries whose result can differ from the exact one make a warning; the summary

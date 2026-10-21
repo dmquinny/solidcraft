@@ -226,8 +226,9 @@ fn a_name_of_a_body_without_history_is_found_by_geometry_and_says_so_once_it_mov
     run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": "len"}));
     run(&mut s, "sketch.finish", json!({}));
     run(&mut s, "solid.extrude", json!({"distance": 10, "name": "Block"}));
-    // Replacing the top by a plane: an operation that reports no history.
-    run(&mut s, "solid.replace_face", json!({"faces": [[20, 15, 10]], "target": {"origin": [0, 0, 12], "normal": [0, 0, 1]}, "name": "Lift"}));
+    // Lifting it 2 mm with Align: an operation that reports no history (Replace Face, used here
+    // before, keeps it now). The top ends at z = 12 as it did.
+    run(&mut s, "solid.align", json!({"bodies": ["Body1"], "from": [0, 0, 0], "to": [0, 0, 2], "name": "Lift"}));
     let state = s.model.state();
     let body = state.bodies.first().unwrap();
     assert!((0..solidcraft_doc::naming::face_names(body).len()).all(|i| !solidcraft_doc::naming::face_name_exact(body, i)));
@@ -240,6 +241,36 @@ fn a_name_of_a_body_without_history_is_found_by_geometry_and_says_so_once_it_mov
     let w = warning(&s, "Round").unwrap_or_default();
     assert!(w.contains("found by geometry, not exact history"), "{w}");
     assert!(!solid_at(&s, [49.9, 15.0, 11.9]));
+}
+
+/// Replace Face keeps the body's history, as Offset Face does: every face of the result is named
+/// exactly, and a sketch takes an attachment on the replaced face (before, no face could: "this
+/// face can't keep an attachment") and follows it when the target moves.
+#[test]
+fn a_sketch_on_a_replaced_face_follows_it() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "top", "expression": "15 mm"}));
+    block(&mut s);
+    run(&mut s, "solid.replace_face", json!({"faces": [[20, 15, 10]], "target": {"origin": [0, 0, "top"], "normal": [0, 0, 1]}, "name": "Lift"}));
+    assert!(names(&s, "Body1").iter().all(|(_, exact)| *exact), "{:?}", names(&s, "Body1"));
+    // A side the replacement only stretched takes an attachment too.
+    run(&mut s, "sketch.create", json!({"plane": {"face": [0, 15, 5]}, "name": "Side"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sketch.create", json!({"plane": {"face": [20, 15, 15]}, "name": "OnTop"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 3}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "OnTop", "distance": 5, "operation": "join", "name": "Boss"}));
+    // The boss stands on the replaced top wherever the circle's centre lands on it.
+    let (lo, hi) = {
+        let state = s.model.state();
+        let b = state.body("Body1").unwrap().mesh().bounds();
+        (b.min.z, b.max.z)
+    };
+    assert!((lo - 0.0).abs() < 1e-6 && (hi - 20.0).abs() < 1e-6, "{lo} {hi}");
+    change(&mut s, "top", "18 mm");
+    assert_eq!(error(&s, "Boss"), None);
+    let hi = s.model.state().body("Body1").unwrap().mesh().bounds().max.z;
+    assert!((hi - 23.0).abs() < 1e-6, "the boss follows the top to z = 18: {hi}");
 }
 
 #[test]
@@ -298,4 +329,75 @@ fn a_shell_fillet_does_not_follow_a_gone_edge_onto_a_smooth_seam() {
     let message = error(&s, "Fillet2").or_else(|| edited.err().map(|e| e.to_string())).unwrap_or_default();
     assert!(message.contains("no longer exists"), "{message}");
     assert!(!message.contains("smooth edge"), "{message}");
+}
+
+/// The faces `model.faces` lists for `body`: name, whether it is exact, and centroid.
+fn listed(s: &mut Session, body: &str) -> Vec<(String, bool, [f64; 3])> {
+    let v = run(s, "model.faces", json!({"body": body}));
+    let faces = v["faces"].as_array().unwrap_or_else(|| panic!("faces of {body}: {v}"));
+    faces
+        .iter()
+        .map(|f| {
+            let c = |k: usize| f["centroid"][k].as_f64().unwrap_or(f64::NAN);
+            (f["name"].as_str().unwrap_or_default().to_string(), f["exact"].as_bool() == Some(true), [c(0), c(1), c(2)])
+        })
+        .collect()
+}
+
+/// The face of `faces` whose centroid is within 0.05 of `at`.
+fn named_at(faces: &[(String, bool, [f64; 3])], at: [f64; 3]) -> String {
+    let near = |c: &[f64; 3]| (0..3).all(|k| (c[k] - at[k]).abs() < 0.05);
+    let found: Vec<&String> = faces.iter().filter(|(_, _, c)| near(c)).map(|(n, _, _)| n).collect();
+    match found.as_slice() {
+        [n] => (*n).clone(),
+        _ => panic!("faces at {at:?}: {found:?} in {faces:?}"),
+    }
+}
+
+/// #1209: an arm with a boss at each end (each boss the radius of the arm's round end under it)
+/// and a square cut through one. The second boss and the cut are prism booleans sewn slab by
+/// slab, where the arm's round end and the boss over it are two pieces of one cylinder: every
+/// face keeps exact history, so the cut's walls are its own four faces and the boss's outer
+/// cylinder keeps its name, through the fillets on the bore's corners too.
+#[test]
+fn a_cut_through_one_of_two_bosses_names_only_its_own_walls() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    let (lo0, lo1) = ([16.54527384497186, -18.318724018148217], [159.66891048662592, -12.425397803491872]);
+    let (hi0, hi1) = ([159.66891048662592, 12.425397803491872], [16.54527384497186, 18.318724018148217]);
+    let (j0, j1) = ([162.79697152270225, -13.15736982664994], [162.79697152270225, 13.15736982664994]);
+    let (k0, k1) = ([11.818299035314524, 19.73139143375053], [11.818299035314524, -19.73139143375053]);
+    run(&mut s, "sketch.line", json!({"points": [lo0, lo1]}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [159.91576013178314, -18.420317757309917], "start": j0, "end": lo1}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [170.0, 0], "start": j0, "end": j1}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [159.91576013178314, 18.420317757309917], "start": hi0, "end": j1}));
+    run(&mut s, "sketch.line", json!({"points": [hi0, hi1]}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [16.95668992023388, 28.310257274511628], "start": k0, "end": hi1}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [0, 0], "start": k0, "end": k1}));
+    run(&mut s, "sketch.arc.center_point", json!({"center": [16.95668992023388, -28.310257274511628], "start": lo0, "end": k1}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 16, "body_name": "Arm"}));
+    run(&mut s, "solid.cylinder", json!({"diameter": 46.0, "height": 22, "base": [0, 0, 0], "operation": "join", "targets": ["Arm"]}));
+    let boss = named_at(&listed(&mut s, "Arm"), [19.98, -4.24, 19.0]);
+    assert!(boss.starts_with("F3:side"), "{boss}");
+    run(&mut s, "solid.cylinder", json!({"diameter": 30.0, "height": 20, "base": [170.0, 0, 0], "operation": "join", "targets": ["Arm"]}));
+    let joined = listed(&mut s, "Arm");
+    assert!(joined.iter().all(|(_, exact, _)| *exact), "{joined:?}");
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.center", json!({"center": [0, 0], "corner": [6.35, 6.35]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"through_all": true, "operation": "cut", "targets": ["Arm"]}));
+    let cut = listed(&mut s, "Arm");
+    assert!(cut.iter().all(|(_, exact, _)| *exact), "{cut:?}");
+    let walls: Vec<&String> = cut.iter().map(|(n, _, _)| n).filter(|n| n.starts_with("F6:")).collect();
+    assert_eq!(walls.len(), 4, "{cut:?}");
+    for (at, line) in [([0.0, -6.35, 11.0], "l1"), ([6.35, 0.0, 11.0], "l2"), ([0.0, 6.35, 11.0], "l3"), ([-6.35, 0.0, 11.0], "l4")] {
+        assert_eq!(named_at(&cut, at), format!("F6:side:{line}"));
+    }
+    assert_eq!(named_at(&cut, [19.98, -4.24, 19.0]), boss);
+    run(&mut s, "solid.fillet", json!({"edges": [[6.35, 6.35, 10], [-6.35, 6.35, 10], [-6.35, -6.35, 10], [6.35, -6.35, 10]], "radius": 1.5}));
+    let filleted = listed(&mut s, "Arm");
+    let blends = filleted.iter().filter(|(n, _, _)| n.starts_with("F7:blend:")).count();
+    assert_eq!(blends, 4, "{filleted:?}");
+    assert_eq!(named_at(&filleted, [19.98, -4.24, 19.0]), boss);
 }

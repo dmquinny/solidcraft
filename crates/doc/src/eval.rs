@@ -1,12 +1,15 @@
 //! Timeline evaluation.
 
+#[path = "placed_mesh.rs"]
+mod placed_mesh;
+
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use solidcraft_geom::tess::TessPlan;
-use solidcraft_geom::{Mesh, Plane, Region2, Vec2, Vec3, regions_apart};
+use solidcraft_geom::{Mesh, Plane, Region2, UnitVec3, Vec2, Vec3, regions_apart};
 use solidcraft_kernel::{self as kernel, Body, BoolOp};
 use solidcraft_sketch::{CurveKind, Profile, SolveReport, find_profiles};
 
@@ -28,6 +31,8 @@ pub struct ModelBody {
     // Timeline snapshots are cloned before meshes are requested. Share the cell itself so
     // meshing any snapshot also warms every unchanged copy of this body.
     mesh: Arc<OnceLock<Arc<Mesh>>>,
+    /// Lazy canonical reference triangles for a proper rigid occurrence placement.
+    mesh_placement: Option<Arc<placed_mesh::PlacedMesh>>,
     /// The display plan (none when the body has no plan: a mesh body, or one the planner
     /// refuses), shared like the mesh. A GPU viewport draws it.
     plan: Arc<[OnceLock<Option<Arc<TessPlan>>>; 4]>,
@@ -50,6 +55,11 @@ pub struct ModelBody {
     /// [`Body::retained_bytes`] of `body`, measured when a feature made or changed it (0: not
     /// measured), so the evaluation cache's budget does not walk every body after every feature.
     bytes: usize,
+    /// In a world state: the [`ModelBody::geometry_key`] of the model body this one places (0: none).
+    source_key: u64,
+    /// [`Body::outline_bounds`] of `body` (with the body it was measured on), worked out once
+    /// and shared by clones.
+    outline: Arc<OnceLock<(Body, solidcraft_geom::Aabb3)>>,
 }
 
 impl ModelBody {
@@ -61,6 +71,7 @@ impl ModelBody {
             body,
             feature,
             mesh: Arc::new(OnceLock::new()),
+            mesh_placement: None,
             plan: Arc::new(Default::default()),
             plan_mesh: Arc::new(Default::default()),
             key: 0,
@@ -70,7 +81,33 @@ impl ModelBody {
             transferred: false,
             imported: None,
             bytes: 0,
+            source_key: 0,
+            outline: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// A box around the body without meshing it ([`Body::outline_bounds`]), worked out once.
+    pub fn outline_bounds(&self) -> solidcraft_geom::Aabb3 {
+        match self.outline.get_or_init(|| (self.body.clone(), self.body.outline_bounds())) {
+            (measured, b) if measured.same(&self.body) => *b,
+            // The body was replaced in this cell's holder since: measure it again.
+            _ => self.body.outline_bounds(),
+        }
+    }
+
+    /// Identity of this body's geometry where it stands: the same for a body evaluated or
+    /// placed again from the same inputs at the same place, so work measured on it can be
+    /// reused (none for a body the evaluation cache does not key).
+    pub fn geometry_key(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let key = if self.key != 0 { self.key } else { self.source_key };
+        if key == 0 {
+            return None;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        self.source_transform.iter().flatten().for_each(|v| v.to_bits().hash(&mut h));
+        Some(h.finish())
     }
     pub fn definition_name(&self) -> &str {
         self.source_name.as_deref().unwrap_or(&self.name)
@@ -83,9 +120,10 @@ impl ModelBody {
         // finding their surface, picks naming their face, sketch planes), and a different
         // triangulation moved those and changed what designs build. A GPU viewport draws the
         // plan ([`ModelBody::display_plan`]).
-        self.mesh
-            .get_or_init(|| Arc::new(self.body.reference_display_mesh_angular(self.display_tol(), kernel::DISPLAY_ANGLE).unwrap_or_default()))
-            .clone()
+        match self.mesh_placement.as_deref() {
+            Some(placed) => self.mesh.get_or_init(|| placed.mesh()).clone(),
+            None => placed_mesh::reference_mesh(&self.body, &self.mesh, self.display_tol()),
+        }
     }
 
     /// The display plan of this body at the viewport's display quality
@@ -98,16 +136,12 @@ impl ModelBody {
 
     /// The display plan at a given display quality, made once per level.
     pub fn display_plan_at(&self, q: crate::display_quality::DisplayQuality) -> Option<Arc<TessPlan>> {
-        self.plan
-            .get(q.index())?
-            .get_or_init(|| match self.body.display_plan_angular(q.chord(self.body.size()), q.angle()) {
-                Ok(plan) => Some(Arc::new(plan)),
-                Err(e) => {
-                    log::debug!("{}: no display plan ({e})", self.name);
-                    None
-                }
-            })
-            .clone()
+        let cell = self.plan.get(q.index())?;
+        match self.mesh_placement.as_deref() {
+            // A placed part shows its definition's plan, moved (planned once for every placement).
+            Some(placed) => cell.get_or_init(|| placed.plan(q, &self.name)).clone(),
+            None => placed_mesh::definition_plan(&self.body, cell, q, &self.name),
+        }
     }
 
     /// The display plan's mesh, evaluated on the CPU once per level: the same triangles a GPU
@@ -122,8 +156,45 @@ impl ModelBody {
     pub fn plan_mesh_at(&self, q: crate::display_quality::DisplayQuality) -> Option<Arc<Mesh>> {
         self.plan_mesh
             .get(q.index())?
-            .get_or_init(|| self.display_plan_at(q).and_then(|plan| self.body.display_mesh_of(&plan).ok()).map(Arc::new))
+            .get_or_init(|| match self.mesh_placement.as_deref() {
+                Some(placed) => placed.plan_mesh(q, &self.name),
+                None => self.display_plan_at(q).and_then(|plan| self.body.display_mesh_of(&plan).ok()).map(Arc::new),
+            })
             .clone()
+    }
+
+    /// [`ModelBody::plan_mesh`] if it is made already; otherwise it is made on a worker thread
+    /// (once, however often this is asked) and `None` comes back meanwhile, so a caller drawing a
+    /// frame (a face highlighted under the pointer) is not held up by a large body's plan
+    /// (#3745): the plan mesh of a long modelled thread takes most of a second. The browser
+    /// build has no threads: there it is made now.
+    pub fn plan_mesh_soon(&self) -> Option<Arc<Mesh>> {
+        let q = crate::display_quality::current();
+        let cell = self.plan_mesh.get(q.index())?;
+        if let Some(mesh) = cell.get() {
+            return mesh.clone();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            static WARMING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+            let key = Arc::as_ptr(&self.plan_mesh) as usize + q.index();
+            let Ok(mut warming) = WARMING.lock() else { return None };
+            if warming.contains(&key) {
+                return None;
+            }
+            let body = self.clone();
+            let started = std::thread::Builder::new().name("plan-mesh".into()).spawn(move || {
+                let _ = body.plan_mesh_at(q);
+                if let Ok(mut warming) = WARMING.lock() {
+                    warming.retain(|k| *k != key);
+                }
+            });
+            if started.is_ok() {
+                warming.push(key);
+                return None;
+            }
+        }
+        self.plan_mesh_at(q)
     }
 
     /// The display plan and its mesh `k` steps finer than `q` (view-dependent refinement, #1320;
@@ -145,9 +216,10 @@ impl ModelBody {
         Some((Arc::new(plan), Arc::new(mesh)))
     }
 
-    /// The chord tolerance of [`ModelBody::mesh`] (mm): 1/1000 of the body's size, at least 1 µm.
+    /// The chord tolerance of [`ModelBody::mesh`] (mm): 1/1000 of the definition's size, at least
+    /// 1 µm. Proper rigid placements retain that tolerance along with the reference triangles.
     pub fn display_tol(&self) -> f64 {
-        (self.body.size() * 1e-3).max(1e-3)
+        self.mesh_placement.as_ref().map(|placed| placed.tolerance).unwrap_or_else(|| (self.body.size() * 1e-3).max(1e-3))
     }
 
     /// Already computed display geometry; saving must not trigger cold tessellation.
@@ -165,10 +237,12 @@ pub struct SolvedSketch {
     pub sketch: solidcraft_sketch::Sketch,
     pub report: SolveReport,
     pub profiles: Vec<Profile>,
+    /// Open and untied ends of its profile curves (where a profile can fail).
+    pub ends: solidcraft_sketch::EndReport,
 }
 
 /// A cosmetic thread: on which cylinder, its size, and the threaded part of the axis.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThreadInfo {
     pub feature: u64,
     pub body: String,
@@ -177,7 +251,7 @@ pub struct ThreadInfo {
     pub pitch: f64,
     pub internal: bool,
     pub axis_point: Vec3,
-    pub axis: Vec3,
+    pub axis: UnitVec3,
     /// Threaded part along the axis from `axis_point`.
     pub start: f64,
     pub end: f64,
@@ -354,7 +428,21 @@ fn thread_groove(t: &ThreadInfo, radius: f64, open: (bool, bool)) -> Result<soli
         (r_root, p / 8.0, r_out, (p / 4.0 + 2.0 * (r_out - r_root) * slope) / 2.0)
     };
     if w0.max(w1) * 2.0 >= p * 0.98 {
-        return Err(DocError::Invalid("the face is too far from the thread's diameter".into()));
+        // The groove would be wider than a pitch: the face is far inside the thread (a hole
+        // narrower than its minor diameter, a shaft thicker than its major one, #2688).
+        let (m, dia) = (&t.designation, 2.0 * radius);
+        let alt = thread_for(dia, t.internal).map(|(n, q)| format_thread(n, q)).filter(|a| a != m);
+        let shown = show_mm(dia);
+        return Err(DocError::Invalid(if t.internal {
+            let alt = alt.map(|a| format!(", or thread this hole {a}")).unwrap_or_default();
+            format!(
+                "this {shown} mm hole is too narrow for a modelled {m} thread (its teeth would fill the hole); drill {} mm for {m}{alt}",
+                show_mm(d - p)
+            )
+        } else {
+            let alt = alt.map(|a| format!(", or thread this shaft {a}")).unwrap_or_default();
+            format!("this {shown} mm shaft is too thick for a modelled {m} thread; make the shaft {} mm for {m}{alt}", show_mm(d))
+        }));
     }
     let k = t.axis;
     let u = k.cross(if k.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) });
@@ -363,10 +451,21 @@ fn thread_groove(t: &ThreadInfo, radius: f64, open: (bool, bool)) -> Result<soli
     // at the threaded length's end.
     let (s0, s1) = (if open.0 { t.start - p } else { t.start }, if open.1 { t.end + p } else { t.end });
     let base = t.axis_point + k * s0;
-    let plane = Plane { origin: base, x: u, y: k };
+    let plane = Plane { origin: base, x: u, y: *k };
     let section = [Vec2::new(r0, -w0), Vec2::new(r1, -w1), Vec2::new(r1, w1), Vec2::new(r0, w0)];
-    // Sections 7.5° apart: the chords sag 0.2% of the radius.
-    Ok(kernel::sweep_helix_mesh(&plane, &section, base, k, p, (s1 - s0) / p, 48)?)
+    // Keep radial chord error below 1% of the pitch, rather than a fixed fraction of the
+    // diameter. At 48 stations a large fine thread cuts too deeply; its outer tool facets
+    // can even dip under the shaft surface. The existing coarse sizes still use 48.
+    let outer = r0.abs().max(r1.abs());
+    if !outer.is_finite() {
+        return Err(DocError::Invalid("thread dimensions are too large".into()));
+    }
+    let angle = (1.0 - (p * 0.01 / outer).min(1.0)).acos();
+    let stations = (std::f64::consts::PI / angle).ceil().max(48.0);
+    if !stations.is_finite() || stations > 720.0 {
+        return Err(DocError::Invalid("the modelled thread is too fine for this diameter; use a cosmetic thread".into()));
+    }
+    Ok(kernel::sweep_helix_mesh(&plane, &section, base, *k, p, (s1 - s0) / p, stations as usize)?)
 }
 
 /// A constant fillet of `edges`; with [`FilletFit::Reduce`](crate::FilletFit::Reduce), a radius too
@@ -426,6 +525,12 @@ fn one_by_one(input: Traced, edges: &[Vec3], blend: impl Fn(&kernel::Body, Vec3)
         Some(prev) => Ok((b.body, prev)),
         None => Err(DocError::Invalid("no edges to fillet".into())),
     }
+}
+
+/// `Posts` for `Posts (1)`: the body a split piece was numbered after.
+fn split_piece_of(name: &str) -> Option<&str> {
+    let (base, n) = name.strip_suffix(')')?.rsplit_once(" (")?;
+    (!n.starts_with('0') && n.parse::<u32>().is_ok()).then_some(base)
 }
 
 /// Add `note` to a feature's warning.
@@ -544,7 +649,7 @@ impl ModelState {
     /// [`quantize`]); the rest keep theirs.
     fn stamp(&mut self, before: &Arc<ModelState>, f: &Feature, key: u64, mats: Vec<Mat>) {
         let feature = f.id;
-        let depth = before.bodies.iter().filter_map(|b| b.names.origin.as_ref().map(|o| o.depth)).max().unwrap_or(0) + 1;
+        let depth = before.bodies.iter().filter_map(|b| b.names.depth()).max().unwrap_or(0) + 1;
         let sheets = if f.kind.is_sheet() { self.sheets.clone() } else { Vec::new() };
         let origin = Arc::new(crate::naming::NamingOrigin { feature: f.clone(), before: before.clone(), depth, mats, sheets });
         // Pieces a cut left are named after their faces, not the kernel's shell order (unless
@@ -672,6 +777,48 @@ impl EvalCache {
     }
 }
 
+/// The results an evaluation ahead on a copy of a model computed or took from the cache, kept for
+/// the run that follows on the model itself (#1989). The evaluation cache is bounded by bytes and
+/// charges every entry its whole model, so on a design with large bodies it holds only the last
+/// few states: by the time the run came, the cache had dropped most of what was computed ahead,
+/// and the run computed it all again, on the window thread.
+#[derive(Debug, Default)]
+pub struct KeptResults(std::sync::Mutex<std::collections::HashMap<u64, CachedEval>>);
+
+impl KeptResults {
+    /// Results kept.
+    pub fn len(&self) -> usize {
+        self.0.lock().map_or(0, |m| m.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, key: u64) -> Option<CachedEval> {
+        self.0.lock().ok().and_then(|m| m.get(&key).cloned())
+    }
+
+    fn put(&self, key: u64, e: &CachedEval) {
+        if let Ok(mut m) = self.0.lock()
+            && (m.len() < CACHE_ENTRIES || m.contains_key(&key))
+        {
+            m.insert(key, e.clone());
+        }
+    }
+}
+
+/// Where a model keeps its results besides the cache ([`Model::keep`]). A copy of the model
+/// starts without: it keeps nothing it computes for someone else's run.
+#[derive(Debug, Default)]
+struct KeptSlot(Option<Arc<KeptResults>>);
+
+impl Clone for KeptSlot {
+    fn clone(&self) -> Self {
+        KeptSlot(None)
+    }
+}
+
 impl SolvedSketch {
     /// Rough heap footprint (see [`ModelState::retained_bytes`]).
     pub fn retained_bytes(&self) -> usize {
@@ -703,6 +850,14 @@ impl ModelState {
             if go_on() {
                 let _ = b.mesh();
             }
+        });
+    }
+    /// [`ModelState::warm_meshes`], and every body's display plan at the current display quality
+    /// (what a GPU viewport draws).
+    pub fn warm_display(&self) {
+        kernel::for_each_on_threads(&self.bodies, 16, |b| {
+            let _ = b.mesh();
+            let _ = b.display_plan();
         });
     }
     pub fn sketch(&self, feature: u64) -> Option<&SolvedSketch> {
@@ -739,6 +894,9 @@ pub struct Model {
     empty: Arc<ModelState>,
     /// Features recomputed by the last `evaluate`.
     pub last_recomputed: usize,
+    /// Features recomputed by every `evaluate` of this model (and of the model it was copied
+    /// from) so far.
+    pub recomputed: usize,
     /// Features whose result the last `evaluate` took from the cache instead of recomputing: the
     /// same feature on the same inputs was evaluated before (an edit set back, undo, redo, a
     /// configuration row). Their geometry did change since the previous evaluation.
@@ -747,6 +905,8 @@ pub struct Model {
     pub cache: Arc<std::sync::Mutex<EvalCache>>,
     /// Evaluate everything from scratch (no reuse; tests compare the two).
     pub no_cache: bool,
+    /// Results kept besides the cache ([`Model::keep`]).
+    kept: KeptSlot,
     /// The imported texts' digests the last `evaluate` fingerprinted the features with.
     step_digests: StepDigests,
 }
@@ -1013,25 +1173,42 @@ fn placement_digest(doc: &Document, f: &Feature) -> u64 {
     };
     let wired = |id: &crate::SketchId| doc.sketch(id.0).is_ok_and(|sketch| !sketch.wires.is_empty());
     let rails: &[crate::SweepRail] = match &f.kind {
-        FeatureKind::Sweep { rails, .. } | FeatureKind::SurfaceSweep { rails, .. } => rails,
+        FeatureKind::Sweep { rails, .. }
+        | FeatureKind::SurfaceSweep { rails, .. }
+        | FeatureKind::Loft { rails, .. }
+        | FeatureKind::SurfaceLoft { rails, .. } => rails,
         _ => &[],
     };
-    if let Some(path) = path
-        && (wired(&path) || rails.iter().any(|r| wired(&r.sketch)))
-    {
+    if path.as_ref().is_some_and(wired) || rails.iter().any(|r| wired(&r.sketch)) {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
-        let owner = doc.feature(path.0).map(|feature| feature.component).unwrap_or(0);
+        let owner = path.and_then(|path| doc.feature(path.0)).map(|feature| feature.component).unwrap_or(0);
         for frame in [doc.component_transform(f.component), doc.component_transform(owner)] {
             frame.iter().flatten().for_each(|value| value.to_bits().hash(&mut hash));
         }
-        if let FeatureKind::Sweep { sketch, rails, .. } | FeatureKind::SurfaceSweep { sketch, rails, .. } = &f.kind {
-            // The profile's and the rails' components place them too.
-            for sketch in std::iter::once(sketch).chain(rails.iter().map(|r| &r.sketch)) {
+        // A sweep's profile and the rails' components place them too.
+        let profile = match &f.kind {
+            FeatureKind::Sweep { sketch, .. } | FeatureKind::SurfaceSweep { sketch, .. } => Some(sketch),
+            _ => None,
+        };
+        for sketch in profile.into_iter().chain(rails.iter().map(|r| &r.sketch)) {
+            let owner = doc.feature(sketch.0).map(|feature| feature.component).unwrap_or(0);
+            doc.component_transform(owner).iter().flatten().for_each(|value| value.to_bits().hash(&mut hash));
+        }
+        return hash.finish();
+    }
+    // A network through 3D sketch curves reads their points through the components the
+    // feature and those sketches are placed in, as a sweep's wired path does.
+    if let FeatureKind::SurfaceNetwork { u, v, .. } = &f.kind {
+        let sketches: Vec<crate::SketchId> = u.iter().chain(v).filter_map(|c| c.sketch).collect();
+        if sketches.iter().any(wired) {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            doc.component_transform(f.component).iter().flatten().for_each(|value| value.to_bits().hash(&mut hash));
+            for sketch in &sketches {
                 let owner = doc.feature(sketch.0).map(|feature| feature.component).unwrap_or(0);
                 doc.component_transform(owner).iter().flatten().for_each(|value| value.to_bits().hash(&mut hash));
             }
+            return hash.finish();
         }
-        return hash.finish();
     }
     // To / From Object finds its target where that target's component is placed (#928).
     let to_object = match &f.kind {
@@ -1041,7 +1218,12 @@ fn placement_digest(doc: &Document, f: &Feature) -> u64 {
     };
     // A mirror of placed bodies follows where they are placed.
     let placed_mirror = matches!(&f.kind, FeatureKind::Mirror { placements, .. } if !placements.is_empty());
-    if to_object || placed_mirror {
+    // A combine moves tools placed differently from its target into the target's frame (#3383).
+    let combine = matches!(&f.kind, FeatureKind::Combine { .. });
+    if !to_object && !combine && drawn_tools_change_bodies(&f.kind) {
+        return drawn_tools_digest(doc, f);
+    }
+    if to_object || placed_mirror || combine {
         return if doc.occurrences.is_empty() && doc.body_offsets.is_empty() { 0 } else { placements_hash(doc) };
     }
     let FeatureKind::Sketch { plane, sketch } = &f.kind else { return 0 };
@@ -1104,7 +1286,15 @@ impl Model {
         let Some(last) = self.results.get(i).filter(|r| !r.skipped && r.error.is_none()).and_then(|r| r.state.sketch(feature)) else {
             return false;
         };
-        let solved = Arc::new(SolvedSketch { feature, name: last.name.clone(), plane: last.plane, profiles: find_profiles(&sketch), sketch, report });
+        let solved = Arc::new(SolvedSketch {
+            feature,
+            name: last.name.clone(),
+            plane: last.plane,
+            profiles: find_profiles(&sketch),
+            ends: solidcraft_sketch::loose_ends(&sketch),
+            sketch,
+            report,
+        });
         let shown = self.results.iter().rposition(|r| !r.skipped);
         for (k, r) in self.results.iter_mut().enumerate().skip(i) {
             r.stale = true;
@@ -1157,6 +1347,37 @@ impl Model {
     pub fn edited_sketches<'a>(&'a self, doc: &'a Document) -> impl Iterator<Item = &'a SolvedSketch> + 'a {
         self.results.iter().filter(|r| !r.skipped && r.error.is_none()).filter_map(|r| r.state.sketch(r.id)).filter(|s| {
             s.report.keeps_orientation() && doc.sketch(s.feature).is_ok_and(|stored| stored.driving_values() != s.sketch.driving_values())
+        })
+    }
+
+    /// While `kept` is set, every result this model evaluates or takes from the cache is also
+    /// kept there, and a result the cache no longer has is taken from there (#1989): an
+    /// evaluation ahead on a copy keeps what it computes, and the run that follows on the model
+    /// itself finds it all, whatever the cache dropped meanwhile. Copies of the model keep
+    /// nothing.
+    pub fn keep(&mut self, kept: Option<Arc<KeptResults>>) {
+        self.kept = KeptSlot(kept);
+    }
+
+    /// Where this model keeps its results besides the cache, if it does ([`Model::keep`]).
+    pub fn kept(&self) -> Option<Arc<KeptResults>> {
+        self.kept.0.clone()
+    }
+
+    /// Whether the results are `doc`'s evaluation: one per feature, each on the inputs `doc`
+    /// gives it, none stale, so [`Model::evaluate`] would keep every one of them. A document
+    /// changed without an evaluation since is not.
+    pub fn is_current(&self, doc: &Document) -> bool {
+        if self.results.len() != doc.features.len() || self.is_stale() {
+            return false;
+        }
+        let vals = evaluation_values(doc).0;
+        let steps = StepDigests::of(doc, &self.step_digests);
+        let marker = doc.marker.unwrap_or(usize::MAX);
+        let mut prev = 0;
+        doc.features.iter().zip(&self.results).enumerate().all(|(i, (f, r))| {
+            prev = chain_fingerprint(doc, &vals, f, prev, i >= marker, &steps);
+            r.id == f.id && r.fingerprint == prev
         })
     }
 
@@ -1216,9 +1437,13 @@ impl Model {
             }
             // The same feature on the same inputs: its earlier result.
             let key = cache_key(f, fp, fingerprint(0, f, &vals, false, &self.step_digests) ^ placement_digest(doc, f), ctx, &state);
+            let kept = self.kept.0.as_ref().filter(|_| !self.no_cache);
             if !self.no_cache
-                && let Some(c) = self.cache.lock().ok().and_then(|mut m| m.get(key))
+                && let Some(c) = self.cache.lock().ok().and_then(|mut m| m.get(key)).or_else(|| kept.and_then(|k| k.get(key)))
             {
+                if let Some(k) = kept {
+                    k.put(key, &c);
+                }
                 restored += 1;
                 if c.error.is_none() {
                     state = c.state.clone();
@@ -1257,7 +1482,7 @@ impl Model {
                 // the face along the hole's axis and never slides sideways to the face's nearest
                 // point when the face no longer reaches it.
                 let hole_axis = match &f.kind {
-                    FeatureKind::Hole { direction, points: None, .. } => direction.normalized(),
+                    FeatureKind::Hole { direction, points: None | Some(crate::SketchPoints { single: true, .. }), .. } => direction.normalized(),
                     _ => None,
                 };
                 let fst = face_point_state(doc, &state, &f.kind, f.component);
@@ -1303,9 +1528,20 @@ impl Model {
                 }),
             });
             if r.is_ok() {
+                // Profiles picked by curves that no longer bound a profile exactly were found
+                // by their best match: say which.
+                let thin = matches!(&f.kind, FeatureKind::Extrude { thin: Some(_), .. });
+                for (sketch, sel) in f.kind.profile_sels() {
+                    if let (false, Some(ss)) = (thin, state.sketch(sketch)) {
+                        for note in crate::profile_fallback_notes(ss, sel) {
+                            append_warning(&mut warning, note);
+                        }
+                    }
+                }
                 if let Some(note) = boolean_diagnostics.warning() {
                     append_warning(&mut warning, note);
                 }
+                track_altered_sheets(&state, &mut next, f, &mut warning);
             } else {
                 boolean_diagnostics = Default::default();
             }
@@ -1336,20 +1572,21 @@ impl Model {
                 }
                 Err(e) => Some(e.to_string().trim_start_matches("the operation failed: ").to_string()),
             };
-            if !self.no_cache
-                && let Ok(mut m) = self.cache.lock()
-            {
-                m.put(
-                    key,
-                    CachedEval {
-                        error: error.clone(),
-                        warning: warning.clone(),
-                        boolean_diagnostics: boolean_diagnostics.clone(),
-                        ms,
-                        bytes: state.retained_bytes(),
-                        state: state.clone(),
-                    },
-                );
+            if !self.no_cache {
+                let e = CachedEval {
+                    error: error.clone(),
+                    warning: warning.clone(),
+                    boolean_diagnostics: boolean_diagnostics.clone(),
+                    ms,
+                    bytes: state.retained_bytes(),
+                    state: state.clone(),
+                };
+                if let Some(k) = &self.kept.0 {
+                    k.put(key, &e);
+                }
+                if let Ok(mut m) = self.cache.lock() {
+                    m.put(key, e);
+                }
             }
             out.push(FeatureResult {
                 id: f.id,
@@ -1366,7 +1603,109 @@ impl Model {
         }
         self.results = out;
         self.last_recomputed = recomputed;
+        self.recomputed += recomputed;
         self.last_restored = restored;
+    }
+}
+
+impl Model {
+    /// Follow a rename of body `old` to `new` without evaluating anything (#3044): `doc` is the
+    /// design after the rename, which changed nothing but names, so every result keeps its
+    /// geometry and meshes and only the body's name (and the names worked out from it) changes.
+    /// False, leaving the model as it was, when the rename can't be followed that way and the
+    /// design must be evaluated: the model isn't the design's, the body is changed by a later
+    /// feature, or is sheet metal, threaded, or named in a later feature's face references.
+    pub fn rename_body(&mut self, doc: &Document, old: &str, new: &str) -> bool {
+        if self.results.len() != doc.features.len() || self.results.iter().zip(&doc.features).any(|(r, f)| r.id != f.id || r.stale) {
+            return false;
+        }
+        let Some(at) = self.results.iter().position(|r| r.state.body(old).is_some()) else { return false };
+        let Some(made) = self.results.get(at).and_then(|r| r.state.body(old)).map(|b| Arc::as_ptr(&b.mesh)) else { return false };
+        // Untouched from the feature that made it to the end, and nothing else holds its name.
+        let untouched = self.results.iter().skip(at).all(|r| r.state.body(old).is_some_and(|b| Arc::as_ptr(&b.mesh) == made));
+        let named_elsewhere = self
+            .results
+            .iter()
+            .any(|r| r.state.body(new).is_some() || r.state.sheets.iter().any(|x| x.body == old) || r.state.threads.iter().any(|t| t.body == old));
+        let faces_named = doc.features.iter().skip(at + 1).any(|f| f.face_names.iter().any(|n| n.contains(old)));
+        if !untouched || named_elsewhere || faces_named {
+            return false;
+        }
+        // States shared between results stay shared.
+        let mut renamed: std::collections::HashMap<*const ModelState, Arc<ModelState>> = std::collections::HashMap::new();
+        for r in self.results.iter_mut().skip(at) {
+            let state = renamed
+                .entry(Arc::as_ptr(&r.state))
+                .or_insert_with(|| {
+                    let mut st = (*r.state).clone();
+                    for b in st.bodies.iter_mut().filter(|b| b.name == old) {
+                        b.name = new.to_string();
+                        b.names = b.names.renamed();
+                    }
+                    Arc::new(st)
+                })
+                .clone();
+            r.state = state;
+        }
+        self.refingerprint(doc);
+        true
+    }
+
+    /// Follow a rename of feature `id` to `doc`'s name for it without evaluating anything: a
+    /// feature's name labels it (its result, its sketch, its construction geometry) but builds
+    /// nothing. False, leaving the model as it was, when the model isn't the design's, the
+    /// feature failed, or a later failed feature's error quotes its old name: evaluate then.
+    pub fn rename_feature(&mut self, doc: &Document, id: u64) -> bool {
+        if self.results.len() != doc.features.len() || self.results.iter().zip(&doc.features).any(|(r, f)| r.id != f.id || r.stale) {
+            return false;
+        }
+        let Some(name) = doc.feature(id).map(|f| f.name.clone()) else { return false };
+        let Some(at) = self.results.iter().position(|r| r.id == id) else { return false };
+        // An error may quote the old name: the feature's own, or a later one's that refers to it
+        // by id (a pattern of it: "{name} cannot be patterned or mirrored yet").
+        let old = self.results.get(at).map(|r| r.name.clone()).unwrap_or_default();
+        if self.results.iter().skip(at).any(|r| r.error.as_deref().is_some_and(|e| r.id == id || e.contains(&old))) {
+            return false;
+        }
+        if let Some(r) = self.results.get_mut(at) {
+            r.name.clone_from(&name);
+        }
+        let mut renamed: std::collections::HashMap<*const ModelState, Arc<ModelState>> = std::collections::HashMap::new();
+        for r in self.results.iter_mut().skip(at) {
+            let labels = r.state.sketches.iter().any(|k| k.feature == id) || r.state.construct.iter().any(|c| c.feature == id);
+            if !labels {
+                continue;
+            }
+            let state = renamed
+                .entry(Arc::as_ptr(&r.state))
+                .or_insert_with(|| {
+                    let mut st = (*r.state).clone();
+                    for k in st.sketches.iter_mut().filter(|k| k.feature == id) {
+                        Arc::make_mut(k).name.clone_from(&name);
+                    }
+                    for c in st.construct.iter_mut().filter(|c| c.feature == id) {
+                        c.name.clone_from(&name);
+                    }
+                    Arc::new(st)
+                })
+                .clone();
+            r.state = state;
+        }
+        self.refingerprint(doc);
+        true
+    }
+
+    /// Set every result's fingerprint to `doc`'s, so the next evaluation reuses every result
+    /// (after a change that builds nothing differently).
+    fn refingerprint(&mut self, doc: &Document) {
+        let (vals, _) = evaluation_values(doc);
+        let marker = doc.marker.unwrap_or(usize::MAX);
+        self.step_digests = StepDigests::of(doc, &self.step_digests);
+        let mut prev = 0;
+        for (i, (r, f)) in self.results.iter_mut().zip(&doc.features).enumerate() {
+            prev = chain_fingerprint(doc, &vals, f, prev, i >= marker, &self.step_digests);
+            r.fingerprint = prev;
+        }
     }
 }
 
@@ -1392,15 +1731,12 @@ pub(crate) fn val(vals: &BTreeMap<String, Value>, e: &str, k: Kind) -> Result<f6
     Document::eval_in(vals, e, k)
 }
 
-/// A loft builds each section from its outline alone, so a section with a hole (a ring) is
-/// refused rather than lofted as if it were filled.
+/// Collapsing the outline and its holes onto one apex cannot make a manifold solid.
 fn refuse_loft_holes(r: &Region2) -> Result<()> {
     if r.holes.is_empty() {
         return Ok(());
     }
-    Err(DocError::Invalid(
-        "not supported yet: a loft section with a hole; loft the outline and the hole as two bodies and cut one from the other".into(),
-    ))
+    Err(DocError::Invalid("not supported yet: lofting a section with holes to a point".into()))
 }
 
 pub fn select_profiles(ss: &SolvedSketch, sel: &ProfileSel) -> Result<Vec<Region2>> {
@@ -1424,8 +1760,11 @@ pub fn select_profiles(ss: &SolvedSketch, sel: &ProfileSel) -> Result<Vec<Region
             }
             v
         }
+        // A curve loop that no longer bounds a profile exactly falls back to the best match; the
+        // feature's warning says so (`profile_fallback_notes`).
         ProfileSel::Curves { .. } | ProfileSel::OffsetBoundaries { .. } | ProfileSel::WholeBoundaries { .. } => {
-            crate::profile_selection_indices(ss, sel)?
+            crate::profile_selection_indices_lenient(ss, sel)?
+                .0
                 .into_iter()
                 .map(|index| {
                     ps.get(index)
@@ -1512,6 +1851,52 @@ fn copy_body_name(state: &ModelState, f: &Feature, k: usize, source: &str) -> St
     unique_body_name(state, base)
 }
 
+/// Keeps each sheet metal body's flat pattern true to the body (see `SheetBody::altered_by`).
+/// A feature that changes a sheet body's material but not its sheet model (a fillet, a join, a
+/// mirror combined into it) marks the sheet with its name, and says so. A feature that rebuilds
+/// the body from the model (a sheet metal feature, or machining the model keeps as cut-outs,
+/// which changes the model) clears the mark, and says that the change it drops is not kept.
+/// Features that move whole bodies or only mark their faces (a cosmetic thread, not a modelled
+/// one, which cuts material) leave the flat pattern as it was.
+fn track_altered_sheets(before: &ModelState, after: &mut ModelState, f: &Feature, warning: &mut Option<String>) {
+    if matches!(
+        f.kind,
+        FeatureKind::Move { .. }
+            | FeatureKind::Align { .. }
+            | FeatureKind::Rest { .. }
+            | FeatureKind::BodyTransfer { .. }
+            | FeatureKind::SplitFace { .. }
+            | FeatureKind::Thread { modeled: false, .. }
+    ) {
+        return;
+    }
+    let ModelState { sheets, bodies, .. } = after;
+    for sh in sheets.iter_mut() {
+        let Some(old) = before.sheets.iter().find(|s| s.body == sh.body) else { continue };
+        let (Some(was), Some(now)) = (before.body(&sh.body), bodies.iter().find(|b| b.name == sh.body)) else { continue };
+        if was.body.same_shape(&now.body) {
+            continue;
+        }
+        if f.kind.is_sheet() || sh != old {
+            if let Some(lost) = sh.altered_by.take() {
+                append_warning(
+                    warning,
+                    format!("`{}` is rebuilt from its sheet metal features: what {lost} changed is not kept (not supported yet)", sh.body),
+                );
+            }
+        } else if sh.altered_by.is_none() {
+            sh.altered_by = Some(f.name.clone());
+            append_warning(
+                warning,
+                format!(
+                    "`{}` is sheet metal: its flat pattern, DXF and bend table can't include this change yet and are refused; a later sheet metal feature rebuilds the body without it",
+                    sh.body
+                ),
+            );
+        }
+    }
+}
+
 /// Add tool bodies to the model according to the operation.
 fn sheet_boolean_unchanged(body: &Body, tools: &[Body], op: Operation) -> Result<()> {
     if sheet_boolean_changes(body, tools, op)? {
@@ -1581,6 +1966,29 @@ fn apply_beside_sheet_cut(st: &mut ModelState, f: &Feature, tools: Vec<Traced>, 
     apply_traced(st, f, tools, op, &rest)
 }
 
+/// Only one target meets every separated tool. A tool with no contact must retain
+/// Join's first-target fallback; tools touching different targets must retain absorption order.
+fn common_join_target(state: &ModelState, indices: &[usize], tools: &[Traced]) -> Result<Option<usize>> {
+    if indices.len() > 64 {
+        return Ok(None);
+    }
+    let bodies: Vec<_> = tools.iter().map(|tool| tool.body.clone()).collect();
+    let mut contacts = vec![None; tools.len()];
+    for &index in indices {
+        let body = state.bodies.get(index).ok_or_else(|| DocError::Invalid("join target disappeared".into()))?;
+        for (contact, meets) in contacts.iter_mut().zip(body.body.meets_each(&bodies)?) {
+            if meets {
+                if contact.is_some() {
+                    return Ok(None);
+                }
+                *contact = Some(index);
+            }
+        }
+    }
+    let common = contacts.first().copied().flatten();
+    Ok(common.filter(|index| contacts.iter().all(|contact| *contact == Some(*index))))
+}
+
 fn apply_op(state: &mut ModelState, f: &Feature, tools: Vec<Body>, op: Operation, targets: &[String]) -> Result<()> {
     apply_traced(state, f, tools.into_iter().map(Traced::unnamed).collect(), op, targets)
 }
@@ -1629,10 +2037,46 @@ fn apply_traced(state: &mut ModelState, f: &Feature, tools: Vec<Traced>, op: Ope
         return Ok(());
     }
     if matches!(op, Operation::Cut | Operation::Intersect) {
-        let bodies: Vec<Body> = tools.iter().map(|t| t.body.clone()).collect();
         for &i in &target_idx {
             if let Some(mb) = state.bodies.get(i).filter(|b| state.sheets.iter().any(|s| s.body == b.name)) {
+                let m = tool_frame(&mb.name);
+                let bodies: Vec<Body> = tools.iter().map(|t| tool_in(t, m).map(|t| t.body)).collect::<Result<_>>()?;
                 sheet_boolean_unchanged(&mb.body, &bodies, op)?;
+            }
+        }
+    }
+    // Batching solid targets must preserve Join's absorption order,
+    // sheet material tracking and the separate bodies of a New Body extrusion.
+    if tools.len() > 1
+        && matches!(f.kind, FeatureKind::Extrude { .. })
+        && matches!(op, Operation::Join | Operation::Cut)
+        && !target_idx.is_empty()
+        && target_idx.iter().all(|i| state.bodies.get(*i).is_some_and(|b| !b.body.is_mesh() && !state.sheets.iter().any(|s| s.body == b.name)))
+        && let Ok(Some(compound)) = kernel::compound_disjoint_extrusions(&tools.iter().map(|tool| tool.body.clone()).collect::<Vec<_>>())
+    {
+        let target = if target_idx.len() == 1 {
+            target_idx.first().copied()
+        } else if op == Operation::Join {
+            common_join_target(state, &target_idx, &tools).ok().flatten()
+        } else {
+            None
+        };
+        // The optimization must not reject geometry the original sequential path can
+        // handle. A failed batch leaves the model untouched and retries the original tools.
+        let batch_targets = if op == Operation::Cut {
+            // Subtracting a union equals subtracting its separated tools in order.
+            // Keep ALL original participants; no sampled contact test excludes a body.
+            Some(target_idx.iter().filter_map(|index| state.bodies.get(*index).map(|body| body.name.clone())).collect::<Vec<_>>())
+        } else {
+            target.and_then(|index| state.bodies.get(index)).map(|body| vec![body.name.clone()])
+        };
+        if let Some(names) = batch_targets {
+            let mut batched = state.clone();
+            // Preserve the original participants. For Join, the compound's larger
+            // size must not expand the contact tolerance and absorb a nearby body.
+            if apply_traced(&mut batched, f, vec![Traced::step(compound, &tools.iter().collect::<Vec<_>>())], op, &names).is_ok() {
+                *state = batched;
+                return Ok(());
             }
         }
     }
@@ -1656,16 +2100,24 @@ fn apply_traced(state: &mut ModelState, f: &Feature, tools: Vec<Traced>, op: Ope
                     if mb.body.is_mesh() || (!met.is_empty() && sheet) {
                         continue;
                     }
-                    if mb.body.meets(&tool.body)? {
+                    // Each body is met where it is shown: the tool goes into its frame (#3383).
+                    if mb.body.meets(&tool_in(tool, tool_frame(name))?.body)? {
                         met.push(name.clone());
                     }
                 }
                 let Some(keep) = met.first().or(live.first()).cloned() else { return Ok(()) };
                 let Some(base) = state.body(&keep).map(ModelBody::traced) else { continue };
-                let mut acc = union(&base, tool)?;
+                let into_keep = tool_frame(&keep);
+                let mut acc = union(&base, &tool_in(tool, into_keep)?)?;
                 for name in met.iter().skip(1) {
                     if let Some(b) = state.body(name) {
-                        acc = union(&acc, &b.traced())?;
+                        // A body placed differently from the one kept joins it where it is shown.
+                        let from = match tool_frame(name) {
+                            Some(m) => crate::mat_inverse(&m),
+                            None => Some(crate::IDENTITY),
+                        };
+                        let m = from.map(|from| crate::mat_mul(&into_keep.unwrap_or(crate::IDENTITY), &from)).filter(|m| !crate::is_identity(m));
+                        acc = union(&acc, &tool_in(&b.traced(), m)?)?;
                     }
                 }
                 let absorbed: std::collections::BTreeSet<String> = met.into_iter().skip(1).collect();
@@ -1682,12 +2134,16 @@ fn apply_traced(state: &mut ModelState, f: &Feature, tools: Vec<Traced>, op: Ope
         Operation::Cut | Operation::Intersect => {
             let bop = if op == Operation::Cut { BoolOp::Cut } else { BoolOp::Intersect };
             let tools = if op == Operation::Cut { clear_tools_as_one(tools) } else { tools };
-            let affected: std::collections::BTreeSet<String> =
-                target_idx.iter().filter_map(|i| state.bodies.get(*i).map(|b| b.name.clone())).collect();
+            // Each target's pieces before the cut: a body joined from separate pieces stays one.
+            let affected: std::collections::BTreeMap<String, usize> =
+                target_idx.iter().filter_map(|i| state.bodies.get(*i)).map(|b| (b.name.clone(), b.body.lumps().map_or(1, |l| l.len()))).collect();
             let mut remove = Vec::new();
             for &ti in &target_idx {
                 let Some(mut acc) = state.bodies.get(ti).map(|b| Some(b.traced())) else { continue };
+                // The tools meet the target where it is shown: in its frame (#3383).
+                let into = state.bodies.get(ti).and_then(|b| tool_frame(&b.name));
                 for t in &tools {
+                    let t = &tool_in(t, into)?;
                     acc = match acc {
                         Some(a) => kernel::boolean(&a.body, &t.body, bop)?.map(|r| Traced::step(r, &[&a, t])),
                         None => None,
@@ -1711,16 +2167,19 @@ fn apply_traced(state: &mut ModelState, f: &Feature, tools: Vec<Traced>, op: Ope
             let live: std::collections::BTreeSet<&str> = state.bodies.iter().map(|b| b.name.as_str()).collect();
             state.threads.retain(|t| live.contains(t.body.as_str()));
             // A cut can leave a body in pieces: each piece becomes its own body ("Bar", "Bar (1)"),
-            // numbered on past names already taken (a body cut in pieces before).
+            // numbered on past names already taken (a body cut in pieces before). Only a cut that
+            // made more pieces than the body had splits it: the pieces of a join stay together.
+            // Not yet: a cut that splits one piece of such a body still splits all of them; keeping
+            // the untouched ones together needs each new piece traced to the piece it came from.
             let mut taken: std::collections::BTreeSet<String> = state.bodies.iter().map(|b| b.name.clone()).collect();
             let mut split: Vec<ModelBody> = Vec::new();
             for mb in std::mem::take(&mut state.bodies) {
-                if !affected.contains(&mb.name) || state.sheets.iter().any(|s| s.body == mb.name) {
+                let Some(&had) = affected.get(&mb.name).filter(|_| !state.sheets.iter().any(|s| s.body == mb.name)) else {
                     split.push(mb);
                     continue;
-                }
+                };
                 let pieces = mb.body.lumps().unwrap_or_else(|_| vec![mb.body.clone()]);
-                if pieces.len() < 2 {
+                if pieces.len() <= had {
                     split.push(mb);
                     continue;
                 }
@@ -1772,12 +2231,7 @@ pub fn through_all_distance(st: &ModelState, plane: &Plane, targets: &[String]) 
 /// Sample points inside a region (sketch coordinates).
 fn region_samples(r: &Region2) -> Vec<Vec2> {
     let mut out = vec![r.interior_point()];
-    let pts = r.outer.polyline(1e-2);
-    let (mut lo, mut hi) = (Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));
-    for p in &pts {
-        lo = Vec2::new(lo.x.min(p.x), lo.y.min(p.y));
-        hi = Vec2::new(hi.x.max(p.x), hi.y.max(p.y));
-    }
+    let solidcraft_geom::Aabb2 { min: lo, max: hi } = r.outer.polyline(1e-2).bounds();
     for i in 0..5 {
         for j in 0..5 {
             let p = Vec2::new(lo.x + (hi.x - lo.x) * (0.1 + 0.2 * i as f64), lo.y + (hi.y - lo.y) * (0.1 + 0.2 * j as f64));
@@ -2255,12 +2709,13 @@ fn body_at(st: &ModelState, body: &Option<crate::BodyName>, points: &[Vec3]) -> 
 }
 
 /// A hole stays on its face when the model changes: a position now inside a body moves back
-/// against the drilling direction to the surface, one now above it moves down onto it.
-fn hole_on_surface(st: &ModelState, p: Vec3, dir: Vec3) -> Vec3 {
+/// against the drilling direction to the surface, one now above it moves down onto it. Only the
+/// bodies in `scope` count (every body when it is empty, see [`hole_scope`]).
+fn hole_on_surface(st: &ModelState, p: Vec3, dir: Vec3, scope: &[String]) -> Vec3 {
     let size = st.bodies.iter().map(|b| b.body.size()).fold(1.0, f64::max);
     let eps = size * 1e-6;
     let mut best: Option<Vec3> = None;
-    for b in &st.bodies {
+    for b in st.bodies.iter().filter(|b| in_hole_scope(scope, b)) {
         let m = b.mesh();
         // Already on the surface: the drill enters right here.
         if let Some((t, _)) = m.raycast(p - dir * eps, dir)
@@ -2298,7 +2753,7 @@ fn faces_through(st: &ModelState, p: Vec3, reach: f64) -> Vec<(f64, Vec3, Option
         }
         for (f, (d, facet)) in near {
             let (exact, off) = match kernel::face_surface(&b.body, f as usize) {
-                Some(kernel::FaceSurface::Plane { normal, point }) => (Some(normal), Some((p - point).dot(normal).abs())),
+                Some(kernel::FaceSurface::Plane { normal, point }) => (Some(*normal), Some((p - point).dot(normal).abs())),
                 Some(kernel::FaceSurface::Cylinder { origin, axis, .. }) => {
                     let v = p - origin;
                     ((v - axis * v.dot(axis)).normalized(), None)
@@ -2541,12 +2996,12 @@ pub(crate) fn revolve_axis(ss: &SolvedSketch, axis: &AxisRef) -> Result<(Vec2, V
 
 /// Whether a drill from `p` along `d` reaches material: it starts into a body (`touches`), or,
 /// when `ahead` is set, a body lies further along `d`. A spot exactly on a surface counts only
-/// when the drill enters there, not when it leaves.
-fn hole_reaches(st: &ModelState, p: Vec3, d: Vec3, ahead: bool) -> bool {
+/// when the drill enters there, not when it leaves. Only the bodies in `scope` count.
+fn hole_reaches(st: &ModelState, p: Vec3, d: Vec3, ahead: bool, scope: &[String]) -> bool {
     let size = st.bodies.iter().map(|b| b.body.size()).fold(1.0, f64::max);
     let eps = size * 1e-6;
     let q = p + d * eps;
-    st.bodies.iter().any(|b| {
+    st.bodies.iter().filter(|b| in_hole_scope(scope, b)).any(|b| {
         let m = b.mesh();
         m.contains(q) || (ahead && m.raycast(q, d).is_some())
     })
@@ -2564,13 +3019,13 @@ pub fn sketch_hole_direction(st: &ModelState, sketch: u64, ids: &[String], flip:
     let ss = st.sketch(sketch)?;
     let spots: Vec<Vec3> =
         ids.iter().map(|id| ss.sketch.points.iter().find(|p| &p.id == id).map(|p| ss.plane.to_world(p.pos))).collect::<Option<_>>()?;
-    let dir = sketch_hole_dir(st, &spots, ss.plane.normal());
+    let dir = sketch_hole_dir(st, &spots, ss.plane.normal(), &[]);
     Some(if flip { -dir } else { dir })
 }
 
-fn sketch_hole_dir(st: &ModelState, spots: &[Vec3], n: Vec3) -> Vec3 {
+fn sketch_hole_dir(st: &ModelState, spots: &[Vec3], n: Vec3, scope: &[String]) -> Vec3 {
     let down = -n;
-    let any = |d: Vec3, ahead: bool| spots.iter().any(|p| hole_reaches(st, *p, d, ahead));
+    let any = |d: Vec3, ahead: bool| spots.iter().any(|p| hole_reaches(st, *p, d, ahead, scope));
     if any(down, false) {
         down
     } else if any(n, false) {
@@ -2582,12 +3037,26 @@ fn sketch_hole_dir(st: &ModelState, spots: &[Vec3], n: Vec3) -> Vec3 {
     }
 }
 
+/// The bodies a hole at sketch points finds its side and its faces on: the bodies it cuts when it
+/// names them (a hole from a sketch on a body's face cuts that body, #2882), so a body further
+/// along can't take the holes meant for it. Empty (every body) otherwise.
+fn hole_scope(f: &Feature) -> &[String] {
+    match &f.kind {
+        FeatureKind::Hole { points: Some(sp), .. } if !sp.single && !f.participants.iter().any(|b| b == "*") => &f.participants,
+        _ => &[],
+    }
+}
+
+fn in_hole_scope(scope: &[String], b: &ModelBody) -> bool {
+    scope.is_empty() || scope.contains(&b.name)
+}
+
 /// Where a hole feature drills (each on the surface) and in which direction: at its sketch
 /// points perpendicular to the sketch (into the material), else at its position.
 fn hole_spots(vals: &BTreeMap<String, Value>, st: &ModelState, f: &Feature) -> Result<(Vec<Vec3>, Vec3)> {
     let FeatureKind::Hole { position, at, direction, points, .. } = &f.kind else { return Err(DocError::Invalid("not a hole".into())) };
     let (spots, dir) = match points {
-        Some(sp) => {
+        Some(sp) if !sp.single => {
             let ss =
                 st.sketch(sp.sketch.0).ok_or_else(|| DocError::Unknown(format!("sketch {} (it must come earlier in the timeline)", sp.sketch)))?;
             let mut v = Vec::new();
@@ -2595,21 +3064,21 @@ fn hole_spots(vals: &BTreeMap<String, Value>, st: &ModelState, f: &Feature) -> R
                 let p = ss.sketch.points.iter().find(|p| &p.id == id).ok_or_else(|| DocError::Unknown(format!("sketch point `{id}`")))?;
                 v.push(ss.plane.to_world(p.pos));
             }
-            let dir = sketch_hole_dir(st, &v, ss.plane.normal());
+            let dir = sketch_hole_dir(st, &v, ss.plane.normal(), hole_scope(f));
             let dir = if sp.flip { -dir } else { dir };
             (v, dir)
         }
-        None => {
+        _ => {
             let dir = direction.normalized().ok_or_else(|| DocError::Invalid("hole direction".into()))?;
-            let at = hole_on_surface(st, hole_position(vals, position, at)?, dir);
+            let at = hole_on_surface(st, single_hole_position(vals, st, position, at, points)?, dir, &[]);
             let dir = hole_dir_into_face(st, at, dir);
-            return Ok((vec![hole_on_surface(st, at, dir)], dir));
+            return Ok((vec![hole_on_surface(st, at, dir, &[])], dir));
         }
     };
     if spots.is_empty() || spots.len() > 10_000 {
         return Err(DocError::Invalid("a hole needs 1…10000 points".into()));
     }
-    Ok((spots.into_iter().map(|p| hole_on_surface(st, p, dir)).collect(), dir))
+    Ok((spots.into_iter().map(|p| hole_on_surface(st, p, dir, hole_scope(f))).collect(), dir))
 }
 
 /// A hole's depth: down to the To Object (where the hole's axis meets the face there, else the
@@ -2638,20 +3107,36 @@ fn hole_depth_to(st: &ModelState, at: &Vec3, dir: Vec3, to: &Option<Vec3>, depth
 fn hole_spots_raw(vals: &BTreeMap<String, Value>, st: &ModelState, f: &Feature) -> Result<(Vec<Vec3>, Vec3)> {
     let FeatureKind::Hole { position, at, direction, points, .. } = &f.kind else { return Err(DocError::Invalid("not a hole".into())) };
     match points {
-        Some(sp) => {
+        Some(sp) if !sp.single => {
             let ss = st.sketch(sp.sketch.0).ok_or_else(|| DocError::Unknown(format!("sketch {}", sp.sketch)))?;
             let v: Vec<Vec3> =
                 sp.ids.iter().filter_map(|id| ss.sketch.points.iter().find(|p| &p.id == id)).map(|p| ss.plane.to_world(p.pos)).take(10_000).collect();
-            let dir = sketch_hole_dir(st, &v, ss.plane.normal());
+            let dir = sketch_hole_dir(st, &v, ss.plane.normal(), hole_scope(f));
             let dir = if sp.flip { -dir } else { dir };
             Ok((v, dir))
         }
-        None => {
+        _ => {
             let dir = direction.normalized().ok_or_else(|| DocError::Invalid("hole direction".into()))?;
-            let p = hole_position(vals, position, at)?;
-            Ok((vec![p], hole_dir_into_face(st, hole_on_surface(st, p, dir), dir)))
+            let p = single_hole_position(vals, st, position, at, points)?;
+            Ok((vec![p], hole_dir_into_face(st, hole_on_surface(st, p, dir, &[]), dir)))
         }
     }
+}
+
+/// Where a hole placed by position is drilled: at its sketch point where the sketch has it now,
+/// for a Single hole snapped to one (#2110), else as [`hole_position`].
+fn single_hole_position(
+    vals: &BTreeMap<String, Value>,
+    st: &ModelState,
+    position: &crate::FacePick,
+    at: &Option<crate::PointExpr>,
+    points: &Option<crate::SketchPoints>,
+) -> Result<Vec3> {
+    let Some(sp) = points else { return hole_position(vals, position, at) };
+    let ss = st.sketch(sp.sketch.0).ok_or_else(|| DocError::Unknown(format!("sketch {} (it must come earlier in the timeline)", sp.sketch)))?;
+    let id = sp.ids.first().ok_or_else(|| DocError::Invalid("a Single hole needs its sketch point".into()))?;
+    let p = ss.sketch.points.iter().find(|p| &p.id == id).ok_or_else(|| DocError::Unknown(format!("sketch point `{id}`")))?;
+    Ok(ss.plane.to_world(p.pos))
 }
 
 /// Where a hole placed by position is drilled: its `at` expressions evaluated, so it follows the
@@ -2776,6 +3261,38 @@ fn hole_tools(
     Ok(hole_tools_and_prisms(vals, st, position, dir, diameter, depth, hole)?.into_iter().map(|(tool, _)| tool).collect())
 }
 
+/// The scale a hole's tools are sized by: the largest body the hole's axis meets (#2904), so a
+/// large body elsewhere in the model changes neither the tool's reach above the face (and so
+/// the countersink's outline) nor its depth. A hole whose axis meets no body is sized by the
+/// largest body of the model, as before.
+fn hole_axis_size(st: &ModelState, position: &Vec3, dir: Vec3) -> f64 {
+    let along = |b: &ModelBody| {
+        // The axis (an unbounded line) against the body's box, grown by the display tolerance.
+        let bb = b.mesh().bounds();
+        if bb.is_empty() {
+            return false;
+        }
+        let pad = 2.0 * b.display_tol();
+        let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+        for (o, d, min, max) in
+            [(position.x, dir.x, bb.min.x, bb.max.x), (position.y, dir.y, bb.min.y, bb.max.y), (position.z, dir.z, bb.min.z, bb.max.z)]
+        {
+            if d.abs() < 1e-12 {
+                if o < min - pad || o > max + pad {
+                    return false;
+                }
+            } else {
+                let (a, c) = ((min - pad - o) / d, (max + pad - o) / d);
+                lo = lo.max(a.min(c));
+                hi = hi.min(a.max(c));
+            }
+        }
+        lo <= hi
+    };
+    let met = st.bodies.iter().filter(|b| along(b)).map(|b| b.body.size()).fold(0.0, f64::max);
+    if met > 0.0 { met } else { st.bodies.iter().map(|b| b.body.size()).fold(1.0, f64::max) }
+}
+
 /// [`hole_tools`], each with its exact geometry when it is a straight cylinder along the axis
 /// (a plain hole, a counterbore, a drill point left in the air past a through hole), so sheet
 /// metal can keep it as a flat cut-out or pocket. Each tool's faces are named by the part of the
@@ -2794,7 +3311,7 @@ fn hole_tools_and_prisms(
     if !(r > 1e-6) {
         return Err(DocError::Invalid("hole diameter must be positive".into()));
     }
-    let size = st.bodies.iter().map(|b| b.body.size()).fold(1.0, f64::max);
+    let size = hole_axis_size(st, position, dir);
     let top = (size * 0.01).max(0.1);
     let bottom = match depth {
         Some(d) => -val(vals, d, Kind::Length)?,
@@ -2977,6 +3494,84 @@ struct ExtrudeConstructor {
     interval: (f64, f64),
 }
 
+/// The tool of an Extrude whose profile is a whole planar face of its one target (the face's
+/// outline projected into the sketch), started at the face (#2040). The projection fits an edge
+/// that is no line or arc, so the profile's tool lies a hair off the body all round its outline,
+/// and the boolean fails there. A join takes the body's own face swept instead, which is sewn on
+/// along it. A cut whose walls take nothing from the body (all of it within the depth lies over
+/// the face) takes a slab beyond the depth plane instead, which meets the body only across that
+/// plane; one whose walls cut into the body at some edges keeps those walls, exactly, and moves
+/// the others off it (`kernel::cut_tool`). `None` (the profile's own tool) otherwise. With the
+/// interval along the normal it spans.
+fn whole_face_tool(
+    st: &ModelState,
+    targets: &[String],
+    ss: &SolvedSketch,
+    r: &Region2,
+    operation: Operation,
+    lo: f64,
+    hi: f64,
+) -> Option<(Traced, (f64, f64))> {
+    if !matches!(operation, Operation::Join | Operation::Cut) || hi - lo <= 0.0 {
+        return None;
+    }
+    // An outline of lines and arcs is the face's own: the profile's tool already meets the body
+    // exactly, and keeps the names later features attach to (#489).
+    if r.outer.segs.iter().all(|s| matches!(s, solidcraft_geom::Seg2::Line { .. } | solidcraft_geom::Seg2::Arc { .. })) {
+        return None;
+    }
+    let mut candidates = st.bodies.iter().filter(|b| targets.is_empty() || targets.contains(&b.name));
+    let target = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    let face = kernel::matching_face(&target.body, &ss.plane, r, &[lo, hi])?;
+    let n = ss.plane.normal();
+    let tol = target.body.size() * 1e-6 + 1e-9;
+    let up = face.normal.dot(n) > 0.0;
+    let (at_lo, at_hi) = ((face.height - lo).abs() <= tol, (face.height - hi).abs() <= tol);
+    let roles = |region| crate::lineage::ProfileRoles {
+        sketch: Some(ss),
+        region: Some(region),
+        caps: [Some(crate::lineage::extrude_cap_role(lo)), Some(crate::lineage::extrude_cap_role(hi))],
+    };
+    match operation {
+        // Out of the body from the face.
+        Operation::Join if (up && at_lo) || (!up && at_hi) => {
+            let built = centered_extrude(&ss.plane, r, lo, hi, Some(ss)).ok()?;
+            let [built] = built.as_slice() else { return None };
+            let exact = kernel::face_prism(&target.body, face, hi - lo, true, &built.body).ok()?;
+            kernel::can_join_touching_faces(&target.body, &exact).then(|| (roles(r).tool(exact, Some(&built.body)), (lo, hi)))
+        }
+        // Into the body from the face, its walls touching it at most.
+        Operation::Cut if ((up && at_hi) || (!up && at_lo)) && !kernel::cut_takes_only_the_face(&target.body, face, hi - lo) => {
+            // Some walls go into the body: those that only touch it are moved off.
+            let built = centered_extrude(&ss.plane, r, lo, hi, Some(ss)).ok()?;
+            let [built] = built.as_slice() else { return None };
+            let (tool, off) = kernel::cut_tool(&target.body, face, hi - lo, Some(&built.body))?;
+            let span = if up { (lo, hi + off) } else { (lo - off, hi) };
+            Some((roles(r).tool(tool, Some(&built.body)), span))
+        }
+        Operation::Cut if (up && at_hi) || (!up && at_lo) => {
+            // Over the whole body, from the depth plane out past it.
+            let reach = target.body.size() * 2.0 + (hi - lo);
+            let c = r.outer.centroid();
+            let p = |x: f64, y: f64| Vec2::new(c.x + x * reach, c.y + y * reach);
+            let line = |a: Vec2, b: Vec2| solidcraft_geom::Seg2::Line { a, b };
+            let corners = [p(-1.0, -1.0), p(1.0, -1.0), p(1.0, 1.0), p(-1.0, 1.0)];
+            let segs = (0..4).filter_map(|i| Some(line(*corners.get(i)?, *corners.get((i + 1) % 4)?))).collect();
+            let slab = Region2 { outer: solidcraft_geom::Loop2 { segs }, holes: vec![] };
+            let (l, h) = if up { (lo, hi + reach) } else { (lo - reach, hi) };
+            let built = centered_extrude(&ss.plane, &slab, l, h, None).ok()?;
+            let [built] = built.as_slice() else { return None };
+            #[cfg(test)]
+            whole_face_tests::slab_taken();
+            Some((roles(&slab).tool(built.body.clone(), None), (l, h)))
+        }
+        _ => None,
+    }
+}
+
 /// Construct planar caps locally before placing the completed tool.
 fn centered_extrude(plane: &Plane, region: &Region2, start: f64, end: f64, sketch: Option<&SolvedSketch>) -> Result<Vec<Traced>> {
     if !plane.origin.is_finite()
@@ -2997,7 +3592,8 @@ fn centered_extrude(plane: &Plane, region: &Region2, start: f64, end: f64, sketc
     };
     // Fit cap surfaces in their own coordinates. Fitting a distant world-space
     // wire can tilt an otherwise exact planar cap through numeric cancellation.
-    let bodies = kernel::extrude(&Plane::XY, std::slice::from_ref(region), start, end)?;
+    // A side drawn in collinear pieces is one face (#1788).
+    let bodies = kernel::extrude_whole_sides(&Plane::XY, std::slice::from_ref(region), start, end)?;
     if *plane == Plane::XY {
         return Ok(bodies.into_iter().map(|body| roles.tool(body, None)).collect());
     }
@@ -3075,17 +3671,20 @@ fn feature_tools_with_constructor(
             let n = ss.plane.normal();
             let tst =
                 if extent.to.is_some() || extent.from.is_some() { state_in_frame(doc, st, f.component) } else { std::borrow::Cow::Borrowed(st) };
+            // Through all, and where the tool meets its targets, is measured where they are shown.
+            let shown = targets_as_shown(st, f, &crate::plain(targets))?;
+            let st: &ModelState = &shown;
             // The face names follow `face_points`: To, then From.
             let name = |k: usize| f.face_names.get(k).map(String::as_str);
             let (to_name, from_name) = if extent.to.is_some() { (name(0), name(1)) } else { (None, name(0)) };
-            let to_face = extent.to.and_then(|p| object_face(&tst, to_name, p.0));
+            let to_face = extent.to.and_then(|p| object_face(&tst, to_name, p.0, Some(n)));
             let centre = {
                 let pts: Vec<Vec2> = regions.iter().flat_map(|r| r.outer.polyline(1e-2)).collect();
                 let c = pts.iter().fold(Vec2::default(), |a, p| a + *p) * (1.0 / pts.len().max(1) as f64);
                 ss.plane.to_world(c)
             };
             let from = match extent.from {
-                Some(p) => height_at(&tst, object_face(&tst, from_name, p.0), &ss.plane, centre, p.0),
+                Some(p) => height_at(&tst, object_face(&tst, from_name, p.0, Some(n)), &ss.plane, centre, p.0),
                 None => 0.0,
             };
             let d = match extent.to {
@@ -3108,21 +3707,30 @@ fn feature_tools_with_constructor(
             };
             if let Some(tp) = &extent.taper {
                 let taper = val(vals, tp, Kind::Angle)?;
-                if extent.distance2.is_some() || extent.start_offset.is_some() || extent.direction == crate::Direction::Symmetric {
-                    return Err(DocError::Invalid("not supported yet: taper with two-sided, symmetric or offset extents".into()));
+                if extent.distance2.is_some() || extent.direction == crate::Direction::Symmetric {
+                    return Err(DocError::Invalid("not supported yet: taper with two-sided or symmetric extents".into()));
                 }
                 let sign = if extent.to.is_none() && extent.direction == crate::Direction::Negative { -1.0 } else { 1.0 };
                 let (len, sign) = if d < 0.0 { (-d, -sign) } else { (d, sign) };
-                let start_plane = ss.plane.offset(from);
+                // Where the extrude starts: the From Object's level and a start offset along the
+                // normal from it. The offset moves the profile that far and the sides are drafted
+                // from there, so the profile stays the section at the start whatever the offset
+                // (`d` is measured from the start already, To Object included).
+                let base = from
+                    + match &extent.start_offset {
+                        Some(e) => val(vals, e, Kind::Length)?,
+                        None => 0.0,
+                    };
+                let start_plane = ss.plane.offset(base);
                 let caps = [
-                    Some(crate::lineage::extrude_cap_role(from)),
-                    Some(crate::lineage::extrude_cap_role(if sign < 0.0 { from - len } else { from + len })),
+                    Some(crate::lineage::extrude_cap_role(base)),
+                    Some(crate::lineage::extrude_cap_role(if sign < 0.0 { base - len } else { base + len })),
                 ];
                 // How far a tool grows past its profile at either end, at most.
                 let mut growth: f64 = 0.0;
                 // A face of the targets in the profile's plane (the same for every profile).
                 let plain_targets: Vec<String> = crate::plain(targets);
-                let on_face = matches!(operation, Operation::Join | Operation::Cut) && face_level_at(st, &ss.plane, from, &plain_targets);
+                let on_face = matches!(operation, Operation::Join | Operation::Cut) && face_level_at(st, &ss.plane, base, &plain_targets);
                 let surroundings = Surroundings::of(st, *operation, &plain_targets);
                 let tools: Vec<Traced> = regions
                     .iter()
@@ -3146,9 +3754,9 @@ fn feature_tools_with_constructor(
                             growth = growth.max(len * taper.tan().abs());
                             return Ok(roles.tool(exact, None));
                         }
-                        let (lo, hi) = if sign < 0.0 { (from - len, from) } else { (from, from + len) };
+                        let (lo, hi) = if sign < 0.0 { (base - len, base) } else { (base, base + len) };
                         let (l2, h2) = surroundings.as_ref().map_or((lo, hi), |sur| extend_for_coplanar(sur, &ss.plane, r, lo, hi));
-                        let (mut a, b) = if sign < 0.0 { (from - h2, from - l2) } else { (l2 - from, h2 - from) };
+                        let (mut a, b) = if sign < 0.0 { (base - h2, base - l2) } else { (l2 - base, h2 - base) };
                         // A taper that narrows the tool away from the face widens it as it runs on into it, past
                         // the profile (where the profile is the whole face, out through the body's sides, #1534):
                         // then it starts on the face instead.
@@ -3219,25 +3827,72 @@ fn feature_tools_with_constructor(
             // Each tool's extent along the normal (they differ where one is run on into a face).
             let mut extents: Vec<(f64, f64)> = Vec::with_capacity(regions.len());
             let plain_targets: Vec<String> = crate::plain(targets);
-            let surroundings = Surroundings::of(st, *operation, &plain_targets);
-            // Trimming may discard a tool's material, so only bodies this feature
-            // actually joins can establish that the discarded end is already filled.
-            let participants = if plain_targets.is_empty() { &f.participants } else { &plain_targets };
-            let trim_targets: Vec<String> = st
-                .bodies
-                .iter()
-                .filter(|b| {
-                    if participants.is_empty() {
-                        b.component == f.component || b.feature == f.id
-                    } else {
-                        participants.iter().any(|t| t == "*" || t == &b.name)
-                    }
-                })
-                .map(|b| b.name.clone())
-                .collect();
-            let join_surroundings =
-                if *operation == Operation::Join && !trim_targets.is_empty() { Surroundings::of(st, *operation, &trim_targets) } else { None };
-            for r in &regions {
+            let exact_planar_cut = *operation == Operation::Cut
+                && ss.sketch.links.len() > 1
+                && ss.sketch.links.iter().all(|link| matches!(&link.source, solidcraft_sketch::LinkSource::Face { .. }))
+                && st
+                    .bodies
+                    .iter()
+                    .filter(|body| plain_targets.is_empty() || plain_targets.iter().any(|target| target == "*" || target == &body.name))
+                    .all(|body| kernel::is_planar(&body.body));
+            let mut touching_batch = false;
+            // Generated face profiles have full source seams. Check all of them in
+            // one guarded construction; arbitrary sketch profiles retain their existing path.
+            if *operation == Operation::Join
+                && regions.len() > 1
+                && ss.sketch.links.len() > 1
+                && ss.sketch.links.iter().all(|link| matches!(&link.source, solidcraft_sketch::LinkSource::Face { .. }))
+            {
+                let exact = regions
+                    .iter()
+                    .map(|region| centered_extrude(&ss.plane, region, lo + off, hi + off, Some(&ss)))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                if let Ok(Some(compound)) = kernel::compound_disjoint_extrusions(&exact.iter().map(|tool| tool.body.clone()).collect::<Vec<_>>())
+                    && st
+                        .bodies
+                        .iter()
+                        .filter(|body| plain_targets.is_empty() || plain_targets.contains(&body.name))
+                        .any(|body| kernel::can_join_all_touching_faces(&body.body, &compound))
+                {
+                    tools = exact;
+                    touching_batch = true;
+                }
+            }
+            let surroundings = if exact_planar_cut || touching_batch { None } else { Surroundings::of(st, *operation, &plain_targets) };
+            let join_surroundings = if *operation == Operation::Join && !touching_batch {
+                // Trimming may discard a tool's material, so only bodies this feature
+                // actually joins can establish that the discarded end is already filled.
+                let participants = if plain_targets.is_empty() { &f.participants } else { &plain_targets };
+                let trim_targets: Vec<String> = st
+                    .bodies
+                    .iter()
+                    .filter(|b| {
+                        if participants.is_empty() {
+                            b.component == f.component || b.feature == f.id
+                        } else {
+                            participants.iter().any(|t| t == "*" || t == &b.name)
+                        }
+                    })
+                    .map(|b| b.name.clone())
+                    .collect();
+
+                if trim_targets.is_empty() { None } else { Surroundings::of(st, *operation, &trim_targets) }
+            } else {
+                None
+            };
+            for r in regions.iter().filter(|_| !touching_batch) {
+                if regions.len() == 1
+                    && let Some((tool, (l2, h2))) = whole_face_tool(st, &plain_targets, &ss, r, *operation, lo + off, hi + off)
+                {
+                    untrimmed &= l2 == lo + off && h2 == hi + off;
+                    tools.push(tool);
+                    footprints.push(r.clone());
+                    extents.push((l2, h2));
+                    continue;
+                }
                 if *operation == Operation::Join {
                     let exact = centered_extrude(&ss.plane, r, lo + off, hi + off, Some(&ss))?;
                     if exact.iter().all(|tool| {
@@ -3376,6 +4031,9 @@ fn feature_tools_with_constructor(
             let (o, d) = revolve_axis(&ss, axis)?;
             // To Object is in this feature's component frame: the model as seen from there.
             let tst = if to.is_some() { state_in_frame(doc, st, f.component) } else { std::borrow::Cow::Borrowed(st) };
+            // Where the tool meets its targets is measured where they are shown (#3383).
+            let shown = targets_as_shown(st, f, &feature_op(f).1)?;
+            let st: &ModelState = &shown;
             let angles = if to.is_some() {
                 (0.0, None)
             } else {
@@ -3443,7 +4101,7 @@ fn feature_tools_with_constructor(
                 .collect::<Result<Vec<_>>>()?;
             // To a curved face: turn past the whole target body, then cut back to its surface
             // (the piece that starts at the profile).
-            let curved = curved_face(&tst, to.and_then(|p| object_face(&tst, f.face_names.first().map(String::as_str), p.0)), None);
+            let curved = curved_face(&tst, to.and_then(|p| object_face(&tst, f.face_names.first().map(String::as_str), p.0, None)), None);
             let curved_body = curved.and_then(|bi| tst.bodies.get(bi));
             // Each region's body: its sides named by the sketch curves, its caps start and end.
             let tool = |r: &Region2, body: Body, built: Option<&Body>| crate::lineage::ProfileRoles::swept(Some(&ss), Some(r)).tool(body, built);
@@ -3504,8 +4162,11 @@ fn feature_tools_with_constructor(
             let m = crate::rigid(Vec3::ZERO, origin_w, axis_w, -start);
             regions.iter().zip(bodies).map(|(r, body)| Ok(tool(r, kernel::transform_matrix(&body, m)?, Some(&body)))).collect()
         }
-        FeatureKind::Loft { sections, .. } if sections.iter().any(|s| s.point.is_some()) => {
+        FeatureKind::Loft { sections, rails, .. } if sections.iter().any(|s| s.point.is_some()) => {
             // A profile lofted to a sketch point (an apex).
+            if !rails.is_empty() {
+                return Err(DocError::Invalid("not supported yet: guide rails on a loft to a point".into()));
+            }
             let [a, b] = &sections[..] else { return Err(DocError::Invalid("not supported yet: a point section in a loft of more than two".into())) };
             let (prof, pt) = if a.point.is_some() { (b, a) } else { (a, b) };
             let ss = st.sketch(prof.sketch.0).ok_or_else(|| DocError::Unknown(format!("sketch {}", prof.sketch)))?;
@@ -3558,7 +4219,7 @@ fn feature_tools_with_constructor(
             let pitch = if *clockwise { -p } else { p };
             Ok(unnamed(vec![kernel::sweep_helix(&plane, &region, *base, axis, pitch, n)?]))
         }
-        FeatureKind::Loft { sections, .. } => {
+        FeatureKind::Loft { sections, rails, rail_fit, .. } => {
             let mut secs = Vec::new();
             let mut sketches = Vec::new();
             for sec in sections {
@@ -3567,14 +4228,27 @@ fn feature_tools_with_constructor(
                     .ok_or_else(|| DocError::Unknown(format!("sketch {} (it must come earlier in the timeline)", sec.sketch)))?;
                 let regions = solidcraft_sketch::merge_regions(&select_profiles(ss, &sec.profiles)?);
                 let [r] = &regions[..] else { return Err(DocError::Invalid("each loft section must be one profile".into())) };
-                refuse_loft_holes(r)?;
-                secs.push((ss.plane, r.outer.clone()));
+                secs.push((ss.plane, r.clone()));
                 sketches.push(ss);
             }
             // Its caps are the first and last sections, its sides named by the curves they run
             // between.
-            let body = kernel::loft(&secs)?;
-            let roles = crate::lineage::SectionRoles { sections: sketches.into_iter().zip(secs.iter().map(|(_, lp)| lp)).collect() };
+            let body = if rails.is_empty() {
+                kernel::loft_regions(&secs)?
+            } else {
+                // Rails shape the sections' outlines; sections with holes wait for rails that
+                // carry the holes too.
+                if secs.iter().any(|(_, r)| !r.holes.is_empty()) {
+                    return Err(DocError::Invalid("not supported yet: guide rails on a loft whose sections have holes".into()));
+                }
+                let outlines: Vec<_> = secs.iter().map(|(p, r)| (*p, r.outer.clone())).collect();
+                // The rails run from the end at the first section.
+                let start = outlines.first().and_then(|(p, lp)| lp.segs.first().map(|seg| p.to_world(seg.start()))).unwrap_or_default();
+                kernel::loft_with_rails(&outlines, &rail_polylines(doc, st, rails, f.component, start)?, kernel_rail_fit(*rail_fit))?
+            };
+            let roles = crate::lineage::SectionRoles {
+                sections: sketches.into_iter().zip(secs.iter().map(|(_, r)| std::iter::once(&r.outer).chain(&r.holes).collect())).collect(),
+            };
             Ok(vec![roles.tool(body)])
         }
         FeatureKind::Sweep { sketch, profiles, path_sketch, path, orientation, twist, scale, rails, rail_fit, .. } => {
@@ -3684,20 +4358,24 @@ pub(crate) fn sweep_control(
         Some(k) => val(vals, k, Kind::Unitless)?,
         None => 1.0,
     };
-    let rail_fit = match rail_fit {
-        crate::RailFit::Scale => kernel::RailFit::Scale,
-        crate::RailFit::Stretch => kernel::RailFit::Stretch,
-    };
-    let ctl = kernel::SweepControl { orientation, twist, scale, rails, rail_fit };
+    let ctl = kernel::SweepControl { orientation, twist, scale, rails, rail_fit: kernel_rail_fit(rail_fit) };
     ctl.check()?;
     Ok(ctl)
 }
 
-/// A sweep's guide rails as polylines in the feature's frame, each a chain of its sketch's curves
-/// (planar or 3D) from the end nearest `start`, the start of the path.
+/// How guide rails reshape a sweep's profile or a loft's sections, for the kernel.
+pub(crate) fn kernel_rail_fit(fit: crate::RailFit) -> kernel::RailFit {
+    match fit {
+        crate::RailFit::Scale => kernel::RailFit::Scale,
+        crate::RailFit::Stretch => kernel::RailFit::Stretch,
+    }
+}
+
+/// A sweep's or a loft's guide rails as polylines in the feature's frame, each a chain of its sketch's curves
+/// (planar or 3D) from the end nearest `start` (the start of the path, the loft's first section).
 pub(crate) fn rail_polylines(doc: &Document, st: &ModelState, rails: &[crate::SweepRail], consumer: u64, start: Vec3) -> Result<Vec<Vec<Vec3>>> {
     if rails.len() > 2 {
-        return Err(DocError::Invalid("a sweep takes one or two guide rails".into()));
+        return Err(DocError::Invalid("a sweep or a loft takes one or two guide rails".into()));
     }
     rails
         .iter()
@@ -3908,9 +4586,17 @@ fn path_segments(ps: &SolvedSketch, ids: &[String], start: Vec3) -> Result<Vec<k
 
 /// Where an extrude of distance `d` starts and ends along the sketch normal, before any start
 /// offset: one side, the other, both (symmetric), or a second distance on the other side.
+///
+/// A second distance (`distance2`) goes the other way from the first side, wherever that went:
+/// against the normal for `direction: negative` (#2700), and back along it when a negative
+/// distance or a To Object below the sketch sends the first side down.
 pub(crate) fn extent_sides(vals: &BTreeMap<String, Value>, extent: &crate::Extent, d: f64, direction: crate::Direction) -> Result<(f64, f64)> {
     Ok(match (&extent.distance2, direction) {
-        (Some(d2), _) => (-val(vals, d2, Kind::Length)?, d),
+        (Some(d2), _) => {
+            let first = if direction == crate::Direction::Negative { -d } else { d };
+            let d2 = val(vals, d2, Kind::Length)?;
+            (if first < 0.0 { d2 } else { -d2 }, first)
+        }
         (None, crate::Direction::Positive) => (0.0, d),
         (None, crate::Direction::Negative) => (-d, 0.0),
         (None, crate::Direction::Symmetric) => {
@@ -3961,6 +4647,15 @@ fn rotation(o: Vec3, a: Vec3, ang: f64) -> Mat {
     );
     let tr = o - ro;
     [[r[0][0], r[0][1], r[0][2], 0.0], [r[1][0], r[1][1], r[1][2], 0.0], [r[2][0], r[2][1], r[2][2], 0.0], [tr.x, tr.y, tr.z, 1.0]]
+}
+
+/// A copy of a sheet metal body is sheet metal too: its sheet model goes with it, moved, or
+/// mirrored into the opposite hand ([`crate::sheet::SheetBody::copied`]), so the copy has its
+/// own flat pattern, DXF and bend table. A copy by any other transform stays a plain solid.
+fn copy_sheet(st: &mut ModelState, from: &str, to: &str, m: &crate::Mat) {
+    let Some(sheet) = st.sheets.iter().find(|s| s.body == from).and_then(|s| s.copied(to, m)) else { return };
+    st.sheets.retain(|s| s.body != to);
+    st.sheets.push(sheet);
 }
 
 /// Reflection in a plane (column-major).
@@ -4200,6 +4895,14 @@ fn replay(
             continue;
         }
         let (op, targets) = feature_op(src);
+        // A primitive's or a hole's targets are its participants (#1108): the copies change
+        // those bodies only, like the feature itself (#2755).
+        let targets = if targets.is_empty() { src.participants.clone() } else { targets };
+        // A join that merged its targets left only the first of them (the others now live in
+        // it): the copies change the bodies still there (#3378). When none is, the names stay
+        // and say which body is missing.
+        let present: Vec<String> = targets.iter().filter(|t| st.bodies.iter().any(|b| &b.name == *t)).cloned().collect();
+        let targets = if present.is_empty() { targets } else { present };
         let mut copies = Vec::new();
         if let FeatureKind::Hole { diameter, depth, hole, to, .. } = &src.kind {
             // A hole is drilled again at each copy of its spot (found on the surface there), so
@@ -4209,7 +4912,7 @@ fn replay(
             for (k, m) in mats.iter().enumerate() {
                 let d = crate::apply_vector(m, dir).normalized().ok_or_else(|| DocError::Invalid("hole direction".into()))?;
                 for p in &spots {
-                    let at = hole_on_surface(st, crate::apply_point(m, *p), d);
+                    let at = hole_on_surface(st, crate::apply_point(m, *p), d, hole_scope(src));
                     let to = to.map(|t| crate::apply_point(m, t.0));
                     let depth = hole_depth_to(st, &at, d, &to, depth)?;
                     // Each copy's faces are named as the hole's, with the instance.
@@ -4242,8 +4945,11 @@ fn replay(
     Ok(())
 }
 
+#[path = "model_cache.rs"]
+mod model_cache;
 #[path = "eval_more.rs"]
 mod more;
+pub use model_cache::SavedModel;
 #[path = "eval_surface.rs"]
 mod surface;
 
@@ -4251,7 +4957,7 @@ mod surface;
 /// there if it is planar and parallel (its plane), else where a ray from `centre` along the
 /// normal meets the body there, else the point itself.
 pub fn object_height(st: &ModelState, plane: &Plane, centre: Vec3, p: Vec3) -> f64 {
-    height_at(st, face_at(st, p), plane, centre, p)
+    height_at(st, face_at(st, p, Some(plane.normal())), plane, centre, p)
 }
 
 /// [`object_height`] of the point `p` on `face` (`(body index, face index)`, see [`object_face`]).
@@ -4283,31 +4989,63 @@ fn height_at(st: &ModelState, face: Option<(usize, usize)>, plane: &Plane, centr
 /// face index)`, within that body's pick tolerance. Not the first body with any face within
 /// its tolerance: that is 5 % of the body's size, so a large body beside a small target (a
 /// plate under a post, a frame around a pin) would otherwise take a pick made on the target.
-fn face_at(st: &ModelState, p: Vec3) -> Option<(usize, usize)> {
+fn face_at(st: &ModelState, p: Vec3, normal: Option<Vec3>) -> Option<(usize, usize)> {
     st.bodies
         .iter()
         .enumerate()
         .filter(|(_, b)| !b.body.is_mesh())
         .filter_map(|(bi, b)| {
-            let (d, fi) = crate::appearance::nearest_face(b, p)?;
+            let (d, fi) = nearest_object_face(b, p, normal)?;
             (d <= crate::appearance::pick_tolerance(b)).then_some((d, bi, fi))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, bi, fi)| (bi, fi))
 }
 
+/// At a shared edge or corner an extrusion's end plane and side wall can be equally near.
+/// Prefer the plane square to the extrusion: choosing the wall would instead extend the tool
+/// past the whole body and try to trim it, even when the tool never intersects that body.
+/// Only settle a distance tie; a nearby plane must not steal a pick on another face.
+fn nearest_object_face(b: &ModelBody, p: Vec3, normal: Option<Vec3>) -> Option<(f64, usize)> {
+    let nearest = crate::appearance::nearest_face(b, p)?;
+    let Some(n) = normal else { return Some(nearest) };
+    if nearest.0 > crate::appearance::pick_tolerance(b) {
+        return Some(nearest);
+    }
+    let tol = (b.body.size() * 1e-3).max(1e-3);
+    let Ok(faces) = b.body.faces(tol) else { return Some(nearest) };
+    let caps: std::collections::BTreeSet<usize> =
+        faces.iter().filter(|f| f.plane_normal.is_some_and(|fnrm| fnrm.cross(n).len() < 1e-6)).map(|f| f.index).collect();
+    if caps.is_empty() || caps.contains(&nearest.1) {
+        return Some(nearest);
+    }
+    let tie = (b.body.size() * 1e-9).max(1e-7);
+    let mesh = b.mesh();
+    mesh.triangles
+        .iter()
+        .zip(&mesh.tri_face)
+        .filter(|(_, fi)| caps.contains(&(**fi as usize)))
+        .filter_map(|(tri, fi)| {
+            let [a, b, c] = mesh.tri(tri)?;
+            let d = crate::appearance::closest_on_triangle(p, a, b, c).dist(p);
+            (d <= nearest.0 + tie).then_some((d, *fi as usize))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .or(Some(nearest))
+}
+
 /// The face a To / From Object point stands for, `(body index, face index)`: the face its
 /// stored `name` finds when the point lies on it (evaluation has moved the point onto its named
 /// face), else the nearest face at the point. The name settles a tie: in an assembly a part of
 /// another component may rest on the target and touch it at the point.
-fn object_face(st: &ModelState, name: Option<&str>, p: Vec3) -> Option<(usize, usize)> {
+fn object_face(st: &ModelState, name: Option<&str>, p: Vec3, normal: Option<Vec3>) -> Option<(usize, usize)> {
     if let Some(n) = name.filter(|n| !n.is_empty())
         && let Some(hit) = crate::naming::locate_face(st, n, p)
         && hit.on_point
     {
         return Some((hit.body, hit.face));
     }
-    face_at(st, p)
+    face_at(st, p, normal)
 }
 
 /// The body of `face` when that face is not a plane (with `n`: not a plane square to `n`), so To
@@ -4326,7 +5064,7 @@ fn curved_face(st: &ModelState, face: Option<(usize, usize)>, n: Option<Vec3>) -
 
 /// The body at `p` when the face there is not planar.
 fn curved_target_any(st: &ModelState, p: Vec3) -> Option<usize> {
-    curved_face(st, face_at(st, p), None)
+    curved_face(st, face_at(st, p, None), None)
 }
 
 /// Tools run through `target`, cut back to its surface: each tool less the body, keeping the
@@ -4370,8 +5108,10 @@ fn face_samples(b: &ModelBody) -> Vec<Vec3> {
     out.into_iter().flatten().collect()
 }
 
-/// The picked faces and every face joined to them smoothly (across tangent edges), as points.
-fn smooth_chain(b: &ModelBody, picks: &[Vec3]) -> Vec<Vec3> {
+/// The picked faces and every face joined to them smoothly (across tangent edges).
+/// Each face appears once, with a point on it. Shell evaluation and selection feedback use
+/// the same expansion; callers keep the original picks when saving the feature.
+pub fn tangent_face_chain(b: &ModelBody, picks: &[Vec3]) -> Vec<(usize, Vec3)> {
     let m = b.mesh();
     let samples = face_samples(b);
     let face_of = |p: Vec3| crate::appearance::face_index_at(b, p);
@@ -4388,6 +5128,8 @@ fn smooth_chain(b: &ModelBody, picks: &[Vec3]) -> Vec<Vec3> {
             .and_then(|(_, n)| n.normalized())
     };
     let mut chosen: Vec<u32> = picks.iter().filter_map(|p| face_of(*p).map(|f| f as u32)).collect();
+    chosen.sort_unstable();
+    chosen.dedup();
     let mut k = 0;
     while k < chosen.len() && chosen.len() < 10_000 {
         let f = chosen[k];
@@ -4412,12 +5154,18 @@ fn smooth_chain(b: &ModelBody, picks: &[Vec3]) -> Vec<Vec3> {
             }
         }
     }
-    let mut out = picks.to_vec();
+    let mut out = Vec::new();
     for f in chosen {
-        if let Some(p) = samples.iter().find(|p| face_of(**p) == Some(f as usize)) {
-            out.push(*p);
+        if let Some(p) = picks.iter().chain(&samples).find(|p| face_of(**p) == Some(f as usize)) {
+            out.push((f as usize, *p));
         }
     }
+    out
+}
+
+fn smooth_chain(b: &ModelBody, picks: &[Vec3]) -> Vec<Vec3> {
+    let mut out = picks.to_vec();
+    out.extend(tangent_face_chain(b, picks).into_iter().map(|(_, point)| point));
     out
 }
 
@@ -4557,6 +5305,8 @@ fn chamfer_with(
 }
 
 fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st: &mut ModelState, warning: &mut Option<String>) -> Result<()> {
+    // Its tools meet bodies in other placements where those are shown (#3383).
+    let _frames = ToolFrames::install(doc, f, st);
     match &f.kind {
         FeatureKind::BodyTransfer { bodies, from, to, transform } => {
             crate::body_transfer::evaluate(doc, st, &crate::plain(bodies), *from, *to, *transform)
@@ -4585,6 +5335,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
         | FeatureKind::SurfaceLoft { .. }
         | FeatureKind::SurfaceBlend { .. }
         | FeatureKind::SurfaceBoundary { .. }
+        | FeatureKind::SurfaceNetwork { .. }
         | FeatureKind::SurfaceMatch { .. }
         | FeatureKind::SurfaceFair { .. }
         | FeatureKind::SurfaceOffset { .. }
@@ -4606,7 +5357,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 None => state_in_frame(doc, st, f.component),
             };
             let (plane, face_warning) = match (anchor, plane) {
-                (Some(_), plane) => (doc.resolve_attached_plane(vals, plane, f.component, st, &fst)?, None),
+                (Some(_), plane) => doc.resolve_attached_plane_noted(vals, plane, f.component, st, &fst)?,
                 // A flat face of a sheet: the panel's exact plane, from its flat region and fold.
                 (None, plane) if crate::sheet::plane_sheet_face(plane).is_some() => {
                     (doc.resolve_plane_in(vals, &sheet_face_plane_in_frame(doc, st, f.component, plane)?, 0, Some(&fst))?, None)
@@ -4639,8 +5390,9 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             }
             sk.validate_periodic_splines()?;
             let profiles = find_profiles(&sk);
+            let ends = solidcraft_sketch::loose_ends(&sk);
             st.sketches.retain(|s| s.feature != f.id);
-            st.sketches.push(Arc::new(SolvedSketch { feature: f.id, name: f.name.clone(), plane, sketch: sk, report, profiles }));
+            st.sketches.push(Arc::new(SolvedSketch { feature: f.id, name: f.name.clone(), plane, sketch: sk, report, profiles, ends }));
             Ok(())
         }
         FeatureKind::Extrude { operation, targets, .. }
@@ -4714,7 +5466,23 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             let t = val(vals, thickness, Kind::Length)?;
             let i = body_at(st, body, &crate::plain(faces))?;
             let Some(mb) = st.bodies.get(i).cloned() else { return Err(DocError::Invalid("body".into())) };
-            let open = if *tangent_chain { smooth_chain(&mb, &crate::plain(faces)) } else { crate::plain(faces) };
+            let picks = crate::plain(faces);
+            let open = if *tangent_chain {
+                let chain = tangent_face_chain(&mb, &picks);
+                if !chain.is_empty() && chain.len() == mb.body.face_count() {
+                    return Err(DocError::Invalid(
+                        "Tangent Chain opens every face of this body, leaving no walls; turn off Tangent Chain to remove only the picked faces"
+                            .into(),
+                    ));
+                }
+                // Keep every authored pick, including any the kernel must reject, as before
+                // chain expansion. The derived samples must not silently drop a bad input.
+                let mut open = picks;
+                open.extend(chain.into_iter().map(|(_, point)| point));
+                open
+            } else {
+                picks
+            };
             let input = mb.traced();
             // The shell, and the operands of the operation that made it.
             let (nb, operands) = match direction.as_str() {
@@ -4764,7 +5532,11 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             let pl = match crate::face_anchor::plane_face_anchor(plane) {
                 Some(anchor) => {
                     let fst = crate::state_in_face_anchor_frame(doc, st, anchor, f.component)?;
-                    doc.resolve_attached_plane(vals, plane, f.component, st, &fst)?
+                    let (pl, note) = doc.resolve_attached_plane_noted(vals, plane, f.component, st, &fst)?;
+                    if let Some(note) = note {
+                        append_warning(warning, note);
+                    }
+                    pl
                 }
                 // A plane of numbers alone reads no body: placing them all is the design's size.
                 None if plane_is_fixed(plane) => doc.resolve_plane_in(vals, plane, 0, Some(st))?,
@@ -4850,7 +5622,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                     if curves.is_empty() {
                         return Err(DocError::Invalid(format!("sketch `{}` has no curves to split with", ss.name)));
                     }
-                    kernel::split_faces(&mb.body, &picked, &kernel::SplitTool::Curves { plane: ss.plane, curves })?
+                    kernel::split_faces(&mb.body, &picked, &kernel::SplitTool::Curves { plane: ss.plane, curves, along: None })?
                 }
                 (None, None) => {
                     let pl = doc.resolve_plane_in(vals, plane, 0, Some(st))?;
@@ -4899,7 +5671,11 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 *slot = ModelBody::traced_new(mb.name.clone(), first, mb.feature);
             }
             for (k, b) in it.enumerate() {
-                let mut name = format!("{} ({})", mb.name, k + 1);
+                // A piece renamed with `body.rename` keeps its own name (#3510).
+                let mut name = match f.body_names.get(k).filter(|n| !n.trim().is_empty() && st.body(n).is_none()) {
+                    Some(n) => n.clone(),
+                    None => format!("{} ({})", mb.name, k + 1),
+                };
                 while st.body(&name).is_some() {
                     name.push('\'');
                 }
@@ -4919,6 +5695,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 for (k, m) in mats.iter().enumerate() {
                     let copy = moved_copy(&mb, kernel::transform_matrix(&mb.body, *m)?, k + 1);
                     let name = pattern_copy_name(st, f, output, &mb.name);
+                    copy_sheet(st, &mb.name, &name, m);
                     st.bodies.push(ModelBody::traced_new(name, copy, f.id));
                     output += 1;
                 }
@@ -4966,6 +5743,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                     }
                 } else {
                     let name = copy_body_name(st, f, output, &mb.name);
+                    copy_sheet(st, &mb.name, &name, &copy);
                     st.bodies.push(ModelBody::traced_new(name, mirrored, f.id));
                     output += 1;
                 }
@@ -5117,12 +5895,46 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             if tools.iter().any(|t| t == target) {
                 return Err(DocError::Invalid("a body cannot be combined with itself".into()));
             }
+            // Each body is kept in its own component's frame: a tool placed differently from the
+            // target is moved into the target's frame, so it is combined where it is shown (#3383).
+            // A tool placed exactly as the target is left as it is.
+            let target_world = st.body(target).map(|b| body_world(doc, b));
             let mut tb = Vec::new();
             for t in tools {
-                tb.push(st.body(t).ok_or_else(|| DocError::Unknown(format!("body `{t}`")))?.traced());
+                match st.body(t) {
+                    Some(b) => {
+                        let traced = b.traced();
+                        let world = body_world(doc, b);
+                        match target_world.filter(|w| *w != world) {
+                            Some(w) => {
+                                let into_target = crate::mat_inverse(&w)
+                                    .ok_or_else(|| DocError::Invalid(format!("`{target}` is placed where it cannot be combined")))?;
+                                let rel = crate::mat_mul(&into_target, &world);
+                                tb.push(Traced::step(kernel::transform_matrix(&b.body, rel)?, &[&traced]));
+                            }
+                            None => tb.push(traced),
+                        }
+                    }
+                    // Designs saved before #2247 combined the pieces a cut split off a body that
+                    // was already several pieces (`Posts`, `Posts (1)`). A cut keeps them in one
+                    // body now: the piece is in `Posts`, which is a tool too or the body joined to.
+                    None => match split_piece_of(t) {
+                        Some(base)
+                            if st.body(base).is_some()
+                                && (tools.iter().any(|o| **o == *base)
+                                    || (**target == *base && matches!(operation, Operation::Join | Operation::NewBody))) =>
+                        {
+                            append_warning(warning, format!("`{t}` is part of `{base}` now"));
+                        }
+                        _ => return Err(DocError::Unknown(format!("body `{t}`"))),
+                    },
+                }
             }
             if st.body(target).is_none() {
                 return Err(DocError::Unknown(format!("body `{target}`")));
+            }
+            if tb.is_empty() && !tools.is_empty() {
+                return Ok(()); // the pieces were all joined back into the body they are part of
             }
             let op = if *operation == Operation::NewBody { Operation::Join } else { *operation };
             apply_traced(st, f, tb, op, std::slice::from_ref(&target.0))?;
@@ -5221,6 +6033,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 if *copy {
                     let traced = moved_copy(&mb, nb, 1);
                     let name = copy_body_name(st, f, output, &mb.name);
+                    copy_sheet(st, &mb.name, &name, &crate::rigid(t, Vec3::ZERO, axis, ang));
                     st.bodies.push(ModelBody::traced_new(name, traced, f.id));
                     output += 1;
                 } else if let Some(slot) = st.bodies.get_mut(i) {
@@ -5386,6 +6199,134 @@ fn plane_reads_geometry(plane: &PlaneRef) -> bool {
     }
 }
 
+/// Where a body's geometry is placed in the world: through its component's placement and any
+/// offset it was moved into that component with (as [`state_in_frame_at`] places it).
+fn body_world(doc: &Document, mb: &ModelBody) -> Mat {
+    let m = doc.component_transform(doc.model_body_component(mb));
+    doc.model_body_offset(mb).map(|offset| crate::mat_mul(&m, offset)).unwrap_or(m)
+}
+
+thread_local! {
+    /// While a feature whose tools are drawn in its own component's frame is evaluated: each body
+    /// placed differently, with the matrix from that frame into the body's own (#3383).
+    static TOOL_FRAMES: std::cell::RefCell<Vec<(String, Mat)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether a feature joins, cuts or intersects with tools drawn in its own component's frame: a
+/// primitive, or a solid built from its sketches. (A combine's tools are bodies, each in its own
+/// frame; it moves them itself.)
+fn drawn_tools_change_bodies(kind: &FeatureKind) -> bool {
+    match kind {
+        FeatureKind::Box { operation, .. }
+        | FeatureKind::Cylinder { operation, .. }
+        | FeatureKind::Sphere { operation, .. }
+        | FeatureKind::Torus { operation, .. }
+        | FeatureKind::Extrude { operation, .. }
+        | FeatureKind::Revolve { operation, .. }
+        | FeatureKind::Loft { operation, .. }
+        | FeatureKind::Sweep { operation, .. }
+        | FeatureKind::Pipe { operation, .. }
+        | FeatureKind::Coil { operation, .. } => *operation != Operation::NewBody,
+        _ => false,
+    }
+}
+
+/// The frames of [`TOOL_FRAMES`] for the feature being evaluated; what was there before is put
+/// back when it is dropped.
+struct ToolFrames(Vec<(String, Mat)>);
+
+impl ToolFrames {
+    /// For a feature with drawn tools (see [`drawn_tools_change_bodies`]): the bodies placed
+    /// differently from its component, so its tools meet them where they are shown (#3383).
+    fn install(doc: &Document, f: &Feature, st: &ModelState) -> Option<ToolFrames> {
+        if !drawn_tools_change_bodies(&f.kind) || (doc.occurrences.is_empty() && doc.body_offsets.is_empty()) {
+            return None;
+        }
+        let frame = doc.component_transform(f.component);
+        let frames: Vec<(String, Mat)> = st
+            .bodies
+            .iter()
+            .filter_map(|b| {
+                let world = body_world(doc, b);
+                (world != frame).then(|| crate::mat_inverse(&world).map(|inv| (b.name.clone(), crate::mat_mul(&inv, &frame)))).flatten()
+            })
+            .collect();
+        if frames.is_empty() {
+            return None;
+        }
+        Some(ToolFrames(TOOL_FRAMES.with(|t| std::mem::replace(&mut *t.borrow_mut(), frames))))
+    }
+}
+
+impl Drop for ToolFrames {
+    fn drop(&mut self) {
+        let before = std::mem::take(&mut self.0);
+        TOOL_FRAMES.with(|t| *t.borrow_mut() = before);
+    }
+}
+
+/// [`placement_digest`] of a feature with drawn tools: the placements, when it names the bodies
+/// it changes (they may lie in another component, where its tools meet them, #3383); nothing
+/// otherwise, as it then changes only bodies of its own component.
+fn drawn_tools_digest(doc: &Document, f: &Feature) -> u64 {
+    let targets = match &f.kind {
+        FeatureKind::Extrude { targets, .. }
+        | FeatureKind::Revolve { targets, .. }
+        | FeatureKind::Loft { targets, .. }
+        | FeatureKind::Sweep { targets, .. }
+        | FeatureKind::Pipe { targets, .. }
+        | FeatureKind::Coil { targets, .. } => !targets.is_empty(),
+        _ => false,
+    };
+    if (!targets && f.participants.is_empty()) || (doc.occurrences.is_empty() && doc.body_offsets.is_empty()) {
+        return 0;
+    }
+    placements_hash(doc)
+}
+
+/// The matrix taking the evaluated feature's drawn tools into body `name`'s frame (`None`: the
+/// same frame).
+fn tool_frame(name: &str) -> Option<Mat> {
+    TOOL_FRAMES.with(|t| t.borrow().iter().find(|(n, _)| n == name).map(|(_, m)| *m))
+}
+
+/// The model as the evaluated feature's drawn tools meet it: the bodies it changes (`targets`,
+/// else the feature's participants; `*` for all) that are placed differently, moved into its
+/// component's frame. A through-all extent, and every test of where a tool meets its targets, is
+/// measured on it, so a target in another, moved component is met where it is shown (#3383).
+/// The model itself when no such body is placed differently.
+fn targets_as_shown<'a>(st: &'a ModelState, f: &Feature, targets: &[String]) -> Result<std::borrow::Cow<'a, ModelState>> {
+    let names: &[String] = if targets.is_empty() { &f.participants } else { targets };
+    let all = names.iter().any(|n| n == "*");
+    let mut out: Option<ModelState> = None;
+    for (i, b) in st.bodies.iter().enumerate() {
+        if !(all || names.contains(&b.name)) {
+            continue;
+        }
+        let Some(back) = tool_frame(&b.name).and_then(|m| crate::mat_inverse(&m)) else { continue };
+        let shown = out.get_or_insert_with(|| st.clone());
+        let mut moved = ModelBody::new(b.name.clone(), kernel::transform_matrix(&b.body, back)?, b.feature);
+        moved.component = b.component;
+        moved.transferred = b.transferred;
+        moved.names = crate::naming::NameCell::same(b);
+        if let Some(slot) = shown.bodies.get_mut(i) {
+            *slot = moved;
+        }
+    }
+    Ok(match out {
+        Some(shown) => std::borrow::Cow::Owned(shown),
+        None => std::borrow::Cow::Borrowed(st),
+    })
+}
+
+/// `tool` moved by `m` (unchanged for `None`).
+fn tool_in(tool: &Traced, m: Option<Mat>) -> Result<Traced> {
+    match m {
+        Some(m) => Ok(Traced::step(kernel::transform_matrix(&tool.body, m)?, &[tool])),
+        None => Ok(tool.clone()),
+    }
+}
+
 pub fn state_in_frame<'a>(doc: &Document, st: &'a ModelState, comp: u64) -> std::borrow::Cow<'a, ModelState> {
     state_in_frame_at(doc, st, comp, doc.component_transform(comp))
 }
@@ -5412,13 +6353,19 @@ pub fn face_point_names(doc: &Document, st: &ModelState, kind: &FeatureKind, com
         return crate::naming::face_names_at(st, &pts);
     }
     let fst = face_point_state(doc, st, kind, comp);
+    let normal = match kind {
+        FeatureKind::Extrude { sketch, .. } => {
+            st.sketch(sketch.0).and_then(|ss| sketch_in_feature_frame(doc, ss, comp).ok()).map(|ss| ss.plane.normal())
+        }
+        _ => None,
+    };
     pts.iter()
         .map(|p| {
             fst.bodies
                 .iter()
                 .filter(|b| !b.body.is_mesh())
                 .filter_map(|b| {
-                    let (d, fi) = crate::appearance::nearest_face(b, *p)?;
+                    let (d, fi) = nearest_object_face(b, *p, normal)?;
                     (d <= (b.body.size() * 1e-3).max(1e-3)).then_some((d, b, fi))
                 })
                 .min_by(|a, b| a.0.total_cmp(&b.0))
@@ -5531,11 +6478,19 @@ impl PlacedBodies {
             Some((_, placed)) => {
                 let mut fresh = ModelBody::new(name, placed.body.clone(), b.feature);
                 fresh.mesh = placed.mesh.clone();
+                fresh.mesh_placement = placed.mesh_placement.clone();
                 fresh.plan = placed.plan.clone();
                 fresh.plan_mesh = placed.plan_mesh.clone();
                 fresh
             }
-            None => ModelBody::new(name, kernel::transform_matrix(&b.body, *m).unwrap_or_else(|_| b.body.clone()), b.feature),
+            None => match kernel::place_matrix(&b.body, *m) {
+                Ok(body) => {
+                    let mut fresh = ModelBody::new(name, body, b.feature);
+                    fresh.mesh_placement = placed_mesh::PlacedMesh::new(b, m).map(Arc::new);
+                    fresh
+                }
+                Err(_) => ModelBody::new(name, b.body.clone(), b.feature),
+            },
         }
     }
 }
@@ -5570,26 +6525,46 @@ pub fn world_state_reusing(doc: &Document, st: &ModelState, placed_before: &mut 
         path
     };
     let mut out = ModelState { body_counter: st.body_counter, ..Default::default() };
-    for (comp, path, m) in doc.placements() {
+    let placements = doc.placements();
+    // A body moved in from another component keeps its place (its offset).
+    let body_matrix = |b: &ModelBody, m: &crate::Mat| doc.model_body_offset(b).map(|o| crate::mat_mul(m, o)).unwrap_or(*m);
+    // Every body placed elsewhere than its definition, placed on all cores: a large assembly
+    // places hundreds of parts, each a B-rep transform.
+    let mut jobs = Vec::new();
+    for (comp, path, m) in &placements {
+        for b in st.bodies.iter().filter(|b| doc.model_body_component(b) == *comp) {
+            let bm = body_matrix(b, m);
+            if !crate::is_identity(&bm) {
+                jobs.push((b, bm, doc.world_body_name(st, &b.name, *comp, path)));
+            }
+        }
+    }
+    let mut moved = kernel::map_on_threads(&jobs, 16, |(b, bm, name)| placed_before.placed(b, bm, name.clone())).into_iter().zip(&jobs);
+    for (comp, path, m) in placements {
         let primary = path == first_path(comp);
         let ident = crate::is_identity(&m);
         for b in st.bodies.iter().filter(|b| doc.model_body_component(b) == comp) {
-            let name = doc.world_body_name(st, &b.name, comp, &path);
-            // A body moved in from another component keeps its place (its offset).
-            let bm = doc.model_body_offset(b).map(|o| crate::mat_mul(&m, o)).unwrap_or(m);
+            let bm = body_matrix(b, &m);
             // Identical geometry also shares its display mesh cell with the definition.
             // A changed placement keeps a distinct mesh, at that placement's coordinates.
             let mut placed = if crate::is_identity(&bm) {
                 let mut placed = b.clone();
-                placed.name = name;
+                placed.name = doc.world_body_name(st, &b.name, comp, &path);
                 placed
             } else {
-                let placed = placed_before.placed(b, &bm, name);
+                // The same order as the jobs: this body's, made above (again here if it failed).
+                let placed = match moved.next() {
+                    Some((Some(placed), _)) => placed,
+                    Some((None, (_, _, name))) => placed_before.placed(b, &bm, name.clone()),
+                    None => placed_before.placed(b, &bm, doc.world_body_name(st, &b.name, comp, &path)),
+                };
                 placed_now.by_source.insert(placed_key(b, &bm), (b.clone(), placed.clone()));
                 placed
             };
             // World states keep their previous display-only evaluation-key semantics.
             placed.key = 0;
+            // With the model body's own frame, so its place is told apart from the placement's.
+            placed.source_key = b.geometry_key().unwrap_or(0);
             placed.source_name = Some(b.definition_name().to_string());
             placed.source_transform = crate::mat_mul(&bm, &b.source_transform);
             placed.component = comp;
@@ -5629,7 +6604,7 @@ pub fn world_state_reusing(doc: &Document, st: &ModelState, placed_before: &mut 
                 let mut t2 = t.clone();
                 let frame = st.body(&t.body).and_then(|body| doc.model_body_offset(body)).map(|offset| crate::mat_mul(&m, offset)).unwrap_or(m);
                 t2.axis_point = crate::apply_point(&frame, t.axis_point);
-                t2.axis = crate::apply_vector(&frame, t.axis);
+                t2.axis = crate::apply_vector(&frame, *t.axis).unit().unwrap_or(t.axis);
                 out.threads.push(t2);
             }
         }
@@ -5698,6 +6673,8 @@ mod world_placement_cache_tests {
         assert!(Arc::ptr_eq(&source.mesh, &first.mesh), "unchanged geometry must retain the shared display mesh cell");
         assert_eq!(first.key, 0);
         assert_eq!(placed.key, 0);
+        // Each placement has its own geometry identity, for work measured on it.
+        assert!(first.geometry_key().is_some() && first.geometry_key() != placed.geometry_key());
         assert!(!Arc::ptr_eq(&source.mesh, &placed.mesh), "a transformed mesh cannot be reused without mapping coordinates");
         assert_eq!(first.source_name.as_deref(), Some("Block"));
         assert_eq!(placed.source_name.as_deref(), Some("Block"));
@@ -5753,15 +6730,24 @@ mod chain_tests {
         m.evaluate(&doc);
         let st = m.state();
         let b = &st.bodies[0];
-        let pts = smooth_chain(b, &[Vec3::new(20.0, 15.0, 20.0)]);
-        let faces: std::collections::BTreeSet<usize> = pts.iter().filter_map(|p| crate::appearance::face_index_at(b, *p)).collect();
+        let pts = tangent_face_chain(b, &[Vec3::new(20.0, 15.0, 20.0)]);
+        let faces: std::collections::BTreeSet<usize> = pts.iter().map(|(index, _)| *index).collect();
         assert_eq!(faces.len(), 3, "{faces:?}");
+        assert_eq!(pts.len(), faces.len());
+        for (index, point) in &pts {
+            assert_eq!(crate::appearance::face_index_at(b, *point), Some(*index));
+        }
+        assert_eq!(tangent_face_chain(b, &[Vec3::new(20.0, 15.0, 20.0); 2]), pts);
     }
 }
 
 #[cfg(test)]
 #[path = "eval_cost_tests.rs"]
 mod cost_tests;
+
+#[cfg(test)]
+#[path = "eval_whole_face_tests.rs"]
+mod whole_face_tests;
 
 #[cfg(test)]
 mod body_name_tests {

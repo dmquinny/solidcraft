@@ -92,7 +92,7 @@ fn a_slanted_hole_stays_on_its_axis_when_its_face_moves() {
 // part: a 40 x 40 x 20 box at z 0..20 (32000 mm³).
 
 fn box_part(s: &mut Session) {
-    run(s, "solid.box", json!({"length": 40, "width": 40, "height": 20, "name": "Part", "position": [20, 20, 0]}));
+    run(s, "solid.box", json!({"length": 40, "width": 40, "height": 20, "name": "Part"}));
 }
 
 /// A sketch named `Pts` on the XY plane lifted to `z`, holding the given points (ids p0, p1, ...).
@@ -321,4 +321,97 @@ fn sketch_floating_in_the_gap_touching_neither_still_drills_down() {
     drill(&mut s, &["pt10_0".to_string()], json!({"depth": 4}));
     near(base - volume(&mut s), pi() * 25.0 * 4.0);
     assert!(!solid_at(&s, 20.0, 20.0, 4.0) && solid_at(&s, 20.0, 20.0, 16.0));
+}
+
+/// #2387: a drill point crossing the sloping back of a wall must leave a real hole.
+#[test]
+fn drilled_sketch_points_break_through_a_sloping_back_face() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 0], "x_dir": [1, 0, 0], "y_dir": [0, 0, 1]}, "name": "Wall"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [15, 0], [15, 30], [7.5, 30], [0, 0]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Wall", "distance": 40, "direction": "negative"}));
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [15, 0, 0], "x_dir": [0, 1, 0], "y_dir": [0, 0, 1]}, "name": "Pts"}));
+    run(&mut s, "sketch.line", json!({"points": [[5, 16], [10, 16]], "ids": ["l10"]}));
+    run(&mut s, "sketch.point", json!({"point": [30, 16], "id": "p12"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(
+        &mut s,
+        "solid.hole",
+        json!({"sketch": "Pts", "points": ["l10.end", "p12"], "depth": "10 mm", "diameter": "5 mm", "type": "drilled", "tip_angle": "118 deg", "name": "H"}),
+    );
+    let id = s.doc.find_feature("H").unwrap().id;
+    let result = s.model.result(id).unwrap();
+    assert!(result.error.is_none());
+    assert!(result.boolean_diagnostics.unverified().is_none());
+    // The cylindrical bore and cone, less the oblique conical cap outside x = z/4.
+    let r = 2.5;
+    let k = 59f64.to_radians().tan();
+    let tip = r / k;
+    let outside = 4.0 - (5.0 - tip);
+    let cap = pi() * k * k * outside.powi(3) / (3.0 * (1.0 - (k / 4.0).powi(2)).powf(1.5));
+    let expected = 2.0 * (pi() * r * r * (10.0 + tip / 3.0) - cap);
+    let left = volume(&mut s);
+    // The measured curved faces are tessellated; 0.05 mm³ is 0.013% of the removed material.
+    assert!((13_500.0 - left - expected).abs() < 0.05, "removed {} vs {expected}", 13_500.0 - left);
+    assert_eq!(s.model.state().bodies.len(), 1);
+    for b in &s.model.state().bodies {
+        assert!(b.body.validity().is_empty());
+        assert_eq!(b.body.shell_count(), 1);
+    }
+    for y in [10.0, 30.0] {
+        assert!(!solid_at(&s, 10.0, y, 16.0), "bore at y = {y}");
+        assert!(!solid_at(&s, 4.2, y, 16.0), "tip breaks through at y = {y}");
+        assert!(solid_at(&s, 10.0, y + 3.0, 16.0), "material beside the bore at y = {y}");
+    }
+    let saved = s.doc.to_json();
+    run(&mut s, "edit.undo", json!({}));
+    near(volume(&mut s), 13_500.0);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.doc.to_json(), saved);
+    near(volume(&mut s), left);
+    let mut reopened = Session::new(solidcraft_doc::Document::from_json(&saved).unwrap());
+    assert!(reopened.model.result(id).unwrap().error.is_none());
+    near(volume(&mut reopened), left);
+}
+
+/// Back (z 0…6) under a smaller Front (z 14…20), and a sketch on Front's top face with points
+/// over Front (`in`) and beyond its edges, over Back (`out1`, `out2`).
+fn front_and_back(s: &mut Session) {
+    run(s, "solid.box", json!({"length": 40, "width": 40, "height": 6, "body_name": "Back"}));
+    run(s, "solid.box", json!({"corner": [10, 10, 14], "length": 20, "width": 20, "height": 6, "body_name": "Front"}));
+    run(s, "sketch.create", json!({"plane": {"face": [20, 20, 20]}, "name": "Pts", "project_edges": false}));
+    for (id, p) in [("in", [20, 20]), ("out1", [5, 5]), ("out2", [35, 35])] {
+        run(s, "sketch.point", json!({"point": p, "id": id}));
+    }
+    run(s, "sketch.finish", json!({}));
+}
+
+/// #2882: holes at the points of a sketch on a body's face drill that body, never one behind it.
+#[test]
+fn holes_from_a_sketch_on_a_face_drill_that_body_only() {
+    let mut s = Session::default();
+    front_and_back(&mut s);
+    let base = volume(&mut s);
+    run(&mut s, "solid.hole", json!({"sketch": "Pts", "points": ["in", "out1", "out2"], "diameter": 5, "depth": 4, "name": "H"}));
+    assert_eq!(s.doc.find_feature("H").unwrap().participants, vec!["Front".to_string()]);
+    near(base - volume(&mut s), pi() * 6.25 * 4.0);
+    assert!(!solid_at(&s, 20.0, 20.0, 18.0), "drilled into Front");
+    for (x, y) in [(5.0, 5.0), (35.0, 35.0), (20.0, 20.0)] {
+        assert!(solid_at(&s, x, y, 5.5) && solid_at(&s, x, y, 3.0), "Back is not drilled at ({x}, {y})");
+    }
+    let mut reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    near(base - volume(&mut reopened), pi() * 6.25 * 4.0);
+}
+
+/// Through all from Front's face stops at Front; `targets` picks another body to drill instead.
+#[test]
+fn face_sketch_holes_through_all_stay_in_their_body_unless_targets_say_otherwise() {
+    let mut s = Session::default();
+    front_and_back(&mut s);
+    run(&mut s, "solid.hole", json!({"sketch": "Pts", "points": ["in"], "diameter": 5, "name": "H"}));
+    assert!(!solid_at(&s, 20.0, 20.0, 15.0) && solid_at(&s, 20.0, 20.0, 3.0));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.hole", json!({"sketch": "Pts", "points": ["in"], "diameter": 5, "targets": ["Back"], "name": "H"}));
+    assert!(solid_at(&s, 20.0, 20.0, 15.0) && !solid_at(&s, 20.0, 20.0, 3.0));
 }

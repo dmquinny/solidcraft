@@ -110,10 +110,21 @@ pub fn bounds(s: &Session) -> Aabb3 {
 
 /// [`bounds`], with the browser's Sketches folder shown (`sketches`) or hidden.
 pub fn visible_bounds(s: &Session, sketches: bool) -> Aabb3 {
+    bounds_by(s, sketches, |body| body.mesh().bounds())
+}
+
+/// [`visible_bounds`] without meshing anything: a body not meshed yet counts with its outline
+/// ([`solidcraft_kernel::Body::outline_bounds`]), which a face curving out past all of its edges
+/// can exceed. Frames a design whose bodies are still being meshed.
+pub fn unmeshed_bounds(s: &Session, sketches: bool) -> Aabb3 {
+    bounds_by(s, sketches, |body| body.cached_mesh().map(|m| m.bounds()).unwrap_or_else(|| body.outline_bounds()))
+}
+
+fn bounds_by(s: &Session, sketches: bool, of: impl Fn(&solidcraft_doc::ModelBody) -> Aabb3) -> Aabb3 {
     let st = s.world_state();
     let mut b = Aabb3::EMPTY;
     for body in st.bodies.iter().filter(|x| s.body_visible(&x.name)) {
-        b = b.union(&body.mesh().bounds());
+        b = b.union(&of(body));
     }
     for ss in st.sketches.iter().filter(|x| sketch_drawn(s, x.feature, sketches)) {
         // All four corners: on a tilted plane two opposite ones don't span the rectangle.
@@ -301,7 +312,8 @@ pub fn sketch_curve_visible(sk: &Sketch, i: usize) -> bool {
 }
 
 /// Point roles shown and picked individually. Associated offsets keep their generated
-/// fit nodes private until their association is broken. Build once per sketch/frame.
+/// fit nodes private until their association is broken, except an open offset's two ends,
+/// which other curves snap and constrain to. Build once per sketch/frame.
 pub struct SketchPointVisibility<'a> {
     hidden: std::collections::HashSet<&'a str>,
 }
@@ -321,7 +333,9 @@ impl<'a> SketchPointVisibility<'a> {
         let mut hidden: std::collections::HashSet<&str> =
             sk.points.iter().filter(|p| p.link.as_deref().is_some_and(|l| text.contains(l))).map(|p| p.id.as_str()).collect();
         for curve in sk.curves.iter().filter(|c| outputs.contains(c.id.as_str())) {
-            hidden.extend(curve.kind.point_ids().into_iter().filter_map(|i| sk.points.get(i).map(|p| p.id.as_str())));
+            let ends = curve.kind.ends();
+            let interior = curve.kind.point_ids().into_iter().filter(|i| ends.is_none_or(|(a, b)| *i != a && *i != b));
+            hidden.extend(interior.filter_map(|i| sk.points.get(i).map(|p| p.id.as_str())));
         }
         Self { hidden }
     }
@@ -332,7 +346,7 @@ impl<'a> SketchPointVisibility<'a> {
 }
 
 /// Should sketch point `i` be drawn or picked individually? Text outlines and derived
-/// offset fit nodes are private. Batch callers use [`SketchPointVisibility`].
+/// offset fit nodes (but an open offset's ends) are private. Batch callers use [`SketchPointVisibility`].
 pub fn sketch_point_visible(sk: &Sketch, i: usize) -> bool {
     sk.points.get(i).is_some_and(|p| SketchPointVisibility::new(sk).takes(p))
 }
@@ -347,6 +361,20 @@ pub fn scene(s: &Session, cam: &Camera) -> Scene {
 /// sketch's Slice), so model renders match the window.
 pub fn scene_with_section(s: &Session, cam: &Camera, section: Option<(Vec3, Vec3)>) -> Scene {
     scene_with_guides(s, cam, section, Guides::default())
+}
+
+/// The plane of the sketch that is open, if any: it always shows a grid, whatever the Grid switch
+/// says (outside a sketch the grid is the user's choice).
+pub fn open_sketch_plane(s: &Session) -> Option<Plane> {
+    let id = s.active_sketch?;
+    s.world_state().sketch(id).map(|ss| ss.plane)
+}
+
+/// The grid on a sketch plane: its centre (the view target's foot on the plane, snapped to the
+/// major step in the plane's own axes) and the plane's x and y directions.
+pub fn sketch_grid_frame(plane: &Plane, target: Vec3, major: f64) -> (Vec3, Vec3, Vec3) {
+    let snap = |d: Vec3| d * (((target - plane.origin).dot(d) / major).round() * major);
+    (plane.origin + snap(plane.x) + snap(plane.y), plane.x, plane.y)
 }
 
 /// What a headless render draws besides the model: the ground grid and the origin's axes.
@@ -434,12 +462,17 @@ fn build_scene(
     if guides.grid {
         let (minor, major) = grid_step(cam.half_height());
         let ext = (cam.half_height() * 3.0 / major).ceil() * major;
-        let tf = cam.to_frame(cam.target);
-        // Headless pictures keep the grid on the ground, the viewport's default.
-        let (u, v) = (Vec3::X, Vec3::Y);
-        let snap = |a: Vec3| a * ((tf.dot(a) / major).round() * major);
-        let c = snap(u) + snap(v);
-        let w = |p: Vec3| cam.from_frame(p);
+        // Headless pictures keep the grid on the ground, the viewport's default; an open sketch
+        // has its own plane's grid (world coordinates, no camera frame).
+        let (c, u, v, w): (Vec3, Vec3, Vec3, Box<dyn Fn(Vec3) -> Vec3>) = if let Some(pl) = open_sketch_plane(s) {
+            let (c, u, v) = sketch_grid_frame(&pl, cam.target, major);
+            (c, u, v, Box::new(|p| p))
+        } else {
+            let tf = cam.to_frame(cam.target);
+            let (u, v) = (Vec3::X, Vec3::Y);
+            let snap = |a: Vec3| a * ((tf.dot(a) / major).round() * major);
+            (snap(u) + snap(v), u, v, Box::new(|p| cam.from_frame(p)))
+        };
         let n = ((ext / minor) as i64).clamp(1, 400);
         for i in -n..=n {
             let t = i as f64 * minor;
@@ -479,7 +512,10 @@ fn build_scene(
         } else {
             s.doc.face_colors(body).into_iter().map(|(f, l)| (f as u32, Rgb(l.color[0], l.color[1], l.color[2]))).collect()
         };
-        sc.meshes.push(SceneMesh { mesh: Arc::clone(&mesh), color, face_colors });
+        // A see-through appearance is drawn see-through, as the viewport draws it; a selected
+        // body is drawn solid, so the selection colour reads.
+        let opacity = if selected { 1.0 } else { s.doc.model_body_opacity(body) as f32 };
+        sc.meshes.push(SceneMesh { mesh: Arc::clone(&mesh), color, face_colors, opacity });
         for (i, e) in mesh.edges.iter().enumerate() {
             if !mesh.shaded_edge_visible(i) {
                 continue;
@@ -508,43 +544,122 @@ fn build_scene(
 /// Where the plane through `o` with normal `n` cuts a mesh: one segment per crossed triangle,
 /// nudged a hair to the kept side (so the clip leaves them drawn).
 pub fn section_segments(m: &solidcraft_geom::Mesh, o: Vec3, n: Vec3) -> Vec<(Vec3, Vec3)> {
-    let eps = 1e-4 * (1.0 + m.bounds().diagonal());
+    let eps = section_nudge(m);
     let mut out = Vec::new();
     for t in &m.triangles {
-        let Some(p) = m.tri(t) else { continue };
-        let d = p.map(|q| n.dot(q - o));
-        let mut pts = Vec::with_capacity(2);
-        for (i, j) in [(0, 1), (1, 2), (2, 0)] {
-            if (d[i] < 0.0) != (d[j] < 0.0) {
-                let s = d[i] / (d[i] - d[j]);
-                pts.push(p[i] + (p[j] - p[i]) * s - n * eps);
-            }
-        }
-        if let [a, b] = pts[..] {
-            out.push((a, b));
-        }
+        cut_triangle(m, t, o, n, eps, &mut out);
     }
     out
 }
 
+/// How far [`section_segments`] nudges the cut to the kept side.
+fn section_nudge(m: &solidcraft_geom::Mesh) -> f64 {
+    1e-4 * (1.0 + m.bounds().diagonal())
+}
+
+/// The segment where the plane through `o` with normal `n` crosses triangle `t`, if it does.
+fn cut_triangle(m: &solidcraft_geom::Mesh, t: &[u32; 3], o: Vec3, n: Vec3, eps: f64, out: &mut Vec<(Vec3, Vec3)>) {
+    let Some(p) = m.tri(t) else { return };
+    let d = p.map(|q| n.dot(q - o));
+    let mut pts = Vec::with_capacity(2);
+    for (i, j) in [(0, 1), (1, 2), (2, 0)] {
+        if (d[i] < 0.0) != (d[j] < 0.0) {
+            let s = d[i] / (d[i] - d[j]);
+            pts.push(p[i] + (p[j] - p[i]) * s - n * eps);
+        }
+    }
+    if let [a, b] = pts[..] {
+        out.push((a, b));
+    }
+}
+
+/// A mesh's triangles sorted into slabs along one normal, so cuts with that normal at any
+/// height look only at the triangles of one slab: dragging a Section Analysis keeps the normal
+/// and moves the cut, and an imported part can have millions of triangles. The same segments
+/// as [`section_segments`].
+pub struct SectionIndex {
+    normal: Vec3,
+    /// The lowest height (`normal · p`) of the mesh, and the slab thickness.
+    start: f64,
+    step: f64,
+    /// Per slab, the triangles whose heights reach into it.
+    slabs: Vec<Vec<u32>>,
+    eps: f64,
+}
+
+/// Slabs a [`SectionIndex`] makes, at most.
+const SECTION_SLABS: usize = 4096;
+
+impl SectionIndex {
+    pub fn new(m: &solidcraft_geom::Mesh, normal: Vec3) -> SectionIndex {
+        let heights: Vec<Option<(f64, f64)>> = m
+            .triangles
+            .iter()
+            .map(|t| {
+                let d = m.tri(t)?.map(|q| normal.dot(q));
+                Some((d[0].min(d[1]).min(d[2]), d[0].max(d[1]).max(d[2])))
+            })
+            .collect();
+        let (lo, hi) = heights.iter().flatten().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), (l, h)| (a.min(*l), b.max(*h)));
+        let count = if lo.is_finite() && hi.is_finite() { (m.triangles.len() / 64).clamp(1, SECTION_SLABS) } else { 0 };
+        let step = if count > 0 && hi > lo { (hi - lo) / count as f64 } else { 1.0 };
+        let mut index = SectionIndex { normal, start: lo, step, slabs: vec![Vec::new(); count], eps: section_nudge(m) };
+        for (i, h) in heights.iter().enumerate() {
+            let (Some((l, h)), Ok(i)) = (h, u32::try_from(i)) else { continue };
+            for k in index.slab(*l)..=index.slab(*h) {
+                if let Some(slab) = index.slabs.get_mut(k) {
+                    slab.push(i);
+                }
+            }
+        }
+        index
+    }
+
+    /// The normal this index was made for.
+    pub fn normal(&self) -> Vec3 {
+        self.normal
+    }
+
+    fn slab(&self, height: f64) -> usize {
+        let k = ((height - self.start) / self.step).floor();
+        if k.is_finite() { (k.max(0.0) as usize).min(self.slabs.len().saturating_sub(1)) } else { 0 }
+    }
+
+    /// [`section_segments`] of `m` (the mesh this index was made from) at the plane through
+    /// `o` with this index's normal.
+    pub fn segments(&self, m: &solidcraft_geom::Mesh, o: Vec3) -> Vec<(Vec3, Vec3)> {
+        let mut out = Vec::new();
+        let at = self.normal.dot(o);
+        if self.slabs.is_empty() || !at.is_finite() || at < self.start {
+            return out;
+        }
+        for i in self.slabs.get(self.slab(at)).into_iter().flatten() {
+            if let Some(t) = m.triangles.get(*i as usize) {
+                cut_triangle(m, t, o, self.normal, self.eps, &mut out);
+            }
+        }
+        out
+    }
+}
+
 /// Is a sketch drawn? The active one is; others unless hidden. Finished sketches are hidden
-/// once a feature uses them, like Fusion's default, unless shown one by one.
+/// once a feature uses them, by default, unless shown one by one.
 pub fn sketch_shown(s: &Session, id: u64) -> bool {
     sketch_drawn(s, id, true)
 }
 
-/// Is a sketch drawn, with the browser's Sketches folder shown (`folder`) or hidden? The sketch
-/// being edited always is; otherwise not when hidden, nor in a hidden component, and one used by
-/// a feature only when shown on its own.
+/// Is a sketch drawn, with sketches shown (`folder`) or hidden? The sketch being edited always
+/// is; otherwise not when hidden, nor in a hidden component, Sketches folder or group (even one
+/// shown on its own), and one used by a feature only when shown on its own.
 pub fn sketch_drawn(s: &Session, id: u64, folder: bool) -> bool {
     let v = &s.visibility;
     if s.active_sketch == Some(id) {
         return true;
     }
-    if v.hidden_sketches.contains(&id) || !sketch_component_visible(s, id) {
+    if !folder || v.hidden_sketches.contains(&id) || !sketch_component_visible(s, id) || s.feature_folder_hidden(id, "sketches") {
         return false;
     }
-    v.shown_sketches.contains(&id) || (folder && !sketch_consumed(s, id))
+    v.shown_sketches.contains(&id) || !sketch_consumed(s, id)
 }
 
 /// Is the placement a sketch is drawn at shown (the active one while its component is being

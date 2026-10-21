@@ -42,9 +42,18 @@ rejected before any jobs or output directories are created. The maximum seed
 its steps, how it ended (ok, or the kind and the start of the error it was refused with), and
 for the design it left the bodies' total volume and area (within a relative 1e-6) and their
 face, edge and shell counts (exact). `tests::robustness_goldens` fails on any change, better or
-worse, so a kernel change shows every seed it moves. Pull requests that touch `crates/kernel`
-run every 8th seed; pushes to `main` and the nightly run them all. Each seed is its own test
+worse, so a kernel change shows every seed it moves. Pull requests that can change them (the
+kernel, engine, doc, sketch and geom crates) run every seed but the slowest few (`SLOW_SEEDS` in
+`.github/workflows/ci.yml`, about four fifths of their time); the merge queue, pushes to `main`
+and the nightly run them all. Each seed is its own test
 (`seed_00` … `seed_95`), so the CI shards and their cores share them out.
+
+Explicit `platforms.<os>.seeds` records override only the listed seeds on that
+operating system; all other seeds keep the shared records and strict tolerances.
+The first four Windows records were independently reproduced on unmodified main
+`1e984c8e`; seed 94 was independently reproduced on unmodified main `c5992386`
+after the extrusion rebase. Both match the extrusion branch. Recording on a platform
+with such entries updates its changed seeds and preserves shared references.
 
 To record an intended change, give the reason:
 
@@ -53,6 +62,33 @@ ROBUSTNESS_GOLDENS_BLESS="why it changed" cargo test --profile ci -p solidcraft-
 ```
 
 The changed seeds and the reason are added to the file's `notes`; say why in the pull request too.
+
+The generator feeds the current geometry's bounds and face/edge picks back into later
+commands. The same RNG seed can therefore generate different command coordinates or picks
+on different math libraries. The original inputs are retained, including near-contact cases.
+Platform snapshots track repeatability; they do not certify cross-platform geometric
+equivalence or resolve the numerical differences tracked in #924.
+
+### Independent measurement checks
+
+The seeded snapshots also have checks against geometric references. Seed 34 starts with a
+quarter cylinder of radius 15 and height 12.5 (`x,y >= 0`, `-12.5 <= z <= 0`), cuts it with a
+radius-2.5 sphere centred at (10, 12.5, 0), then drills an independent radius-2, depth-5 blind
+hole from (0, 7.5, -6.25) along +X, with a 118-degree tip.
+Subtracting the sphere/cylinder intersection and the drill gives **2134.404133 mm³** and
+**1086.316691 mm²**. The drill has tip height `2 / tan(59 degrees)`; the spherical bite is
+integrated over the intersection of the radius-15 disk and the sphere's projected radius-2.5
+disk. Integrating the lower spherical hemisphere and the removed cylinder-wall patch gives
+the surface reference. The test compares the chordal measurement with these independent
+references at 5e-5 relative error.
+
+A fixed command replay recorded from seed 67 checks two disconnected shells kept in one
+body after a cut (#2247), with a combined analytic surface inventory of 22 planar, six
+cylindrical and one conical face after merging redundant subdivisions. The commands are
+fixed because the generator chooses later operations from the current body and edge layout;
+changes to body grouping can therefore change the generated design. This preserves the
+original geometric reference independently of those choices. These checks supplement the
+snapshots' stricter repeatability comparisons of raw topology and tessellated measurements.
 
 ## Successful Boolean retries
 
@@ -63,6 +99,11 @@ tolerances and leaves the exact result, so it is recorded but not warned about.
 `timeline.inspect` and `doc.inspect` expose every retry in the feature's
 `boolean_diagnostics`, including the strategy and the applied translation,
 rotation, face offset and tessellation tolerance in millimetres/radians.
+Candidates those retries discarded before measuring them are listed in its
+`rejected`, with the reason: a candidate with an edge further outside the
+operands than 5% of their size cannot be their union, cut or intersection,
+and meshing one (a trim loop running metres along a cone's continuation)
+could take minutes or never finish (#3020).
 
 A common shift of both operands is reversed on the result. Coincident-face
 separation and bore offsets describe temporary working geometry; they are not
@@ -170,7 +211,7 @@ Found by QA on new users' first steps, each with an engine test against the anal
   round runs round the corners as spindle tori (the tube wider than its circle), which the
   offset now takes. Volume within 1e-5 of the analytic one.
 - **Shell thicker than or equal to a round** (r2 rounds shelled 2 mm): the round's inside
-  collapses to a sharp edge, as in Fusion, instead of "a cylinder shrinks to nothing".
+  collapses to a sharp edge, as intended, instead of "a cylinder shrinks to nothing".
 - **Shell thinner than a round tangent to the open face** (1.5 mm): every face moves in
   (tangencies keep) and the opening is the open face's copy swept out through the body.
 - **Shell after a drilled hole** (its tip a cone).
@@ -185,7 +226,7 @@ Found by QA on new users' first steps, each with an engine test against the anal
 ### Known limitations (counted as "not supported", with a clear message)
 
 - A shell thicker than a wall or a step: the moved faces would cross and the cavity turn
-  inside out. Fusion fills such places solid; we need a topology-changing offset.
+  inside out. The intended behaviour fills such places solid; we need a topology-changing offset.
 - Fillets and chamfers between two curved faces, or ending at faces that aren't planar.
 
 ### Still failing

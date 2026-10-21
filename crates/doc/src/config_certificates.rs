@@ -823,7 +823,8 @@ impl Document {
         let stem = |index: usize| names.faces.get(index).map(|name| crate::naming::strip_piece(name));
         let seed: Vec<usize> =
             indices.into_iter().filter(|index| stem(*index).is_some_and(|name| name.starts_with(&own) && !name.contains('@'))).collect();
-        let ambiguous = || DocError::Unknown("attached planar face certificate is missing or ambiguous".into());
+        let feature = self.feature(origin).map_or_else(|| format!("F{origin}"), |feature| feature.name.clone());
+        let ambiguous = || DocError::Invalid(format!("the attached flat face of {feature} on `{}` is missing or ambiguous", body.name));
         let first = seed.first().and_then(|index| stem(*index)).ok_or_else(ambiguous)?;
         if seed.iter().any(|index| stem(*index) != Some(first)) {
             return Err(ambiguous());
@@ -864,7 +865,15 @@ mod tests {
 
     fn solved(mut sketch: solidcraft_sketch::Sketch) -> SolvedSketch {
         let report = solidcraft_sketch::solve(&mut sketch);
-        SolvedSketch { feature: 1, name: "sources".into(), plane: solidcraft_geom::Plane::XY, sketch, report, profiles: Vec::new() }
+        SolvedSketch {
+            feature: 1,
+            name: "sources".into(),
+            plane: solidcraft_geom::Plane::XY,
+            sketch,
+            report,
+            profiles: Vec::new(),
+            ends: Default::default(),
+        }
     }
 
     #[test]

@@ -5,8 +5,7 @@
 //! browser, which has no file picker for libraries, it offers the ones the web app fetched from
 //! the server's `Libraries` folder (apps/solidcraft-web/src/files.rs).
 use crate::dialogs_appearance::selected_params;
-use crate::{SolveApp, dialogs::row_label, dialogs_appearance::Ap, selection::SelInput, theme::Tokens};
-use egui::RichText;
+use crate::{SolveApp, dialogs_appearance::Ap, selection::SelInput, ui_kit};
 use serde_json::{Value, json};
 use solidcraft_engine::io::catalog::{Catalog, Definition, Entry};
 use std::sync::Arc;
@@ -110,15 +109,14 @@ fn load(app: &mut SolveApp, library: &mut LocalLibrary) -> Result<String, String
 }
 
 pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &[SelInput]) {
-    row_label(ui, "Local library");
-    ui.vertical(|ui| {
+    ui_kit::section(ui, "local_library", "Local library", true, |ui| {
         #[cfg(not(target_arch = "wasm32"))]
         open_rows(app, ui, k);
         #[cfg(target_arch = "wasm32")]
         server_rows(app, ui, k);
         entry_rows(app, ui, k, inputs);
-        ui.checkbox(&mut k.local.overwrite, crate::i18n::tr_label("Replace existing library file"));
-        let save = ui.button(crate::i18n::tr_label("Export design library..."));
+        ui_kit::checkbox(ui, crate::i18n::tr_label("Replace existing library file"), &mut k.local.overwrite);
+        let save = ui_kit::button(ui, crate::i18n::tr_label("Export design library..."), ui_kit::Button::Normal);
         crate::scenario::publish_handle("library:export", save.rect.center());
         if save.clicked() {
             if app.services.pick_save.is_some() {
@@ -127,28 +125,30 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &[SelInpu
                 export(app, k, k.local.path.clone(), k.local.overwrite);
             }
         }
-        ui.label(
-            RichText::new("Apply your appearance first. Exports assigned appearances and materials created in this design.")
-                .small()
-                .color(Tokens::get().text_dim),
+        ui_kit::text(
+            ui,
+            crate::i18n::tr_label("Apply your appearance first. Exports assigned appearances and materials created in this design."),
+            ui_kit::Text::Note("library_export"),
         );
     });
-    ui.end_row();
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn open_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap) {
-    let path = ui.add(egui::TextEdit::singleline(&mut k.local.path).hint_text("Library file").desired_width(200.0));
+    let path = ui_kit::row(ui, "Library file", |ui| {
+        let id = ui.make_persistent_id("library_path");
+        ui_kit::cell_editor(ui, id, &mut k.local.path, "Library file", false)
+    });
     crate::scenario::publish_handle("library:path", path.rect.center());
     if path.changed() {
         k.local.catalog = None;
         k.local.selected = None;
     }
     ui.horizontal(|ui| {
-        if ui.button(crate::i18n::tr_label("Open library...")).clicked() {
+        if ui_kit::button(ui, crate::i18n::tr_label("Open library..."), ui_kit::Button::Normal).clicked() {
             open_library(app, k.local.token.clone());
         }
-        let load_button = ui.add_enabled(!k.local.path.is_empty(), egui::Button::new(crate::i18n::tr_label("Load library")));
+        let load_button = ui_kit::button(ui, "Load library", ui_kit::Button::Enabled(!k.local.path.is_empty()));
         crate::scenario::publish_handle("library:load", load_button.rect.center());
         if load_button.clicked() {
             k.local.catalog = None;
@@ -165,24 +165,29 @@ fn server_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap) {
     let mut found: Vec<String> = solidcraft_engine::io::vfs::list(SERVER_LIBRARIES).into_iter().map(|(path, _)| path).collect();
     found.sort_by_key(|path| path.to_lowercase());
     if found.is_empty() {
-        ui.label(
-            RichText::new("Put .solidcraft-library.json files in the server's Libraries folder to use them here.")
-                .small()
-                .color(Tokens::get().text_dim),
+        ui_kit::text(
+            ui,
+            "Put .solidcraft-library.json files in the server's Libraries folder to use them here.",
+            ui_kit::Text::Note("library_platform"),
         );
         return;
     }
-    let label = |path: &str| path.strip_prefix(SERVER_LIBRARIES).unwrap_or(path).trim_end_matches(".solidcraft-library.json").to_string();
-    let mut chosen = if found.len() == 1 && k.local.path.is_empty() { found.first().cloned() } else { None };
-    let current = if k.local.path.is_empty() { "Choose a library".to_string() } else { label(&k.local.path) };
-    egui::ComboBox::from_id_salt("server_libraries").selected_text(current).show_ui(ui, |ui| {
-        for path in &found {
-            if ui.selectable_label(k.local.path == *path, label(path)).clicked() {
-                chosen = Some(path.clone());
-            }
-        }
-    });
-    if let Some(path) = chosen.filter(|path| *path != k.local.path) {
+    let mut options = vec!["Choose a library"];
+    let labels: Vec<&str> =
+        found.iter().map(|path| path.strip_prefix(SERVER_LIBRARIES).unwrap_or(path).trim_end_matches(".solidcraft-library.json")).collect();
+    options.extend(labels);
+    let open = found.iter().position(|path| *path == k.local.path).map_or(0, |i| i + 1);
+    let mut index = open;
+    ui_kit::row(ui, "Library", |ui| ui_kit::dropdown(ui, "server_library", &mut index, &options));
+    // Nothing open yet: the first library opens by itself. Otherwise a pick opens that one.
+    let chosen = if k.local.path.is_empty() {
+        found.first().cloned()
+    } else if index != open && index > 0 {
+        found.get(index - 1).cloned()
+    } else {
+        None
+    };
+    if let Some(path) = chosen {
         k.local.path = path;
         k.local.catalog = None;
         k.local.selected = None;
@@ -195,8 +200,11 @@ fn server_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap) {
 /// applies the selected one.
 fn entry_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &[SelInput]) {
     if let Some(catalog) = &k.local.catalog {
-        ui.label(RichText::new(&catalog.name).strong());
-        let search = ui.add(egui::TextEdit::singleline(&mut k.local.search).hint_text("Search this library").desired_width(200.0));
+        ui_kit::text(ui, &catalog.name, ui_kit::Text::Report("library_name", false));
+        let search = ui_kit::row(ui, "Search this library", |ui| {
+            let id = ui.make_persistent_id("library_search");
+            ui_kit::search_field(ui, id, &mut k.local.search, "Search this library")
+        });
         crate::scenario::publish_handle("library:search", search.rect.center());
         if search.changed() {
             k.local.selected = None;
@@ -219,38 +227,43 @@ fn entry_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &[SelIn
             .chain(catalog.entries.iter().filter(|entry| matches!(&entry.definition, Definition::Material(_))).filter(found))
             .collect();
         if shown.is_empty() {
-            ui.label("No matching appearance presets or materials.");
+            ui_kit::text(ui, crate::i18n::tr_label("No matching appearance presets or materials."), ui_kit::Text::Note("library_empty"));
         }
-        let row_height = ui.spacing().interact_size.y;
-        egui::ScrollArea::vertical().id_salt("local_library_entries").max_height(120.0).show_rows(ui, row_height, shown.len(), |ui, range| {
-            for index in range {
-                let Some(entry) = shown.get(index) else { continue };
-                let (name, color, detail) = match &entry.definition {
-                    Definition::Appearance(look) => (look.name.as_str(), look.color, format!("Opacity {:.0}%", look.opacity * 100.0)),
-                    Definition::Material(material) => (
-                        material.name.as_str(),
-                        material.appearance.as_ref().map_or([150, 150, 150], |look| look.color),
-                        format!("Physical material, {} g/cm³", material.density_g_cm3),
-                    ),
-                };
-                ui.horizontal(|ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                    let [r, g, b] = color;
-                    ui.colored_label(egui::Color32::from_rgb(r, g, b), "■");
-                    let button = ui.selectable_label(k.local.selected.as_deref() == Some(entry.id.as_str()), name).on_hover_text(format!(
-                        "{detail} · {} · {}",
-                        entry.provenance.license,
-                        entry.provenance.source_url.as_deref().unwrap_or("Local definition")
-                    ));
-                    crate::scenario::publish_handle(&format!("library:entry:{index}"), button.rect.center());
-                    if button.clicked() {
-                        k.local.selected = Some(entry.id.clone());
+        let row_height = ui_kit::row_height();
+        ui_kit::list_frame(ui, "local_library_entries", |ui| {
+            egui::ScrollArea::vertical().id_salt("local_library_entries").max_height(row_height * 5.0).show_rows(
+                ui,
+                row_height,
+                shown.len(),
+                |ui, range| {
+                    for index in range {
+                        let Some(entry) = shown.get(index) else { continue };
+                        let (name, color, detail) = match &entry.definition {
+                            Definition::Appearance(look) => (look.name.clone(), look.color, format!("Opacity {:.0}%", look.opacity * 100.0)),
+                            Definition::Material(material) => (
+                                format!("{} · {} g/cm³", material.name, material.density_g_cm3),
+                                material.appearance.as_ref().map_or([150, 150, 150], |look| look.color),
+                                format!("Physical material, {} g/cm³", material.density_g_cm3),
+                            ),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            let [r, g, b] = color;
+                            ui_kit::color_thumbnail(ui, ui.id().with((&entry.id, "sample")), egui::Color32::from_rgb(r, g, b), &name, ());
+                            let button = ui_kit::list_picker(ui, &entry.id, &name, k.local.selected.as_deref() == Some(entry.id.as_str()))
+                                .on_hover_text(format!(
+                                    "{detail} · {} · {}",
+                                    entry.provenance.license,
+                                    entry.provenance.source_url.as_deref().unwrap_or("Local definition")
+                                ));
+                            crate::scenario::publish_handle(&format!("library:entry:{index}"), button.rect.center());
+                            if button.clicked() {
+                                k.local.selected = Some(entry.id.clone());
+                            }
+                        });
                     }
-                    if let Definition::Material(material) = &entry.definition {
-                        ui.label(RichText::new(format!("{} g/cm³", material.density_g_cm3)).small().color(Tokens::get().text_dim));
-                    }
-                });
-            }
+                },
+            );
         });
     }
     let entry =
@@ -262,7 +275,7 @@ fn entry_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &[SelIn
         return;
     }
     let entry = entry.filter(|entry| matches!(&entry.definition, Definition::Appearance(_)));
-    let apply = ui.add_enabled(entry.is_some() && selected.is_some(), egui::Button::new(crate::i18n::tr_label("Apply library appearance")));
+    let apply = ui_kit::button(ui, "Apply library appearance", ui_kit::Button::Enabled(entry.is_some() && selected.is_some()));
     crate::scenario::publish_handle("library:apply", apply.rect.center());
     if apply.clicked()
         && let (Some(entry), Some(selected)) = (entry, selected)
@@ -303,8 +316,7 @@ fn material_apply(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, entry: &Ent
         .and_then(Value::as_array)
         .map(|names| names.iter().filter_map(|name| name.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
-    let assign = ui
-        .add_enabled(!bodies.is_empty(), egui::Button::new(crate::i18n::tr_label("Assign library material")))
+    let assign = ui_kit::button(ui, "Assign library material", ui_kit::Button::Enabled(!bodies.is_empty()))
         .on_disabled_hover_text("Select whole bodies: a physical material goes on a body, not on a face or a component");
     crate::scenario::publish_handle("library:assign", assign.rect.center());
     if !assign.clicked() {

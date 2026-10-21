@@ -46,7 +46,9 @@ use K::*;
 /// The parameters each command takes in world coordinates.
 fn table(id: &str) -> &'static [(&'static str, K)] {
     match id {
-        "solid.extrude" => &[("face", Pick), ("face_body", Body), ("from", Make), ("to", Make), ("targets", Body), ("participants", Body)],
+        "solid.extrude" => {
+            &[("face", Pick), ("faces", Picks), ("face_body", Body), ("from", Make), ("to", Make), ("targets", Body), ("participants", Body)]
+        }
         "solid.revolve" => &[("face", Pick), ("axis", Axis), ("to", Make), ("targets", Body), ("participants", Body)],
         "solid.box" | "solid.sphere" => &[("corner", Make), ("center", Make)],
         "solid.cylinder" | "solid.coil" | "solid.torus" => &[("base", Make), ("center", Make), ("axis", Dir)],
@@ -306,6 +308,20 @@ thread_local! {
 /// goes into the active component's frame as a whole.)
 pub fn mapped() -> bool {
     MAPPED.with(std::cell::Cell::get)
+}
+
+/// Author generated geometry directly in the active component's local frame.
+/// Restores the enclosing command's mapping state, including on an error.
+pub(crate) fn local_geometry() -> LocalGeometry {
+    LocalGeometry(MAPPED.with(|m| m.replace(true)))
+}
+
+pub(crate) struct LocalGeometry(bool);
+
+impl Drop for LocalGeometry {
+    fn drop(&mut self) {
+        MAPPED.with(|m| m.set(self.0));
+    }
 }
 
 /// A command running inside another (its parameters are already in component frames).

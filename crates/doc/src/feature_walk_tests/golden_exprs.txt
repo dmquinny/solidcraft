@@ -342,6 +342,7 @@ surface_offset
   expressions: soff.distance, soff.tolerance
 surface_blend
 surface_boundary
+surface_network
 surface_match
 surface_fair
   inputs:
@@ -370,6 +371,16 @@ surface_ruled
     Angle = ruled.angle (Angle)
   expressions: ruled.distance, ruled.angle
 surface_trim
+  inputs:
+    Angle = trim.angle (Angle)
+    Offset = trim.offset (Length)
+  expressions: trim.angle, trim.offset
+surface_trim_curves
+  inputs:
+    Angle = trim.angle (Angle)
+    Offset = trim.offset (Length)
+  expressions: trim.angle, trim.offset
+surface_trim_mutual
   inputs:
     Angle = trim.angle (Angle)
     Offset = trim.offset (Length)

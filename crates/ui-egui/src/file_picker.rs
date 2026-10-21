@@ -29,8 +29,9 @@ impl Wake for Repaint {
 
 impl SolveApp {
     /// Keep the target design and editors unchanged until the picker answers.
+    /// (A save being written keeps it unchanged too, see [`crate::save_job`].)
     pub fn file_picker_busy(&self) -> bool {
-        self.file_picker.is_some()
+        self.file_picker.is_some() || self.saving.is_some()
     }
 
     pub(crate) fn pick_open(&mut self, complete: impl FnOnce(&mut SolveApp, Option<String>) + 'static) {
@@ -43,6 +44,21 @@ impl SolveApp {
             return;
         }
         let future = self.services.pick_open.as_ref().map(|pick| pick(extensions));
+        self.begin_picker(future, Box::new(complete));
+    }
+
+    /// Ask for one file of a kind (`label`, `extensions`), with the host's dialog for it, or the
+    /// Open dialog where the host has none. (The agent chat asks for its files; the web build has
+    /// no chat.)
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn pick_file(&mut self, label: &str, extensions: &[&str], complete: impl FnOnce(&mut SolveApp, Option<String>) + 'static) {
+        if self.file_picker_busy() {
+            return;
+        }
+        let future = match self.services.pick_file.as_ref() {
+            Some(pick) => Some(pick(label, extensions)),
+            None => self.services.pick_open.as_ref().map(|pick| pick(extensions)),
+        };
         self.begin_picker(future, Box::new(complete));
     }
 
@@ -159,7 +175,9 @@ mod tests {
         if let Some(waker) = answer.waker.borrow_mut().take() {
             waker.wake();
         }
-        tick(app, &egui::Context::default());
+        tick(app, &crate::fonts::test_context());
+        // A save the answer started is written on a worker: wait for it.
+        crate::save_job::tick(app, true);
         assert!(!app.file_picker_busy());
     }
 
@@ -292,7 +310,13 @@ mod tests {
             Box::pin(std::future::ready(None))
         }));
         h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
-        for (command, want) in [("sketch.insert_svg", vec!["svg"]), ("sketch.insert_dxf", vec!["dxf"]), ("file.insert_step", vec![])] {
+        for (command, want) in [
+            ("sketch.insert_svg", vec!["svg"]),
+            ("sketch.insert_dxf", vec!["dxf"]),
+            ("file.insert_step", vec![]),
+            ("canvas.insert", vec!["png", "jpg", "jpeg"]),
+            ("canvas.decal", vec!["png", "jpg", "jpeg"]),
+        ] {
             h.app.start(command);
             tick(&mut h.app, &h.ctx);
             assert_eq!(asked.borrow().last().cloned(), Some(want.iter().map(|e| e.to_string()).collect::<Vec<_>>()), "{command}");

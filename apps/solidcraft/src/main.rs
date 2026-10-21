@@ -25,7 +25,7 @@ mod native_crash;
 mod native_frame;
 #[cfg(target_os = "macos")]
 mod open_documents;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 mod space_mouse;
 mod startup;
 
@@ -38,7 +38,7 @@ struct App {
     starting: Option<std::path::PathBuf>,
     /// Frames begun; the second one means the first was drawn (startup is over).
     frames: u32,
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     space_mouse: space_mouse::SpaceMouse,
 }
 
@@ -68,7 +68,7 @@ impl eframe::App for App {
             self.solve.open_path_async(&f);
         }
         self.solve.logic(ctx);
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         if !self.solve.file_picker_busy() {
             self.space_mouse.tick(&mut self.solve, ctx);
         }
@@ -78,7 +78,7 @@ impl eframe::App for App {
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         // Before the app's own hook, which adds the control channel's events.
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         self.space_mouse.raw_input_hook(self.solve.preferences.space_mouse_enabled, raw);
         self.solve.raw_input_hook(raw);
     }
@@ -91,6 +91,8 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         // The agent chat's agent and everything it started end with the app.
         solidcraft_ui_egui::agent_chat::shutdown(&mut self.solve);
+        // A save still being written ends before the app does.
+        solidcraft_ui_egui::save_job::tick(&mut self.solve, true);
         solidcraft_ui_egui::recovery_ui::close(&mut self.solve);
         solidcraft_engine::crash::end_session();
         // An update asked to restart into the new version or to run its installer.
@@ -116,6 +118,7 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
     let parent = rfd::AsyncFileDialog::new().set_parent(cc);
     let open_parent = parent.clone();
     let program_parent = parent.clone();
+    let file_parent = parent.clone();
     Services {
         pick_open: Some(Box::new(move |first: &[&str]| {
             // The file type the command reads comes first, so the picker opens on it (#1801).
@@ -166,6 +169,22 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
                 .pick_file();
             Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
         })),
+        // One kind of file (the agent chat's attachments): only the types it names, as given and in
+        // lower and upper case (Linux dialogs match case; macOS allows just the listed types).
+        pick_file: Some(Box::new(move |label: &str, exts: &[&str]| {
+            let mut all: Vec<String> = Vec::new();
+            for e in exts {
+                for v in [e.to_string(), e.to_ascii_lowercase(), e.to_ascii_uppercase()] {
+                    if !all.contains(&v) {
+                        all.push(v);
+                    }
+                }
+            }
+            let all: Vec<&str> = all.iter().map(String::as_str).collect();
+            // Any other file attaches by reference, so the list is not the only choice.
+            let future = file_parent.clone().add_filter(label, &all).add_filter("All files", &["*"]).pick_file();
+            Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
+        })),
         pick_program: Some(Box::new(move || {
             let dialog = program_parent.clone().set_title("Choose your slicer");
             let dialog = if cfg!(target_os = "windows") { dialog.add_filter("Programs", &["exe"]) } else { dialog };
@@ -191,6 +210,10 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
         http_download: Some(std::sync::Arc::new(http_download)),
         // Already an installed app: only the browser build offers to install.
         install_app: None,
+        can_restore: None,
+        restore_file: None,
+        download_design: None,
+        browser_files: None,
         agent_http: Some(std::sync::Arc::new(agent_http)),
         secrets: Some(std::sync::Arc::new(Keychain)),
         show_in_folder: Some(Box::new(|path| {
@@ -655,14 +678,14 @@ fn main() -> eframe::Result {
             if !notes.is_empty() {
                 app.set_status(notes.join(" "), true);
             }
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             let space_mouse = space_mouse::SpaceMouse::start(&cc.egui_ctx);
             solidcraft_engine::crash::phase("first frame");
             Ok(Box::new(App {
                 solve: app,
                 starting,
                 frames: 0,
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 space_mouse,
             }))
         }),

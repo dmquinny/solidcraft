@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use solidcraft_geom::{Aabb3, Vec3};
+use solidcraft_geom::{Aabb3, Ring, UnitVec3, Vec3};
 use truck_modeling::{self as mt, builder};
 
 use crate::body::shell_groups::boxes_separate;
@@ -905,12 +905,19 @@ fn apart_with(a: &Body, b: &Body, op: BoolOp, grow: bool) -> Option<Result<Optio
         } else if op == BoolOp::Union {
             for (n, d) in &same {
                 let slab = slab_beyond(*n, *d, d1.max(d2) * 3.0, size * 4.0)?;
-                match crate::ops::boolean(&r, &slab, BoolOp::Cut)? {
-                    Some(x) => {
+                match crate::ops::boolean(&r, &slab, BoolOp::Cut) {
+                    Ok(Some(x)) => {
                         h = h.and_then(|h| trimmed(&x, h, &slab, [a, b], *n, *d, tol));
                         r = x;
                     }
-                    None => return Ok(None),
+                    Ok(None) => return Ok(None),
+                    // An edge of the union can lie in the plane, where a pushed side crosses a side
+                    // of the other body (a prism's edge in the plane lying in a slab's end face):
+                    // the cut along it fails, and the same trim is made by editing the faces.
+                    Err(e) => {
+                        r = trim_exact(&r, *n, *d).map_err(|_| e)?;
+                        h = None;
+                    }
                 }
             }
         }
@@ -991,6 +998,44 @@ pub(crate) fn faces_touch(a: &Body, b: &Body) -> bool {
         mb.tri(t).is_some_and(|[p, q, r]| inside.contains((p + q + r) / 3.0 + *n * depth))
     })
 }
+
+/// Does `r` hold a skin of no thickness: a planar face lying on another of its planar faces that
+/// faces the other way, with no material behind part of it? A cut whose tool ends exactly on a
+/// face of the target can come out with the target's face whole over the hole and the tool's end
+/// face under it, closing the hole. No volume shows that, and points sampled off the surface see
+/// the hole either way. Faces back to back in one plane with material behind both (the top of a
+/// step beside the underside of an overhang) are not this. `mesh` is `r`'s mesh; what counts is
+/// an area of the faces with nothing behind it, so that the few triangles along an edge where the
+/// mesh of a curved neighbour cuts the corner don't.
+pub(crate) fn has_skin(r: &Body, mesh: &solidcraft_geom::Mesh) -> bool {
+    let size = r.size();
+    let tol = (size * 1e-7).max(1e-9) * 10.0;
+    let p = planes(r);
+    if p.len() > MAX_SKIN_FACES {
+        return false;
+    }
+    let paired: HashMap<usize, Vec3> = p
+        .iter()
+        .filter(|(i, x)| p.iter().any(|(j, y)| i != j && x.n.dot(y.n) < -1.0 + 1e-9 && (x.d + y.d).abs() < tol))
+        .map(|(i, x)| (*i, x.n))
+        .collect();
+    if paired.is_empty() {
+        return false;
+    }
+    let inside = mesh.inside_index();
+    let depth = (size * 1e-4).max(1e-6);
+    let mut open = 0.0;
+    for (t, face) in mesh.triangles.iter().zip(&mesh.tri_face).take(100_000) {
+        let (Some(n), Some([a, b, c])) = (paired.get(&(*face as usize)), mesh.tri(t)) else { continue };
+        if !inside.contains((a + b + c) / 3.0 - *n * depth) {
+            open += (b - a).cross(c - a).len() * 0.5;
+        }
+    }
+    open > (size * size * 1e-6).max(1e-9)
+}
+
+/// The most planar faces [`has_skin`] pairs up (every pair is compared).
+const MAX_SKIN_FACES: usize = 2000;
 
 /// The triangles of `tool`'s faces in the plane (`m`, `d`), `m` their outward normal, each with
 /// how far its face reaches past it sideways. A face bounded by straight edges is its
@@ -1091,7 +1136,7 @@ fn faces_box(body: &Body, faces: &[usize], gap: f64) -> Option<Aabb3> {
         bb.add(b.min);
         bb.add(b.max);
     }
-    (!bb.is_empty()).then(|| Aabb3 { min: bb.min - Vec3::new(gap, gap, gap), max: bb.max + Vec3::new(gap, gap, gap) })
+    (!bb.is_empty()).then(|| bb.inflated(gap))
 }
 
 /// `body` (with its history `h` over its operand) with its faces in the plane (n, d) split
@@ -1193,10 +1238,18 @@ pub(crate) fn imprint_union(a: &Body, b: &Body, accept: &dyn Fn(&Body) -> bool) 
 /// faces): every such pair of faces goes and the shells are stitched along their edges. `None`
 /// when no such pair of faces exists.
 pub(crate) fn glue(a: &Body, b: &Body) -> Option<Result<Body>> {
+    glue_impl(a, b, false)
+}
+
+/// Glue every certified start cap, retaining each tool's original contact tolerance.
+pub(crate) fn glue_all_caps(a: &Body, b: &Body) -> Option<Result<Body>> {
+    glue_impl(a, b, true)
+}
+
+fn glue_impl(a: &Body, b: &Body, all_caps: bool) -> Option<Result<Body>> {
     use mt::{BoundedCurve, ParametricCurve};
     let size = a.size().max(b.size());
     let tol = (size * 1e-7).max(1e-9) * 10.0;
-    let key = |p: Vec3| ((p.x / tol).round() as i64, (p.y / tol).round() as i64, (p.z / tol).round() as i64);
     let mid = |e: &mt::Edge| {
         let c = e.curve();
         let (t0, t1) = c.range_tuple();
@@ -1205,14 +1258,40 @@ pub(crate) fn glue(a: &Body, b: &Body) -> Option<Result<Body>> {
     // Matching faces: same plane, opposite normals, the same edges. Every pair is glued: a
     // pair left behind would stay inside the result as a zero-thickness slit (issue #616).
     let (pa, pb) = (planes(a), planes(b));
+    let mut tool_sizes = HashMap::new();
+    if all_caps {
+        for shell in b.solid.boundaries() {
+            let mut bounds = solidcraft_geom::Aabb3::EMPTY;
+            for vertex in shell.vertex_iter() {
+                bounds.add(from_p3(vertex.point()));
+            }
+            let size = bounds.diagonal();
+            if !size.is_finite() {
+                return None;
+            }
+            for face in shell.face_iter() {
+                tool_sizes.insert(face.id(), size);
+            }
+        }
+    }
     let fa_list: Vec<&mt::Face> = a.solid.face_iter().collect();
     let fb_list: Vec<&mt::Face> = b.solid.face_iter().collect();
     // B edge → the matching A edge; B vertex → the matching A vertex.
     let mut map: HashMap<mt::EdgeID, mt::Edge> = HashMap::new();
     let mut vmap: HashMap<mt::VertexID, mt::Vertex> = HashMap::new();
     let (mut glued_a, mut glued_b): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    if all_caps && pa.len().saturating_mul(pb.len()) > 2_000_000 {
+        return None;
+    }
     for (ia, x) in &pa {
         for (ib, y) in &pb {
+            if all_caps
+                && !matches!(b.face_sources().and_then(|sources| sources.get(*ib)), Some(Some(crate::FaceSource::ExtrudeCap { high: false, .. })))
+            {
+                continue;
+            }
+            let tol = if all_caps { (a.size().max(*tool_sizes.get(&fb_list.get(*ib)?.id())?) * 1e-7).max(1e-9) * 10.0 } else { tol };
+            let key = |p: Vec3| ((p.x / tol).round() as i64, (p.y / tol).round() as i64, (p.z / tol).round() as i64);
             if glued_a.contains(ia) || glued_b.contains(ib) || x.n.dot(y.n) > -1.0 + 1e-9 || (x.d + y.d).abs() > tol {
                 continue;
             }
@@ -1263,6 +1342,14 @@ pub(crate) fn glue(a: &Body, b: &Body) -> Option<Result<Body>> {
             glued_a.push(*ia);
             glued_b.push(*ib);
         }
+    }
+    if all_caps
+        && b.face_sources()?
+            .iter()
+            .enumerate()
+            .any(|(index, source)| matches!(source, Some(crate::FaceSource::ExtrudeCap { high: false, .. })) && !glued_b.contains(&index))
+    {
+        return None;
     }
     if glued_a.is_empty() {
         return None;
@@ -1347,7 +1434,7 @@ fn inset_into(outer: &Body, inner: &Body, outer_operand: usize) -> Option<Result
     let tol = (size * 1e-7).max(1e-9) * 10.0;
     // Clear of the outer face's edges by more than the samples' chord error.
     let clear = (size * 2e-3).max(1e-6);
-    let sample = |w: &mt::Wire| -> Option<Vec<Vec3>> {
+    let sample = |w: &mt::Wire| -> Option<Ring<Vec3>> {
         if w.len() > 1000 {
             return None;
         }
@@ -1357,7 +1444,7 @@ fn inset_into(outer: &Body, inner: &Body, outer_operand: usize) -> Option<Result
             let (t0, t1) = c.range_tuple();
             pts.extend((0..SAMPLES).map(|k| from_p3(c.subs(t0 + (t1 - t0) * k as f64 / SAMPLES as f64))));
         }
-        (!pts.is_empty() && pts.iter().all(|p| p.is_finite())).then_some(pts)
+        (!pts.is_empty() && pts.iter().all(|p| p.is_finite())).then(|| Ring::new(pts))
     };
     let fo: Vec<&mt::Face> = outer.solid.face_iter().collect();
     let fi: Vec<&mt::Face> = inner.solid.face_iter().collect();
@@ -1374,7 +1461,7 @@ fn inset_into(outer: &Body, inner: &Body, outer_operand: usize) -> Option<Result
             let (Some(inner_pts), Some(outer_loops)) = (sample(&outline), face_o.boundaries().iter().map(sample).collect::<Option<Vec<_>>>()) else {
                 continue;
             };
-            let outer_count: usize = outer_loops.iter().map(Vec::len).sum();
+            let outer_count: usize = outer_loops.iter().map(|l| l.len()).sum();
             if inner_pts.len().saturating_mul(outer_count) > MAX_WORK {
                 continue;
             }
@@ -1387,8 +1474,7 @@ fn inset_into(outer: &Body, inner: &Body, outer_operand: usize) -> Option<Result
             let outer_polys: Vec<_> = outer_loops.iter().map(|l| flat(l)).collect();
             let inner_poly = flat(&inner_pts);
             let in_outer = |p: Vec3| outer_polys.iter().filter(|l| l.contains(flat_point(p))).count() % 2 == 1;
-            let near_outer =
-                |p: Vec3| outer_loops.iter().any(|l| l.iter().zip(l.iter().cycle().skip(1)).any(|(s, t)| p.dist_to_segment(*s, *t) < clear));
+            let near_outer = |p: Vec3| outer_loops.iter().any(|l| l.edges().any(|(s, t)| p.dist_to_segment(*s, *t) < clear));
             let fits = inner_pts.iter().all(|p| in_outer(*p) && !near_outer(*p))
                 && outer_loops.iter().flatten().all(|p| !inner_poly.contains(flat_point(*p)));
             if !fits {
@@ -1433,7 +1519,7 @@ fn inset_into(outer: &Body, inner: &Body, outer_operand: usize) -> Option<Result
 struct CylFace {
     index: usize,
     origin: Vec3,
-    axis: Vec3,
+    axis: UnitVec3,
     radius: f64,
 }
 
@@ -1595,7 +1681,7 @@ pub(crate) fn bore_union(a: &Body, b: &Body, accept: &dyn Fn(&Body) -> bool) -> 
                     return Err(KernelError::Failed("narrowing a bore: an unsound result".into()));
                 }
                 let Some(joined) = crate::ops::boolean(target, &narrowed, BoolOp::Union)? else { return Ok(None) };
-                let cut = crate::build::cylinder(at(lo, 0.0, 0.0), c.axis, c.radius, hi - lo)?;
+                let cut = crate::build::cylinder(at(lo, 0.0, 0.0), *c.axis, c.radius, hi - lo)?;
                 let Some(r) = crate::ops::boolean(&joined, &cut, BoolOp::Cut)? else { return Ok(None) };
                 let h = recut(&r, &joined, &narrowed, &cut, &bore, tool_operand);
                 Ok(Some(r.with_checked_history(h, &record::counts(&[a, b]))))

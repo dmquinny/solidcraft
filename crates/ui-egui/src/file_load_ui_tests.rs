@@ -18,15 +18,15 @@ impl Win {
     fn new() -> Self {
         let mut app = SolveApp::new(Session::default(), Default::default());
         app.custom_titlebar = true;
-        let mut w = Win { ctx: egui::Context::default(), app, time: 0.0 };
+        let mut w = Win { ctx: crate::fonts::test_context(), app, time: 0.0 };
         for _ in 0..3 {
             w.frame(vec![]);
         }
         w
     }
 
-    /// One frame: (the viewport commands it sent, how long it took).
-    fn frame(&mut self, events: Vec<Event>) -> (Vec<ViewportCommand>, std::time::Duration) {
+    /// One frame: the viewport commands it sent.
+    fn frame(&mut self, events: Vec<Event>) -> Vec<ViewportCommand> {
         self.time += 1.0 / 60.0;
         let raw = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0))),
@@ -35,14 +35,13 @@ impl Win {
             events,
             ..Default::default()
         };
-        let began = std::time::Instant::now();
         let app = &mut self.app;
         let mut out = self.ctx.run_ui(raw, |ui| {
             app.logic(ui.ctx());
             app.ui(ui);
         });
         out.textures_delta.clear();
-        (out.viewport_output.remove(&ViewportId::ROOT).map(|v| v.commands).unwrap_or_default(), began.elapsed())
+        out.viewport_output.remove(&ViewportId::ROOT).map(|v| v.commands).unwrap_or_default()
     }
 
     /// The frames of a press-drag-release along `path`: the viewport commands they sent.
@@ -51,7 +50,7 @@ impl Win {
         let mut events = vec![vec![Event::PointerMoved(path[0])], vec![button(path[0], true)]];
         events.extend(path[1..].iter().map(|p| vec![Event::PointerMoved(*p)]));
         events.push(vec![button(*path.last().unwrap(), false)]);
-        events.into_iter().flat_map(|e| self.frame(e).0).collect()
+        events.into_iter().flat_map(|e| self.frame(e)).collect()
     }
 }
 
@@ -97,46 +96,42 @@ fn fingerprint(s: &Session) -> serde_json::Value {
 fn the_window_keeps_drawing_and_moving_while_a_large_design_opens() {
     let dir = scratch("drag");
     let path = large_design(&dir, 4);
-    let began = std::time::Instant::now();
     let mut sync = Session::default();
     sync.execute("doc.open", &json!({"path": path})).unwrap();
-    let sync_ms = began.elapsed().as_secs_f64() * 1000.0;
 
     let mut w = Win::new();
     let blank = w.app.session.doc.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    w.app.file_load.worker_gate = Some((started_tx, release_rx));
     w.app.open_path_async(&path);
-    assert!(w.app.file_load.busy(), "the open runs off the window thread");
+    // The deadline only bounds a broken test; responsiveness is proved by ordering, not time.
+    let worker = started_rx.recv_timeout(std::time::Duration::from_secs(60)).expect("file worker started");
+    assert_ne!(worker, std::thread::current().id(), "opening runs on another thread");
+    for _ in 0..3 {
+        w.frame(vec![]);
+        assert!(w.app.file_load.busy(), "frames finish before the file worker is released");
+        assert!(std::sync::Arc::ptr_eq(&w.app.session.doc, &blank), "the old design stays intact");
+    }
     let bar = pos2(500.0, 17.0);
     let viewport = w.app.viewport.rect.map_or(pos2(800.0, 500.0), |r| r.center());
-    let (mut busy_frames, mut slowest) = (0, std::time::Duration::ZERO);
-    let (mut moved, mut overlay, mut viewport_ignored) = (false, false, false);
-    for _ in 0..100_000 {
-        if !w.app.file_load.busy() {
-            break;
-        }
-        busy_frames += 1;
-        if busy_frames == 2 {
-            // The title bar still moves the window, and maximizes it on a double click.
-            let cmds = w.gesture(&[bar, bar + vec2(12.0, 4.0), bar + vec2(40.0, 10.0)]);
-            moved = cmds.iter().any(|c| matches!(c, ViewportCommand::StartDrag)) && w.app.file_load.busy();
-            // A drag on the design reaches the overlay, not the viewport (no orbit).
-            let cam = serde_json::to_value(w.app.cam).unwrap();
-            w.gesture(&[viewport, viewport + vec2(30.0, 0.0), viewport + vec2(80.0, 20.0)]);
-            viewport_ignored = serde_json::to_value(w.app.cam).unwrap() == cam && w.app.tool.is_none();
-            overlay = crate::scenario::handle_at("file_loading:cancel").is_some();
-            // Shortcuts and commands wait for the file.
-            assert!(w.app.run("solid.box", json!({"length": 5, "width": 5, "height": 5})).is_err());
-            continue;
-        }
-        let (_, took) = w.frame(vec![]);
-        slowest = slowest.max(took);
+    let cmds = w.gesture(&[bar, bar + vec2(12.0, 4.0), bar + vec2(40.0, 10.0)]);
+    assert!(cmds.iter().any(|c| matches!(c, ViewportCommand::StartDrag)), "the title bar drag was handled during the open");
+    let cam = serde_json::to_value(w.app.cam).unwrap();
+    w.gesture(&[viewport, viewport + vec2(30.0, 0.0), viewport + vec2(80.0, 20.0)]);
+    assert_eq!(serde_json::to_value(w.app.cam).unwrap(), cam, "the design underneath took no camera input");
+    assert!(w.app.tool.is_none());
+    assert!(crate::scenario::handle_at("file_loading:cancel").is_some(), "the Opening overlay with Cancel was shown");
+    assert!(w.app.run("solid.box", json!({"length": 5, "width": 5, "height": 5})).is_err());
+    assert!(w.app.file_load.busy(), "all window interactions completed before releasing the worker");
+    assert!(std::sync::Arc::ptr_eq(&w.app.session.doc, &blank));
+    release_tx.send(()).expect("release the file worker after window interactions");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while w.app.file_load.busy() && std::time::Instant::now() < deadline {
+        w.frame(vec![]);
+        std::thread::yield_now();
     }
-    assert!(!w.app.file_load.busy(), "the open finished");
-    assert!(busy_frames >= 3, "frames kept coming during the {sync_ms:.0} ms open: {busy_frames}");
-    assert!(moved, "the title bar drag was handled during the open");
-    assert!(overlay, "the Opening overlay with Cancel was shown");
-    assert!(viewport_ignored, "the design underneath took no input");
-    assert!(slowest.as_secs_f64() * 1000.0 < (sync_ms * 0.5).max(250.0), "no frame waited for the open: slowest {slowest:?}, open {sync_ms:.0} ms");
+    assert!(!w.app.file_load.busy(), "the released open finished");
     for _ in 0..3 {
         w.frame(vec![]);
     }
@@ -216,6 +211,11 @@ fn a_control_open_answers_after_loading_without_freezing_the_window() {
     assert_eq!(reply["ok"], true, "{reply}");
     assert_eq!(reply["result"], expected);
     assert!(count_rx.try_recv().is_ok(), "inspection answered while the file loaded");
+    // Its bodies are meshed after it opened, and its Home picture drawn then, off the UI thread.
+    while crate::open_meshing::active(&w.app) {
+        w.frame(vec![]);
+    }
+    assert!(crate::home::remembering(&w.app.home), "the Home picture is drawn off the UI thread");
     for _ in 0..3 {
         w.frame(vec![]);
     }
@@ -268,5 +268,162 @@ fn a_control_import_passes_up_and_names_on() {
     // Z up said by the caller: kept as it is, and not asked about either.
     let (_, size, offered) = import(json!({"path": path, "up": "z"}));
     assert!(size[1] > 39.9 && !offered, "{size:?} {offered}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An opened design is in the window before its bodies are meshed: the view draws the bodies
+/// meshed so far (never meshing one itself), framed from their outlines, until all are.
+#[test]
+fn an_opened_design_shows_its_bodies_as_they_are_meshed() {
+    let dir = scratch("progressive");
+    let path = large_design(&dir, 24);
+    let mut w = Win::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    w.app.control_rx = Some(rx);
+    let (open, open_rx) = crate::control::ControlRequest::new("engine.execute", json!({"command": "doc.open", "params": {"path": path}}));
+    tx.send(open).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while open_rx.try_recv().is_err() {
+        w.frame(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(std::time::Instant::now() < deadline, "the open answers");
+    }
+    let mut seen = Vec::new();
+    while crate::open_meshing::active(&w.app) {
+        let shown = crate::open_meshing::shown_world(&w.app);
+        assert!(shown.bodies.iter().all(|b| b.cached_mesh().is_some()), "only meshed bodies are drawn");
+        let (done, total) = crate::open_meshing::progress(&w.app).unwrap();
+        assert!(done <= total && total == w.app.session.world_state().bodies.len(), "Loading parts {done}/{total}");
+        seen.push(shown.bodies.len());
+        w.frame(vec![]);
+    }
+    assert!(seen.windows(2).all(|p| p[0] <= p[1]), "the picture only grows: {seen:?}");
+    let world = w.app.session.world_state();
+    // Then the whole design (in the order its bodies came, kept until the design changes).
+    let names = |st: &solidcraft_engine::doc::ModelState| {
+        let mut n: Vec<String> = st.bodies.iter().map(|b| b.name.clone()).collect();
+        n.sort();
+        n
+    };
+    assert_eq!(names(&crate::open_meshing::shown_world(&w.app)), names(&world), "then the whole design");
+    assert!(world.bodies.iter().all(|b| b.cached_mesh().is_some()));
+    // Framed from the meshes now, as a synchronous open frames it.
+    let framed = w.app.cam;
+    w.app.fit_view();
+    // Floating viewport framing can round the same bounds by a few ulps.
+    let refitted = w.app.cam;
+    assert!((refitted.target - framed.target).len() < 1e-9);
+    assert!((refitted.distance - framed.distance).abs() < 1e-9);
+    assert_eq!(
+        (refitted.yaw, refitted.pitch, refitted.roll, refitted.fov, refitted.up),
+        (framed.yaw, framed.pitch, framed.roll, framed.fov, framed.up)
+    );
+    // An edit after that: the viewport draws the session's world again.
+    w.app.session.execute("solid.box", &json!({"length": 5, "width": 5, "height": 5, "operation": "new"})).unwrap();
+    w.frame(vec![]);
+    assert!(std::sync::Arc::ptr_eq(&crate::open_meshing::shown_world(&w.app), &w.app.session.world_state()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A screenshot asked for right after an open shows the whole design: it waits for the meshing,
+/// and what was asked after it waits for it.
+#[test]
+fn a_screenshot_after_an_open_waits_for_the_whole_design() {
+    let dir = scratch("progressive-shot");
+    let path = large_design(&dir, 24);
+    let mut w = Win::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    w.app.control_rx = Some(rx);
+    let (open, open_rx) = crate::control::ControlRequest::new("engine.execute", json!({"command": "doc.open", "params": {"path": path}}));
+    tx.send(open).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while open_rx.try_recv().is_err() {
+        w.frame(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(std::time::Instant::now() < deadline, "the open answers");
+    }
+    if !crate::open_meshing::active(&w.app) {
+        return; // Meshed already: nothing to wait for on this machine.
+    }
+    let (shot, _shot_rx) = crate::control::ControlRequest::new("ui.screenshot", json!({}));
+    let (count, count_rx) = crate::control::ControlRequest::new("document.inspect", json!({}));
+    tx.send(shot).unwrap();
+    tx.send(count).unwrap();
+    w.frame(vec![]);
+    if crate::open_meshing::active(&w.app) {
+        assert!(count_rx.try_recv().is_err(), "a request after the screenshot waits for it");
+    }
+    while crate::open_meshing::active(&w.app) {
+        w.frame(vec![]);
+    }
+    for _ in 0..3 {
+        w.frame(vec![]);
+    }
+    assert!(count_rx.try_recv().is_ok(), "answered once the design is meshed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An assembly of a few rounded parts placed many times, as a STEP file: an import that takes a
+/// while to read, place and mesh.
+fn step_assembly(dir: &std::path::Path) -> String {
+    let mut s = Session::default();
+    // Distinct parts (each meshed on its own), each placed a few times (placed copies share it).
+    for k in 0..40 {
+        let len = 30.0 + k as f64;
+        let part = s.execute("component.create", &json!({"name": format!("Bracket {k}")})).unwrap()["component"].as_u64().unwrap();
+        s.execute("solid.box", &json!({"length": len, "width": 20, "height": 8, "operation": "new"})).unwrap();
+        s.execute("solid.cylinder", &json!({"radius": 6, "height": 20, "base": [10, 10, 0], "operation": "join"})).unwrap();
+        s.execute("solid.cylinder", &json!({"radius": 2.5, "height": 40, "base": [len - 10.0, 10, -10], "operation": "cut"})).unwrap();
+        s.execute("solid.fillet", &json!({"edges": [[len / 2.0, 0, 8]], "radius": 3})).unwrap();
+        s.execute("solid.sphere", &json!({"radius": 4, "center": [10, 10, 24], "operation": "join"})).unwrap();
+        s.execute("component.activate", &json!({"component": 0})).unwrap();
+        for i in 1..5 {
+            s.execute("occurrence.copy", &json!({"component": part, "translate": [i as f64 * 80.0, k as f64 * 40.0, 0]})).unwrap();
+        }
+    }
+    let path = dir.join("assembly.step").to_string_lossy().to_string();
+    s.execute("file.export", &json!({"path": path})).unwrap();
+    path
+}
+
+/// Open `path` through the window as a person would, every frame timed, until it is in and meshed.
+/// The slowest frame: ms and the phase it was in.
+fn open_timed(path: &str) -> (Win, (f64, &'static str)) {
+    let mut w = Win::new();
+    w.app.frame_watch.slowest = (0.0, "idle");
+    let (tx, rx) = std::sync::mpsc::channel();
+    w.app.control_rx = Some(rx);
+    let (open, open_rx) = crate::control::ControlRequest::new("engine.execute", json!({"command": "doc.open", "params": {"path": path}}));
+    tx.send(open).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut answered = false;
+    while !answered || crate::open_meshing::active(&w.app) || !w.app.file_load.idle() {
+        w.frame(vec![]);
+        answered |= open_rx.try_recv().is_ok();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(std::time::Instant::now() < deadline, "{path} opens");
+    }
+    let slowest = w.app.frame_watch.slowest;
+    eprintln!("{path}: slowest frame {:.1} ms while {}, {} bodies", slowest.0, slowest.1, w.app.session.world_state().bodies.len());
+    (w, slowest)
+}
+
+/// The window stays responsive through every phase of opening a design: a STEP assembly imported,
+/// the design saved with its model and opened again, and saved without it and opened again. No
+/// frame on the window thread takes longer than 250 ms (the test names the phase that did).
+#[test]
+fn opening_a_large_design_never_stalls_the_window() {
+    const BUDGET_MS: f64 = 250.0;
+    let dir = scratch("watchdog");
+    let step = step_assembly(&dir);
+    let (mut w, (ms, phase)) = open_timed(&step);
+    assert!(ms < BUDGET_MS, "STEP import: a {ms:.0} ms frame while {phase}");
+    assert!(w.app.session.world_state().bodies.len() >= 200);
+    for (name, cache) in [("cached.solidcraft", true), ("plain.solidcraft", false)] {
+        let path = dir.join(name).to_string_lossy().to_string();
+        w.app.session.execute("file.save_as", &json!({"path": path, "cache": cache})).unwrap();
+        let (_, (ms, phase)) = open_timed(&path);
+        assert!(ms < BUDGET_MS, "{name}: a {ms:.0} ms frame while {phase}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

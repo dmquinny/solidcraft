@@ -185,6 +185,24 @@ impl Document {
         }
         Ok(())
     }
+    /// A face target for messages: its role on its feature where the certificate tells it, else
+    /// its name, and its body (`the top cap of E1 on `Body1``).
+    pub(crate) fn describe_face_target(&self, target: &ConfigFaceTarget) -> String {
+        let feature = self.feature(target.origin_feature).map_or_else(|| format!("F{}", target.origin_feature), |f| f.name.clone());
+        let end = |high: bool| if high { "top" } else { "bottom" };
+        let role = match &target.certificate {
+            Some(super::FaceCertificate::ExtrudeCap { high, .. }) | Some(super::FaceCertificate::CylinderCap { high }) => {
+                format!("the {} cap", end(*high))
+            }
+            Some(super::FaceCertificate::Box { axis, high }) => {
+                format!("the {}{} side", if *high { "+" } else { "-" }, ["x", "y", "z"].get(usize::from(*axis)).copied().unwrap_or("?"))
+            }
+            Some(super::FaceCertificate::ExtrudeSide { curve, .. }) => format!("the side along `{curve}`"),
+            _ => format!("face `{}`", target.name),
+        };
+        format!("{role} of {feature} on `{}`", target.body)
+    }
+
     /// Verify the current named pieces describe one surface, not ambiguous generated roles.
     pub fn configuration_face_indices(&self, body: &crate::ModelBody, target: &ConfigFaceTarget) -> Result<Vec<usize>> {
         self.certify_config_face(target)?;
@@ -248,14 +266,25 @@ impl Document {
                 })
                 .collect();
             if indices.is_empty() {
-                return Err(DocError::Unknown("attached planar face certificate is missing or ambiguous".into()));
+                return Err(DocError::Invalid(format!("{} no longer exists", self.describe_face_target(target))));
             }
             return self.certified_pieces(body, indices, target.origin_feature);
         }
         if let Some(super::FaceCertificate::ExtrudeSide { sketch, curve }) = &target.certificate {
-            let indices: Vec<_> = body.body.face_sources().into_iter().flatten().enumerate().filter_map(|(index, source)| {
-                matches!(source, Some(solidcraft_kernel::FaceSource::CertifiedExtrudeSide { producer, sketch: current_sketch, curve: current_curve, .. }) if *producer == target.origin_feature && current_sketch == sketch && current_curve == curve).then_some(index)
-            }).collect();
+            let side = |index: usize, exact: bool| matches!(body.body.face_sources().and_then(|sources| sources.get(index)), Some(Some(solidcraft_kernel::FaceSource::CertifiedExtrudeSide { producer, sketch: current_sketch, curve: current_curve, .. })) if *producer == target.origin_feature && current_sketch == sketch && (!exact || current_curve == curve));
+            let count = body.body.face_sources().map_or(0, |sources| sources.len());
+            let mut indices: Vec<_> = (0..count).filter(|index| side(*index, true)).collect();
+            // A side drawn in collinear pieces is one face over all of them (#1788): a certificate
+            // made when the pieces were faces of their own finds it by the piece's name, which
+            // the joined face answers to.
+            if indices.is_empty() {
+                let names = crate::naming::names(body);
+                indices = (0..count)
+                    .filter(|index| {
+                        side(*index, false) && crate::history_names::matches(&names, *index, &target.name) == Some(crate::history_names::Match::Alias)
+                    })
+                    .collect();
+            }
             if indices.is_empty() {
                 return Err(DocError::Unknown("constructed side certificate no longer exists".into()));
             }

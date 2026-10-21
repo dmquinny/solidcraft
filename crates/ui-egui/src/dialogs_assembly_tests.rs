@@ -8,13 +8,7 @@ use crate::dialogs::{apply_commands, face_sel, preview_commands};
 /// Components A (grounded) and B: a 20 x 20 x 10 box each, B 30 mm along X.
 fn two_boxes() -> SolveApp {
     let mut s = Session::default();
-    for (name, x) in [("A", 0), ("B", 30)] {
-        s.execute("component.activate", &json!({"component": "root"})).unwrap();
-        s.execute("component.create", &json!({ "name": name })).unwrap();
-        s.execute("solid.box", &json!({"length": 20, "width": 20, "height": 10, "corner": [x, 0, 0]})).unwrap();
-    }
-    s.execute("component.activate", &json!({"component": "root"})).unwrap();
-    s.execute("occurrence.ground", &json!({"occurrence": "A:1", "grounded": true})).unwrap();
+    crate::test_support::grounded_boxes(&[("A", 0), ("B", 30)], |id, p| s.execute(id, &p).unwrap());
     SolveApp::new(s, Services::default())
 }
 
@@ -138,6 +132,29 @@ fn edit_joint_runs_edit_and_limits() {
     assert!((j.offset - 2.0).abs() < 1e-12);
 }
 
+/// Edit Joint shows an offset typed as an expression as that expression, and OK keeps it; the
+/// dialog's plain numbers keep no expression.
+#[test]
+fn edit_joint_keeps_an_offset_typed_as_an_expression() {
+    let mut app = two_boxes();
+    let (a, b) = (occ(&app, "A"), occ(&app, "B"));
+    app.run("parameters.add", json!({"name": "gap", "expression": "3 mm"})).unwrap();
+    let (fa, fb) = (json!({"occurrence": a, "face": [10, 10, 10]}), json!({"occurrence": b, "face": [40, 10, 0]}));
+    app.run("joint.create", json!({"type": "rigid", "a": fa, "b": fb, "offset": "gap", "angle": "0 deg"})).unwrap();
+    let id = app.session.doc.assembly.joints[0].id;
+    let mut d = edit_joint(&app, id).unwrap();
+    if let Kind::Assembly(Asm::Joint(f)) = &mut d.kind {
+        assert_eq!(f.offset[2], "gap");
+        f.flip = true;
+    }
+    for (id, p) in apply_commands(&app, &d).unwrap() {
+        app.run(&id, p).unwrap();
+    }
+    let j = &app.session.doc.assembly.joints[0];
+    assert!(j.flip);
+    assert_eq!((j.exprs.offset.as_deref(), j.exprs.angle.as_deref()), (Some("gap"), None));
+}
+
 /// As-built joints and rigid groups take components from body picks; New Component makes one
 /// from bodies when bodies are picked.
 #[test]
@@ -192,7 +209,7 @@ fn ok_click_survives_a_busy_preview() {
         f.animate = true;
     }
     app.dialog = Some(d);
-    let ctx = egui::Context::default();
+    let ctx = crate::fonts::test_context();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
     let frame = |app: &mut SolveApp, busy: bool, events: Vec<egui::Event>| {
         app.preview.busy = busy;
@@ -244,7 +261,7 @@ fn picks_on_one_component_say_why_and_offer_components() {
     d.pick(&app.session, face_sel(&app.session, Vec3::new(40.0, 10.0, 0.0)).unwrap());
     assert!(apply_commands(&app, &d).is_err(), "one component: no joint");
     app.dialog = Some(d);
-    let ctx = egui::Context::default();
+    let ctx = crate::fonts::test_context();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
     let frame = |app: &mut SolveApp, events: Vec<egui::Event>| {
         let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
@@ -273,7 +290,7 @@ fn picks_on_one_component_say_why_and_offer_components() {
     assert!(text_at(&out, &why).is_none(), "nothing left to say");
 }
 
-/// Two top faces mate face to face as in Fusion: B ends up upside down on A, not inside it;
+/// Two top faces mate face to face: B ends up upside down on A, not inside it;
 /// Flip turns it back over (into A).
 #[test]
 fn face_snaps_mate_face_to_face() {
@@ -312,7 +329,7 @@ fn drive_value_takes_the_keyboard() {
     app.run("joint.create", json!({"type": "revolute", "a": {"occurrence": a, "face": [10, 10, 10]}, "b": {"occurrence": b, "face": [40, 10, 0]}}))
         .unwrap();
     app.start("joint.drive");
-    let ctx = egui::Context::default();
+    let ctx = crate::fonts::test_context();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
     let frame = |app: &mut SolveApp, events: Vec<egui::Event>| {
         let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };

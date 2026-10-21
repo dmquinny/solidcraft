@@ -67,6 +67,17 @@ pub fn publish_handle(name: &str, at: egui::Pos2) {
     HANDLES.with(|h| h.borrow_mut().push((name.to_string(), at)));
 }
 
+/// Publish a rectangle and its centered interaction handle with the same explicit identity.
+pub(crate) fn publish_target(name: &str, rect: egui::Rect) {
+    publish_target_as(name, name, rect);
+}
+
+/// Publish centered geometry with explicit, independently named handle and rectangle aliases.
+pub(crate) fn publish_target_as(handle: &str, rect_name: &str, rect: egui::Rect) {
+    publish_handle(handle, rect.center());
+    publish_rect(rect_name, rect);
+}
+
 /// Where a handle was drawn last frame.
 pub fn handle_at(name: &str) -> Option<egui::Pos2> {
     HANDLES.with(|h| h.borrow().iter().rfind(|(n, _)| n == name).map(|x| x.1))
@@ -84,6 +95,11 @@ pub fn publish_rect(name: &str, r: egui::Rect) {
 
 pub fn rect_of(name: &str) -> Option<egui::Rect> {
     RECTS.with(|h| h.borrow().iter().rfind(|(n, _)| n == name).map(|x| x.1))
+}
+
+#[cfg(test)]
+pub(crate) fn rects(prefix: &str) -> Vec<(String, egui::Rect)> {
+    RECTS.with(|r| r.borrow().iter().filter(|(name, _)| name.starts_with(prefix)).cloned().collect())
 }
 
 /// A number about this frame's drawing, by name ("axis_view_highlights": the axis view's highlighted tips).
@@ -160,7 +176,11 @@ impl Harness {
     pub fn new() -> Harness {
         let mut h = Harness {
             app: SolveApp::new(Session::default(), Services::default()),
-            ctx: egui::Context::default(),
+            ctx: {
+                let ctx = egui::Context::default();
+                crate::fonts::setup_bundled_fonts(&ctx);
+                ctx
+            },
             output: Default::default(),
             dir: scratch_dir(),
             next_file: Rc::new(RefCell::new(None)),
@@ -217,6 +237,34 @@ impl Harness {
         }
     }
 
+    /// One frame in which the platform drops `files`, the pointer last seen at `at` (a drop
+    /// itself carries no position with winit 0.30).
+    pub fn drop_files(&mut self, at: egui::Pos2, files: Vec<egui::DroppedFileHandle>) {
+        self.drag_files(at, Vec::new(), files);
+    }
+
+    /// One frame in which files are dragged over the window (`hovered`) or dropped, the pointer
+    /// last seen at `at`.
+    pub fn drag_files(&mut self, at: egui::Pos2, hovered: Vec<egui::HoveredFile>, dropped: Vec<egui::DroppedFileHandle>) {
+        self.time += 1.0 / 60.0;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
+            time: Some(self.time),
+            focused: true,
+            events: vec![egui::Event::PointerMoved(at)],
+            hovered_files: hovered,
+            dropped_files: dropped,
+            ..Default::default()
+        };
+        let app = &mut self.app;
+        let mut out = self.ctx.run_ui(raw, |ui| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        });
+        out.textures_delta.clear();
+        self.output = out.platform_output;
+    }
+
     /// Frames until the queued input is used up (and the view has settled).
     pub fn settle(&mut self) {
         for _ in 0..2000 {
@@ -226,9 +274,11 @@ impl Harness {
             }
             self.frame();
         }
-        // A file opening or recovering in the background: wait for it (as a person would).
+        // A file opening, recovering or saving in the background: wait for it (as a person would).
         let began = std::time::Instant::now();
-        while !self.app.file_load.idle() && began.elapsed() < std::time::Duration::from_secs(120) {
+        while (!self.app.file_load.idle() || self.app.saving.is_some() || crate::open_meshing::active(&self.app))
+            && began.elapsed() < std::time::Duration::from_secs(120)
+        {
             self.frame();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -487,6 +537,7 @@ impl Harness {
                 }
                 drop(old);
                 self.ctx = egui::Context::default();
+                crate::fonts::setup_bundled_fonts(&self.ctx);
                 self.ctx.enable_accesskit();
                 self.install();
                 self.start_autosave();
@@ -750,7 +801,8 @@ pub fn check(h: &mut Harness, e: &Value) -> Result<(), String> {
                 if r.width() < lo - 0.5 || r.width() > hi + 0.5 {
                     return Err(format!("dialog width {:.0}, want {lo}..{hi}", r.width()));
                 }
-                if (r.right() - vp.right()).abs() > 2.0 || r.top() < vp.top() || r.bottom() > vp.bottom() + 1.0 {
+                let clearance = if rect_of("dialog:header").is_some() { crate::theme::Tokens::get().space_8 } else { 0.0 };
+                if (r.right() - (vp.right() - clearance)).abs() > 0.5 || r.top() < vp.top() || r.bottom() > vp.bottom() + 1.0 {
                     return Err(format!("dialog {r:?} is not docked right inside the viewport {vp:?}"));
                 }
             }
@@ -1049,3 +1101,7 @@ pub fn check(h: &mut Harness, e: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "scenario_publication_tests.rs"]
+mod publication_tests;

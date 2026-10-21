@@ -67,20 +67,46 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             }
             apply_op(st, f, tools, *operation, &crate::plain(targets))
         }
-        FeatureKind::SurfaceTrim { body, plane, tool, keep } => {
+        FeatureKind::SurfaceTrim { body, plane, tool, keep, keep_more, curves, with, keep_with, stitch, extend } => {
             let i = st.bodies.iter().position(|b| &b.name == body).ok_or_else(|| DocError::Unknown(format!("body `{body}`")))?;
             let Some(mb) = st.bodies.get(i).cloned() else { return Err(DocError::Invalid("body".into())) };
-            let trimmed = match tool {
-                Some(t) => {
+            let picks: Vec<Vec3> = std::iter::once(keep.0).chain(keep_more.iter().map(|p| p.0)).collect();
+            let keeps = if keep_more.is_empty() { kernel::TrimKeep::Side(keep.0) } else { kernel::TrimKeep::Regions(&picks) };
+            if let Some(other) = with {
+                return mutual_trim(st, i, other, keeps, &crate::plain(keep_with), *stitch, *extend);
+            }
+            let trimmed = match (tool, curves) {
+                (Some(t), _) => {
                     let tb = st.body(&t.body).ok_or_else(|| DocError::Unknown(format!("body `{}`", t.body)))?;
                     let face = crate::appearance::face_index_at(tb, t.point.0)
                         .ok_or_else(|| DocError::Invalid(format!("no face of `{}` at the tool point", t.body)))?;
-                    kernel::trim(&mb.body, &kernel::SplitTool::Face { body: &tb.body, face }, keep.0)?
+                    kernel::trim_keep(&mb.body, &kernel::SplitTool::Face { body: &tb.body, face }, keeps)?
                 }
-                None => kernel::trim(&mb.body, &kernel::SplitTool::Plane(doc.resolve_plane_in(vals, plane, 0, Some(st))?), keep.0)?,
+                (None, Some(c)) => {
+                    let ss = st
+                        .sketch(c.sketch.0)
+                        .ok_or_else(|| DocError::Unknown(format!("sketch {} (it must come earlier in the timeline)", c.sketch)))?;
+                    let ss = sketch_in_feature_frame(doc, ss, f.component)?;
+                    let ids: Vec<String> = if c.curves.is_empty() {
+                        ss.sketch.curves.iter().filter(|k| !k.construction).map(|k| k.id.clone()).collect()
+                    } else {
+                        c.curves.clone()
+                    };
+                    let chains = curve_chains(&ss, &ids)?;
+                    if chains.is_empty() {
+                        return Err(DocError::Invalid(format!("sketch `{}` has no curves to trim with", ss.name)));
+                    }
+                    kernel::trim_keep(
+                        &mb.body,
+                        &kernel::SplitTool::Curves { plane: ss.plane, curves: chains, along: c.direction.map(|d| d.0) },
+                        keeps,
+                    )?
+                }
+                (None, None) => kernel::trim_keep(&mb.body, &kernel::SplitTool::Plane(doc.resolve_plane_in(vals, plane, 0, Some(st))?), keeps)?,
             };
+            let made = Traced::step(trimmed, &[&mb.traced()]);
             if let Some(slot) = st.bodies.get_mut(i) {
-                *slot = ModelBody::new(mb.name, trimmed, mb.feature);
+                *slot = ModelBody::traced_new(mb.name, made, mb.feature);
             }
             Ok(())
         }
@@ -115,7 +141,7 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             }
             Ok(())
         }
-        FeatureKind::SurfaceBlend { from, to, continuity, bulge, align, stitch } => {
+        FeatureKind::SurfaceBlend { from, to, continuity, bulge, align, seam, stitch } => {
             let a = st.body(&from.body).ok_or_else(|| DocError::Unknown(format!("body `{}`", from.body)))?.body.clone();
             let b = st.body(&to.body).ok_or_else(|| DocError::Unknown(format!("body `{}`", to.body)))?.body.clone();
             if from.edges.is_empty() || to.edges.is_empty() {
@@ -129,6 +155,7 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
                 *continuity,
                 *bulge,
                 align.map(|[p, q]| [p.0, q.0]),
+                seam.map(|[p, q]| [p.0, q.0]),
                 BLEND_STATIONS,
                 *stitch,
             )?;
@@ -151,10 +178,47 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
                 st.sketch(sketch.0).ok_or_else(|| DocError::Unknown(format!("sketch {sketch} (it must come earlier in the timeline)")))?,
                 f.component,
             )?;
-            let boundaries = boundary_frames(&ss, curves, orders, *samples)?;
-            let body = kernel::boundary_patch(&boundaries, *crown, *samples)?;
+            // Two curves are the two sides of a bridge. Three or four run round a loop: the Coons
+            // patch of the loop, which lies in the sketch's plane with them, so every order holds.
+            let body = if curves.len() >= 3 {
+                if *crown != 0.0 {
+                    return Err(DocError::Invalid(
+                        "not supported yet: crown on a patch through three or four curves (it is the flat patch of its sides)".into(),
+                    ));
+                }
+                loop_patch(&ss, curves)?
+            } else {
+                let boundaries = boundary_frames(&ss, curves, orders, *samples)?;
+                kernel::boundary_patch(&boundaries, *crown, *samples)?
+            };
             let name = new_name(st, f, 0);
             st.bodies.push(ModelBody::new(name, body, f.id));
+            Ok(())
+        }
+        FeatureKind::SurfaceNetwork { u, v, operation } => {
+            if !matches!(operation, crate::Operation::NewBody | crate::Operation::Join) {
+                return Err(DocError::Invalid("a boundary surface is a new body or joins the body of its edges".into()));
+            }
+            let us = network_sources(doc, st, f, u, "U")?;
+            let vs = network_sources(doc, st, f, v, "V")?;
+            let made = kernel::boundary_surface(&network_curves(&us), &network_curves(&vs))?;
+            if *operation == crate::Operation::Join {
+                // Into the body of the first curve picked on a body's edges.
+                let target = u
+                    .iter()
+                    .chain(v)
+                    .find_map(|c| c.body.clone())
+                    .ok_or_else(|| DocError::Invalid("join needs a curve on a body's edges: the surface is sewn into that body".into()))?;
+                let i = st.bodies.iter().position(|b| b.name == target).ok_or_else(|| DocError::Unknown(format!("body `{target}`")))?;
+                let Some(mb) = st.bodies.get(i).cloned() else { return Err(DocError::Invalid("body".into())) };
+                let joined = kernel::boundary_join(&mb.body, &made)?;
+                if let Some(slot) = st.bodies.get_mut(i) {
+                    *slot = ModelBody::new(mb.name, joined, mb.feature);
+                }
+                return Ok(());
+            }
+            let name = new_name(st, f, 0);
+            st.bodies.push(ModelBody::new(name, made, f.id));
             Ok(())
         }
         FeatureKind::SurfaceMatch { body, faces, target, edges, order } => {
@@ -325,11 +389,14 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             push_sheet(st, f, traced);
             Ok(())
         }
-        FeatureKind::SurfaceLoft { sections, continuity, crown } => {
+        FeatureKind::SurfaceLoft { sections, continuity, crown, rails, rail_fit } => {
             // A loft with edge chains for sections, or one that has to leave its ends a particular
             // way, is built through `loft_blend` from the frames of every section; the plain one
             // (sketch chains only, both ends G0) is the loft of old.
             if *continuity != [kernel::Continuity::G0, kernel::Continuity::G0] || sections.iter().any(|s| s.body.is_some()) {
+                if !rails.is_empty() {
+                    return Err(DocError::Invalid("not supported yet: guide rails on a loft with edge sections or end continuity".into()));
+                }
                 return loft_blend(st, f, sections, *continuity, *crown, doc);
             }
             let mut secs = Vec::with_capacity(sections.len());
@@ -354,10 +421,17 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
                 secs.push((ss.plane, chain));
                 sketches.push(ss);
             }
-            let body = kernel::loft_sheet(&secs)?;
+            let body = if rails.is_empty() {
+                kernel::loft_sheet(&secs)?
+            } else {
+                // The rails run from the end at the first section.
+                let start = secs.first().and_then(|(p, c)| c.first().map(|seg| p.to_world(seg.start()))).unwrap_or_default();
+                let rails = crate::eval::rail_polylines(doc, st, rails, f.component, start)?;
+                kernel::loft_sheet_with_rails(&secs, &rails, crate::eval::kernel_rail_fit(*rail_fit))?
+            };
             // Each wall named by the section curves it runs between, as a loft's sides are.
             let loops: Vec<solidcraft_geom::Loop2> = secs.iter().map(|(_, c)| solidcraft_geom::Loop2 { segs: c.clone() }).collect();
-            let traced = crate::lineage::SectionRoles { sections: sketches.iter().zip(&loops).collect() }.tool(body);
+            let traced = crate::lineage::SectionRoles { sections: sketches.iter().zip(&loops).map(|(s, lp)| (s, vec![lp])).collect() }.tool(body);
             push_sheet(st, f, traced);
             Ok(())
         }
@@ -439,6 +513,135 @@ fn push_sheet(st: &mut ModelState, f: &Feature, traced: crate::lineage::Traced) 
     st.bodies.push(ModelBody::traced_new(name, traced, f.id));
 }
 
+/// The most curves one direction of a network may list (the kernel's own cap).
+const MAX_NETWORK_CURVES: usize = solidcraft_geom::network::MAX_NETWORK_CURVES;
+
+/// A loop of three or four sketch curves as one patch: four give the Coons patch of opposite pairs
+/// (the first and third one way, the second and fourth the other); three collapse the side
+/// opposite the first curve to the corner where the other two meet.
+fn loop_patch(ss: &SolvedSketch, curves: &[String]) -> Result<kernel::Body> {
+    let mut chains: Vec<Vec<Seg2>> = Vec::with_capacity(curves.len());
+    for id in curves {
+        let ci = ss.sketch.curve_index(id).ok_or_else(|| DocError::Unknown(format!("sketch curve `{id}`")))?;
+        let segs = ss.sketch.exact_segs(ci).unwrap_or_else(|| ss.sketch.segs(ci));
+        if segs.is_empty() {
+            return Err(DocError::Invalid(format!("curve `{id}` has no geometry to build on")));
+        }
+        chains.push(segs);
+    }
+    let side = |k: usize| -> Result<kernel::BoundaryCurve<'static>> {
+        let (Some(id), Some(segs)) = (curves.get(k), chains.get(k)) else { return Err(DocError::Invalid("a boundary curve is missing".into())) };
+        Ok(kernel::BoundaryCurve {
+            label: format!("curve `{id}`"),
+            source: kernel::CurveSource::Sketch { plane: ss.plane, segs: segs.clone() },
+            continuity: kernel::Continuity::G0,
+        })
+    };
+    match curves.len() {
+        4 => Ok(kernel::boundary_surface(&[side(0)?, side(2)?], &[side(1)?, side(3)?])?),
+        3 => {
+            // The corner the second and third curves share, whichever way each was drawn.
+            let ends = |k: usize| -> Option<[Vec2; 2]> {
+                let c = chains.get(k)?;
+                Some([c.first()?.start(), c.last()?.end()])
+            };
+            let (Some(b), Some(c)) = (ends(1), ends(2)) else { return Err(DocError::Invalid("a boundary curve is missing".into())) };
+            let mut best = (f64::INFINITY, Vec2::new(0.0, 0.0));
+            for p in b {
+                for q in c {
+                    if p.dist(q) < best.0 {
+                        best = (p.dist(q), (p + q) * 0.5);
+                    }
+                }
+            }
+            let apex = kernel::BoundaryCurve {
+                label: "the corner opposite the first curve".into(),
+                source: kernel::CurveSource::Point(ss.plane.to_world(best.1)),
+                continuity: kernel::Continuity::G0,
+            };
+            Ok(kernel::boundary_surface(&[side(0)?, apex], &[side(1)?, side(2)?])?)
+        }
+        _ => Err(DocError::Invalid("a loop patch takes three or four curves".into())),
+    }
+}
+
+/// A network curve resolved in the feature's frame, owning what it is built from.
+enum NetSource {
+    Sketch(solidcraft_geom::Plane, Vec<Seg2>),
+    Points(Vec<Vec3>),
+    Edges(kernel::Body, Vec<Vec3>),
+    Point(Vec3),
+}
+
+/// The curves of one direction of a network, resolved: each one sketch chain, 3D sketch chain,
+/// edge chain or point, labelled `U1`, `U2`, … (with `dir` "U") for messages.
+fn network_sources(
+    doc: &Document,
+    st: &ModelState,
+    f: &Feature,
+    list: &[crate::NetworkCurve],
+    dir: &str,
+) -> Result<Vec<(String, NetSource, kernel::Continuity)>> {
+    if list.len() > MAX_NETWORK_CURVES {
+        return Err(DocError::Invalid(format!("at most {MAX_NETWORK_CURVES} curves each way")));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for (k, c) in list.iter().enumerate() {
+        let label = format!("{dir}{}", k + 1);
+        let given = [c.sketch.is_some() || !c.curves.is_empty(), c.body.is_some() || !c.edges.is_empty(), c.point.is_some()];
+        if given.iter().filter(|g| **g).count() != 1 {
+            return Err(DocError::Invalid(format!("{label} must be sketch curves, a body's edges or a point")));
+        }
+        let source = if let Some(p) = c.point {
+            NetSource::Point(p.0)
+        } else if let Some(name) = &c.body {
+            if c.edges.is_empty() {
+                return Err(DocError::Invalid(format!("{label} needs points on the edges of {name}")));
+            }
+            let b = st.body(name).ok_or_else(|| DocError::Unknown(format!("body `{name}`")))?;
+            NetSource::Edges(b.body.clone(), crate::plain(&c.edges))
+        } else {
+            let sk = c.sketch.ok_or_else(|| DocError::Invalid(format!("{label} needs the sketch its curves are in")))?;
+            if c.curves.is_empty() || c.curves.len() > MAX_CHAIN_CURVES {
+                return Err(DocError::Invalid(format!("{label} needs 1 to {MAX_CHAIN_CURVES} curves of its sketch")));
+            }
+            let raw = st.sketch(sk.0).ok_or_else(|| DocError::Unknown(format!("sketch {sk} (it must come earlier in the timeline)")))?;
+            // 3D sketch curves are followed through their points; planar ones exactly.
+            let mapped = path_in_frame(doc, raw, f.component)?;
+            match path_points(&mapped, &c.curves, Vec3::new(f64::NAN, f64::NAN, f64::NAN))? {
+                Some(pts) => NetSource::Points(pts),
+                None => {
+                    let ss = sketch_in_feature_frame(doc, raw, f.component)?;
+                    let mut chains = curve_chains(&ss, &c.curves)?.into_iter();
+                    let (Some(chain), None) = (chains.next(), chains.next()) else {
+                        return Err(DocError::Invalid(format!("{label}: its curves must meet end to end in one chain")));
+                    };
+                    NetSource::Sketch(ss.plane, chain)
+                }
+            }
+        };
+        out.push((label, source, c.continuity));
+    }
+    Ok(out)
+}
+
+/// The kernel's curves over resolved sources (borrowing their bodies).
+fn network_curves(sources: &[(String, NetSource, kernel::Continuity)]) -> Vec<kernel::BoundaryCurve<'_>> {
+    sources
+        .iter()
+        .map(|(label, src, g)| kernel::BoundaryCurve {
+            label: label.clone(),
+            source: match src {
+                NetSource::Sketch(plane, segs) => kernel::CurveSource::Sketch { plane: *plane, segs: segs.clone() },
+                NetSource::Points(pts) => kernel::CurveSource::Points(pts.clone()),
+                NetSource::Edges(body, at) => kernel::CurveSource::Edges { body, at: at.clone() },
+                NetSource::Point(p) => kernel::CurveSource::Point(*p),
+            },
+            continuity: *g,
+        })
+        .collect()
+}
+
 /// The boundaries `surface.boundary` builds its patch from: each picked curve's own stations in
 /// the sketch's frame, every one of them leaving the boundary square into the loop — the direction
 /// from the curve towards the middle of the loop, taken across its tangent — over the plane the
@@ -501,6 +704,43 @@ fn boundary_frames(
         out.push(Boundary { frames, order: orders.get(side).copied().unwrap_or(solidcraft_kernel::Continuity::G1) });
     }
     Ok(out)
+}
+
+/// Mutual Trim: the body at `i` and `other` trimmed by each other (each keeping its picks), the
+/// kept pieces sewn into the first when `stitch`; their faces named after the faces they are
+/// pieces of.
+fn mutual_trim(st: &mut ModelState, i: usize, other: &str, keeps: kernel::TrimKeep, keep_with: &[Vec3], stitch: bool, extend: bool) -> Result<()> {
+    let j = st.bodies.iter().position(|b| b.name == other).ok_or_else(|| DocError::Unknown(format!("body `{other}`")))?;
+    if i == j {
+        return Err(DocError::Invalid("a surface can't trim itself: pick another surface".into()));
+    }
+    let (Some(a), Some(b)) = (st.bodies.get(i).cloned(), st.bodies.get(j).cloned()) else { return Err(DocError::Invalid("body".into())) };
+    let keeps_with = match keep_with {
+        [] => return Err(DocError::Invalid(format!("pick the side of `{other}` to keep"))),
+        [p] => kernel::TrimKeep::Side(*p),
+        ps => kernel::TrimKeep::Regions(ps),
+    };
+    let (ta, tb) = kernel::mutual_trim(&a.body, &b.body, keeps, keeps_with, extend)?;
+    let (ta, tb) = (Traced::step(ta, &[&a.traced()]), Traced::step(tb, &[&b.traced()]));
+    if stitch {
+        let sewn = kernel::stitch(&[&ta.body, &tb.body], 0.0)?;
+        if sewn.edge_count() >= ta.body.edge_count() + tb.body.edge_count() {
+            return Err(DocError::Invalid("the trimmed surfaces don't meet along an edge: they can't be stitched".into()));
+        }
+        let sewn = Traced::step(sewn, &[&ta, &tb]);
+        if let Some(slot) = st.bodies.get_mut(i) {
+            *slot = ModelBody::traced_new(a.name, sewn, a.feature);
+        }
+        st.bodies.retain(|x| x.name != other);
+    } else {
+        if let Some(slot) = st.bodies.get_mut(i) {
+            *slot = ModelBody::traced_new(a.name, ta, a.feature);
+        }
+        if let Some(slot) = st.bodies.get_mut(j) {
+            *slot = ModelBody::traced_new(b.name, tb, b.feature);
+        }
+    }
+    Ok(())
 }
 
 /// What a surface builder sweeps: the boundary loops of the picked profiles, then the picked

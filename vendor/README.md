@@ -30,6 +30,11 @@ Changes:
   With no direction to go by, the edge goes where both of its ends are in one wire.
 - `transversal/divide_face/mod.rs`: a face piece whose wire is not simple makes the operation
   give up (`Face::try_new`) instead of panicking.
+- `transversal/divide_face/mod.rs`: a loop whose polygon in the face's parameters has no area
+  (a small hole's rim divided at the tolerance of a much larger operand: one chord per half
+  circle) is divided again, finer, before its area's sign tells a hole from a face piece. The
+  sign of a zero area was random: the hole became a face of its own, inside out, and the face it
+  was cut in stayed whole.
 - `lib.rs`: `tr!` reports where an operation gives up when `SHAPEOPS_TRACE` is set; compiler
   warnings no longer fail the build.
 - Face and edge history (`transversal/history.rs`, new): `and_with_history` / `or_with_history`
@@ -41,6 +46,16 @@ Changes:
   a moved vertex), across the passes that fold in the operands' extra shells. `and` / `or` are
   wrappers that drop the history; the `*_with_history` forms return the same solid with the
   history as an `Option` (`None` where a face or edge went unrecorded).
+- `transversal/integrate/mod.rs`: `meshes` and `and_with_history_meshed` take the first
+  operand's shell meshes made beforehand (copied for each use, since the loops stores cut their
+  edges): a large body cut down to the regions of many small ones is meshed once, which was most
+  of each operation's time.
+- `transversal/integrate/mod.rs`: in an AND, a face no intersection divides (a shell that meets
+  nothing of the other) is placed by the crossings of a ray with the other shell counted as each
+  face is oriented, not by its surface alone, and an inward shell (a void, a cut's inverted tool)
+  holds what lies outside it. Faces with reversed surfaces (a revolved body's) counted the wrong
+  way, and a void dropped every face outside it: a cut beside a sealed void came out empty or
+  with the body gone. An OR keeps truck's count.
 
 ## truck-geometry 0.5.0 (Apache-2.0, © RICOS Co. Ltd., https://github.com/ricosjp/truck)
 
@@ -59,6 +74,10 @@ Changes:
   back to the seam at the other end of the period and fold its parameter polygon over itself (no
   intersection loop then lay inside the face). `crates/kernel/src/seam_faces_tests.rs` holds it
   to a cone read from STEP.
+- `nurbs/bspsurface.rs`: `uuder` and `vvder` multiply by p·(p − 1), as `BSplineCurve::der2`
+  does. They multiplied by p only, so the second derivatives of every B-spline and NURBS surface
+  of degree p ≥ 3 were 1/(p − 1) of their value (a cubic surface's curvature read as half, #763).
+  `crates/kernel/src/surface_second_derivative_tests.rs` holds them to finite differences.
 
 ## truck-stepio 0.3.0 (Apache-2.0, © RICOS Co. Ltd., https://github.com/ricosjp/truck)
 
@@ -123,6 +142,12 @@ Changes:
 - `tessellation/triangulation.rs`: meshed faces and edges are built unchecked: faces whose loop
   runs along a seam edge both ways and closed edges (a full circle on one vertex) are valid,
   but the debug-build checks rejected them (debug builds could not mesh them).
+- `tessellation/triangulation.rs`: on a periodic surface, a boundary point's projected parameter
+  is moved by whole periods to within half a period of the point before it, however many periods
+  away the search put it (it was moved by two periods at most). A hinted search on a revolved
+  surface can return an angle millions of turns from its hint; the loop then spanned those turns,
+  the polyline closing it across the seam had millions of points, and meshing never finished,
+  which hung the STEP export that reads its own file back (#1985).
 - `tessellation/triangulation.rs`: parameter searches that land outside a surface's bounded,
   non-periodic domain are rejected (a hinted B-spline search can run off and extrapolate to
   thousands of parameter units, and meshing that grid never finishes); the last-resort nearest
@@ -160,6 +185,22 @@ Changes:
   old test is kept as `tessellation::include_test_hooks`, behind a `test-hooks` feature that
   only `solidcraft-kernel`'s tests turn on, and `crates/kernel/tests/tess_include_equivalence.rs`
   compares the two.
+- `tessellation/triangulation.rs`: the constrained Delaunay triangulation of a trimmed face
+  works in (u, v) scaled by the surface's mean speed along each (a power of two, so exact both
+  ways). In raw parameters, a loft side ruled across (about 30 mm) and long along the loft
+  (about 600 mm) is a strip stretched twentyfold, and a trimming node was fanned to boundary
+  nodes hundreds of millimetres away: a flat sheet through a joined tube.
+- `tessellation/triangulation.rs`: every segment of a face's boundary becomes a constraint; one
+  that crosses or overlaps a constraint already added (an intersection edge's polyline can hook
+  back a few micrometres past its vertex) is split where they meet. truck dropped such a
+  segment and joined its start to the first later node it could reach, which on a joined tube
+  left a trimming curve's 130 nodes behind one constraint across the face: slivers from it
+  sagged millimetres off the surface, and a face pinched to a point (#1648) got no triangles.
+  All meshes; faces whose segments all go in mesh as before.
+- `tessellation/mod.rs`: `Deflection::rulings` is now `Deflection::display`: a mesh to display
+  or export (the kernel's `tessellate` and display meshes), which gets the ruling grid lines,
+  and the speed-scaled triangulation above. The meshes a Boolean operation intersects
+  (`Deflection::chord`) keep truck's (u, v) and insertion order.
 - `lib.rs`: compiler warnings no longer fail the build. Example, test and bench targets are
   dropped (their sources are not vendored).
 - `tessellation/triangulation.rs`: adaptive division also splits a cell that bows off its
@@ -171,13 +212,12 @@ Changes:
   face's mesh puts each point at its parameters on the face's own surface, so a point of an edge
   that lies off a surface within tolerance (an intersection-curve sample whose projection did not
   converge, an imported edge) came out in a different place on each of the edge's faces, and the
-  exported mesh had a crack there. In display and export meshes (`Deflection::rulings`), a
+  exported mesh had a crack there. In display and export meshes (`Deflection::display`), a
   vertex at a point of a face's boundary loops that is farther than `TOLERANCE` from the nearest
   point of the face's edges now goes to that point, when it is within the chord tolerance
   (`onto_edges`). Points within `TOLERANCE` stay on the surface, so exact geometry meshes as
   before. The meshes Boolean operations intersect keep truck's points.
-
-- `tessellation/triangulation.rs`: in display and export meshes (`Deflection::rulings`), a
+- `tessellation/triangulation.rs`: in display and export meshes (`Deflection::display`), a
   direction left undivided along the rulings of a face ruled one way also gets a grid line
   through each point of the face's boundary that lies inside the face along it
   (`with_boundary_lines`), when there are at most 16 such points: corners standing into the
@@ -187,6 +227,17 @@ Changes:
   the face, many degrees round: those triangles cut through the surface and folded over each
   other (a cone face with a small hole meshed several mm² too large, and the boolean that made
   it was refused for its volume).
+- `tessellation/triangulation.rs`: a face that comes out of the triangulation with no triangle
+  at all, though the points of its one boundary loop enclose an area in space, is given the
+  triangles of that loop (ears clipped on the plane of the loop, no point added, so the faces on
+  either side of its edges still meet it). Its two edges can be different curves that, sampled
+  as they are, run along the same line in the face's parameters (a lens thinner than the
+  tolerance), and the loop then has no area there. The shell's mesh had a hole. Faces that
+  mesh are untouched, and so are preview meshes (they have their own step grid). Only a face
+  with one loop of at most 256 points is filled, and not one whose loop crosses itself, whose
+  ears would overlap (the pinched face of #1648 is one): it stays as it was.
+  `crates/kernel/src/thin_face_tests.rs` holds it, `crates/kernel/tests/tess_loop_fill.rs` the
+  ear clipping (through the `test-hooks` feature).
 
 ## matext4cgmath 0.1.0 (Apache-2.0, © RICOS Co. Ltd., https://github.com/ricosjp/matext4cgmath)
 
@@ -230,3 +281,14 @@ SolidCraft changes:
   an unsupported surface no longer unwrap.
 - `src/winit.rs`: acquire a drawable before preparing paint callbacks, so a skipped
   surface frame cannot discard initialization commands for cached viewport meshes.
+- `src/lib.rs`, `src/winit.rs`: surfaces are configured under `capture_errors` (error scopes):
+  a configuration the device refuses (D3D12 "Failed to wait for GPU to come idle before
+  reconfiguring the Surface", #1935) is logged, the frame is skipped and the configure is tried
+  again, instead of the device's uncaptured-error handler panicking. A streak of refusals warns
+  once (debug after), waits 16 ms doubling up to 1 s between tries and recreates the surface
+  every `SURFACE_RECREATE_AFTER` refusals (`ConfigureRetry`). Each surface keeps the deadline of
+  its next try: until it is due, no configure or recreate happens, whether the repaint comes
+  from input, an animation, a resize (its size is kept for the retry) or an outdated surface,
+  and the frame is skipped with a repaint asked for when it is due. The streak and the deadline
+  survive a recreate; a configure the device takes ends the streak, a recreate it asked for
+  included. A recreate for a lost surface goes ahead as before.

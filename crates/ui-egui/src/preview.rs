@@ -2,7 +2,8 @@
 //! scratch copy of the session ([`solidcraft_engine::Session::preview`]), off the UI thread
 //! where threads exist, and the result is drawn in place of the bodies it changes: new surface
 //! tinted, removed material as a translucent ghost. The last good preview stays up while the
-//! next one computes or when an input makes the feature fail (the error shows in the dialog).
+//! next one computes; once the current inputs make the feature fail, nothing is previewed and
+//! the error shows in the dialog (#3254).
 //! Nothing here touches the document or the undo history.
 //!
 //! A feature that adds or removes a tool body (join, cut, intersect) shows only its tool. That
@@ -15,7 +16,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use serde_json::Value;
 use solidcraft_engine::Session;
 use solidcraft_engine::doc::ModelState;
-use solidcraft_engine::geom::{Aabb3, Mesh, Vec3};
+use solidcraft_engine::geom::{Aabb3, Mesh, Ring, Vec3};
 
 use crate::SolveApp;
 use crate::gpu::{GpuScene, SceneSlot};
@@ -36,6 +37,17 @@ impl Colors {
     pub fn from_tokens(t: &Tokens) -> Colors {
         let c = |c: egui::Color32| c.to_srgba_unmultiplied();
         Colors { body: c(t.body), added: c(t.preview_add), new_body: c(t.preview_new), removed: c(t.preview_cut), edge: c(t.body_edge) }
+    }
+
+    fn for_tool(t: &Tokens, tab: &str, active: bool) -> Colors {
+        let mut colors = Self::from_tokens(t);
+        let accent = crate::theme::TabAccent::for_tab(t, tab);
+        if active && accent.color != t.accent {
+            colors.added = accent.color.to_srgba_unmultiplied();
+            colors.new_body = t.body.lerp_to_gamma(accent.color, 0.45).to_srgba_unmultiplied();
+        }
+        // Removed material retains its warning colour and opacity.
+        colors
     }
 }
 
@@ -83,7 +95,7 @@ pub struct PreviewState {
     /// Is a preview scene up?
     pub active: bool,
     pub sketches: Vec<SketchPreview>,
-    /// Why the current inputs don't make a feature (the last good preview stays up).
+    /// Why the current inputs don't make a feature (nothing is previewed then).
     pub error: Option<String>,
     /// A preview is being computed.
     pub busy: bool,
@@ -98,10 +110,34 @@ pub struct PreviewState {
     pub stopped: Option<serde_json::Value>,
     /// The radius splines the previewed fillet tapered its edges with.
     pub tapered: Vec<(Vec3, solidcraft_engine::kernel::Taper)>,
+    straight: crate::extrude_preview::StraightPreview,
+    /// PreviewReselect: Primary held - hide the preview and restore replaced bodies for picks.
+    pub rolled_back: bool,
 }
 
 impl PreviewState {
+    /// Bodies the model scene should hide for the preview (empty while rolled back).
+    pub fn effective_replaced(&self) -> &[String] {
+        if self.rolled_back { &[] } else { &self.replaced }
+    }
+
+    /// Whether the preview scene should be drawn.
+    pub fn draw_active(&self) -> bool {
+        self.active && !self.rolled_back
+    }
+
+    /// Stop drawing the preview scene and give the bodies it stood in for back to the model.
+    fn hide_scene(&mut self) {
+        if self.active || !self.replaced.is_empty() {
+            self.active = false;
+            self.bounds = Aabb3::EMPTY;
+            self.replaced.clear();
+            self.set_scene(GpuScene::default());
+        }
+    }
+
     fn clear(&mut self) {
+        self.straight.clear();
         self.running = None;
         self.running_tool = false;
         self.running_stream_key = None;
@@ -112,12 +148,8 @@ impl PreviewState {
         self.tapered.clear();
         self.sketches.clear();
         self.busy = false;
-        if self.active || !self.replaced.is_empty() {
-            self.active = false;
-            self.bounds = Aabb3::EMPTY;
-            self.replaced.clear();
-            self.set_scene(GpuScene::default());
-        }
+        self.rolled_back = false;
+        self.hide_scene();
     }
 
     /// Drop the preview of a design that leaves the window. Its scene goes too: the viewport
@@ -151,7 +183,10 @@ impl PreviewState {
                 self.tapered = b.tapered;
                 self.set_scene(b.scene);
             }
+            // The current inputs make no feature: the last good geometry would contradict
+            // them (a 1 mm extrusion still drawn at 0 mm), so nothing is drawn.
             Err(e) => {
+                self.hide_scene();
                 self.sketches.clear();
                 self.error = Some(e);
                 self.applied = None;
@@ -233,9 +268,9 @@ fn motion_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option
     Some(h.finish())
 }
 
-/// Tool previews already stream in `poll`. New-body extrusions and face offsets instead
-/// build their full result; allow successful intermediate distances only within the same
-/// setup. Preserve selections, feature identity, extent mode, revision and colours. The
+/// Tool previews already stream in `poll`. New-body extrusions, face offsets, fillets and
+/// chamfers instead build their full result; allow successful intermediate distances (a
+/// fillet's radii, a chamfer's distances and angle) only within the same setup. Preserve selections, feature identity, extent mode, revision and colours. The
 /// exact job key still ensures the latest distance is computed and errors never go stale.
 fn stream_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option<u64> {
     if let Some(key) = motion_key(cmds, revision, colors) {
@@ -255,6 +290,10 @@ fn stream_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option
         let fields: &[&str] = match command.as_str() {
             "solid.extrude" => &["distance", "distance2", "to_offset"],
             "solid.offset_face" => &["distance"],
+            // A radius dragged or typed: each result shows while the next computes, rather than
+            // the preview holding still until the input stops changing.
+            "solid.fillet" => &["radius", "radius2", "mid"],
+            "solid.chamfer" => &["distance", "distance2", "angle"],
             _ => return None,
         };
         let params = params.as_object_mut()?;
@@ -271,7 +310,7 @@ fn stream_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option
 /// Keep the preview in step with the open dialog: start a computation when its inputs changed,
 /// take finished results. Called once per frame.
 pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
-    let cmds = match app.dialog.as_ref().filter(|d| d.previews()).map(|d| crate::dialogs::preview_commands(app, d)) {
+    let cmds = match app.dialog.as_ref().filter(|d| d.previews() && d.preview_enabled).map(|d| crate::dialogs::preview_commands(app, d)) {
         Some(Ok(c)) if !c.is_empty() => c,
         _ if crate::sketch_attachment_ui::commands(app).is_some() => crate::sketch_attachment_ui::commands(app).unwrap_or_default(),
         // A parameter being edited in Change Parameters.
@@ -284,7 +323,7 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
             return;
         }
     };
-    let colors = Colors::from_tokens(&Tokens::get());
+    let colors = Colors::for_tool(&Tokens::get(), &app.ui.tab, app.tool.is_some() || app.dialog.is_some());
     let key = job_key(&cmds, app.session.revision, colors);
     let stream_key = stream_key(&cmds, app.session.revision, colors);
     let tool = as_new_body(&cmds).is_some();
@@ -293,6 +332,14 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
     if pv.running.is_none() && pv.shown_key != Some(key) {
         pv.started = crate::now_ms();
         pv.running_stream_key = stream_key;
+        let mut straight = std::mem::take(&mut app.preview.straight);
+        let job = straight.compute(app, &cmds, colors);
+        app.preview.straight = straight;
+        if let Some(job) = job {
+            app.preview.apply(key, job);
+            app.preview.busy = false;
+            return;
+        }
         let scratch = app.session.scratch();
         spawn(&mut app.preview, key, scratch, cmds, colors, tool);
     }
@@ -341,8 +388,18 @@ fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, V
 /// kernel can't do yet), the tool body is still shown, with the error.
 pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
     if cmds.iter().any(|(command, params)| {
-        matches!(command.as_str(), "sketch.redefine" | "sketch.mirror" | "sketch.pattern.rectangular" | "sketch.pattern.circular" | "sketch.offset")
-            || command == "construct.plane.along_path"
+        matches!(
+            command.as_str(),
+            "sketch.redefine"
+                | "sketch.mirror"
+                | "sketch.pattern.rectangular"
+                | "sketch.pattern.circular"
+                | "sketch.offset"
+                | "sketch.fillet"
+                | "sketch.chamfer.equal_distance"
+                | "sketch.chamfer.two_distance"
+                | "sketch.chamfer.distance_angle"
+        ) || command == "construct.plane.along_path"
             || params.get("command").and_then(Value::as_str) == Some("construct.plane.along_path")
     }) {
         let preview = s.preview_visible_world(cmds).map_err(|error| error.to_string())?;
@@ -392,6 +449,51 @@ fn compute_tool(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
         .map_err(|_| "the preview failed".to_string())?;
     b.bounds = state_bounds(&tool.after);
     Ok(b)
+}
+
+fn extrusion_params<'a>(id: &str, params: &'a Value) -> Option<&'a Value> {
+    match id {
+        "solid.extrude" => Some(params),
+        "timeline.redefine" if params.get("command").and_then(Value::as_str) == Some("solid.extrude") => params.get("params"),
+        _ => None,
+    }
+}
+
+/// Check references without intersecting the tool with the target's geometry.
+pub(crate) fn extrusion_target_error(s: &Session, cmds: &[(String, Value)], before: &ModelState) -> Option<String> {
+    for (id, params) in cmds {
+        let params = extrusion_params(id, params)?;
+        let op = params.get("operation").and_then(Value::as_str).unwrap_or("new");
+        if op == "new" {
+            continue;
+        }
+        let targets = params
+            .get("targets")
+            .and_then(Value::as_array)
+            .filter(|targets| !targets.is_empty())
+            .or_else(|| params.get("participants").and_then(Value::as_array));
+        let mut found = false;
+        if let Some(targets) = targets.filter(|targets| !targets.is_empty()) {
+            for target in targets.iter().filter_map(Value::as_str) {
+                if target == "*" {
+                    found |= !before.bodies.is_empty();
+                } else if before.body(target).is_some() {
+                    found = true;
+                } else {
+                    return Some(format!("unknown body `{target}`"));
+                }
+            }
+        } else {
+            found = params.get("faces").and_then(|_| params.get("face_body")).and_then(Value::as_str).map_or_else(
+                || before.bodies.iter().any(|body| s.doc.model_body_component(body) == s.active_component),
+                |name| s.world_state().body(name).is_some(),
+            );
+        }
+        if !found && matches!(op, "cut" | "intersect") {
+            return Some("there is no body to cut or intersect".into());
+        }
+    }
+    None
 }
 
 fn state_bounds(st: &ModelState) -> Aabb3 {
@@ -482,7 +584,7 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
                     sc.xray_tri(p.to_f32(), plane.normal().to_f32(), color);
                 }
             }
-            for (a, b) in quad.iter().zip(quad.iter().cycle().skip(1)).take(4) {
+            for (a, b) in Ring::from(quad).edges() {
                 sc.line(a.to_f32(), b.to_f32(), c.added, 1.3, true);
             }
         }
@@ -696,6 +798,9 @@ pub fn point_triangle_dist(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
 
 /// The same computed sketch preview is drawn over both native GPU and CPU viewports.
 pub fn paint_sketches(app: &SolveApp, painter: &egui::Painter, proj: &crate::viewport::Proj) {
+    if app.preview.rolled_back {
+        return;
+    }
     if !app.dialog.as_ref().is_some_and(|d| matches!(d.kind, crate::dialogs::Kind::SketchModify(_)) && d.previews()) {
         return;
     }
@@ -721,6 +826,32 @@ pub fn paint_sketches(app: &SolveApp, painter: &egui::Painter, proj: &crate::vie
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tool_preview_follows_tab_without_recolouring_removal_or_idle_previews() {
+        for dark in [false, true] {
+            for vision in crate::theme::ColorVision::ALL {
+                let t = Tokens::themed(dark, vision);
+                let base = Colors::from_tokens(&t);
+                for tab in ["MODEL", "SKETCH", "SURFACE", "ASSEMBLE", "INSERT", "INSPECT", "MANAGE", "VIEW", "SHEET METAL", "RENDER"] {
+                    for active in [false, true] {
+                        let colors = Colors::for_tool(&t, tab, active);
+                        assert_eq!(colors.removed, base.removed);
+                        assert_eq!(colors.body, base.body);
+                        assert_eq!(colors.edge, base.edge);
+                        if !active || crate::theme::TabAccent::for_tab(&t, tab).color == t.accent {
+                            assert_eq!(colors.added, base.added);
+                            assert_eq!(colors.new_body, base.new_body);
+                        } else {
+                            let accent = crate::theme::TabAccent::for_tab(&t, tab);
+                            assert_eq!(colors.added, accent.color.to_srgba_unmultiplied());
+                            assert_ne!(colors.new_body, colors.added);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn colors() -> Colors {
         Colors { body: [1, 1, 1, 255], added: [2, 2, 2, 255], new_body: [4, 4, 4, 255], removed: [3, 3, 3, 100], edge: [0, 0, 0, 255] }
@@ -757,6 +888,8 @@ mod tests {
         pv.poll(2, None);
         assert_eq!(pv.error.as_deref(), Some("current invalid expression"));
         assert_eq!(pv.shown_key, Some(2));
+        assert!(!pv.active && pv.replaced.is_empty(), "the current inputs failed: nothing is previewed (#3254)");
+        assert_ne!(pv.key, 9, "the viewport takes the empty scene");
         pv.poll(2, None);
         assert_eq!(pv.error.as_deref(), Some("current invalid expression"), "current errors still prevent invalid Apply");
     }

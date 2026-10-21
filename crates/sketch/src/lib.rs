@@ -20,6 +20,7 @@ mod construct;
 mod curves;
 mod decompose;
 mod dims;
+mod ends;
 mod fonts;
 mod freeform_offset;
 pub mod linalg;
@@ -31,6 +32,8 @@ mod offset_topology;
 mod pattern;
 mod periodic;
 mod profiles;
+#[cfg(feature = "solver-profiling")]
+pub mod profiling;
 mod shape;
 mod solver;
 mod text;
@@ -44,11 +47,13 @@ pub use curves::{
 };
 pub use decompose::Budget;
 pub use dims::{DimFrame, DimLayout, chain_centres, default_text, dim_frame, dim_layout, dim_layout_reaching, dim_reach, encode_text};
+pub use ends::{END_TOL, EndReport, EndTouch, UntiedEnd, loose_ends};
 pub use fonts::{DEFAULT_FONT_FAMILY, FontData, families_in, find_style_in, font_data, font_data_styled, installed_families, set_font_file_check};
 pub use freeform_offset::{FreeformOffset, OFFSET_TOLERANCE};
 pub use link::{Link, LinkGeom, LinkKind, LinkSource, MAX_LINK_ENTITIES, SKETCH_AXIS_HALF, TextExprs, sketch_axis_geom};
 pub use model::{
-    Constraint, ConstraintKind, Curve, CurveKind, MAX_CONSTRAINTS, MAX_COORD, MAX_CURVES, MAX_POINTS, SPoint, Sketch, SketchError, SketchView,
+    Constraint, ConstraintKind, Curve, CurveKind, MAX_CONSTRAINTS, MAX_COORD, MAX_CURVES, MAX_POINTS, PointExprs, SPoint, Sketch, SketchError,
+    SketchView,
 };
 pub use offset::OffsetChain;
 pub use offset_topology::{OffsetCreated, OffsetRole, OffsetRoleFlags, OffsetRoleKind, OffsetTopology};
@@ -58,10 +63,11 @@ pub use profiles::{
     CurvePick, Profile, distinct_curves, find_drawn_profiles, find_profiles, merge_regions, profile_at_point, profile_by_curves,
     without_text_counters,
 };
-pub use shape::{Shape, intersections};
+pub use shape::{Shape, intersections, intersections_within};
+pub use solver::solve_after_edit_with_analysis;
 pub use solver::{
-    Analysis, CONSISTENT, DrivingValues, Hold, SolveReport, SolveStatus, constraint_residual, determined_by, measure_dimension, solve,
-    solve_after_edit, solve_after_value_edit, solve_holding, solve_with,
+    Analysis, CONSISTENT, DrivingValues, Hold, SolveReport, SolveStatus, constraint_residual, determined_by, measure_dimension, move_line_towards,
+    move_point_towards, solve, solve_after_edit, solve_after_value_edit, solve_holding, solve_with,
 };
 pub use text::{MAX_TEXT_CHARS, TextAlign, TextStyle, text_geometry, text_geometry_in, text_geometry_styled};
 pub use thin::{MAX_THIN_SEGMENTS, thin_wall_regions};
@@ -74,7 +80,13 @@ mod construct_tests;
 #[cfg(test)]
 mod continuation_tests;
 #[cfg(test)]
+mod ends_tests;
+#[cfg(test)]
 mod font_tests;
+#[cfg(test)]
+mod least_motion_tests;
+#[cfg(test)]
+mod line_circle_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
