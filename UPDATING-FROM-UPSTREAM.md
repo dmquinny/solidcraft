@@ -202,6 +202,28 @@ you") draw it as it is now, not as its file is, so live edits show without a sav
 changes received live never make a document "modified" here (their save marks it saved when
 both sides agree on the design).
 
+## Material libraries
+
+Upstream's local libraries (`solidcraft-library/1`: appearances, and physical materials with a
+density and a default look; docs/book/src/dev/local-libraries.md) open only in the desktop app.
+Here the web app also fetches every `*.solidcraft-library.json` in the designs folder's
+`Libraries` subfolder (`Z:\Maker\SolidCraft\Libraries`) once at start (`fetch_libraries` in
+`apps/solidcraft-web/src/files.rs`), and the Appearance window's "Local library" section offers
+them (`server_rows` in `crates/ui-egui/src/dialogs_library.rs`; a single library opens by itself).
+That section now lists a library's physical materials after its appearances, on desktop too, and
+**Assign library material** copies the selected one into the design and assigns it to the selected
+bodies in one undo step (`library.apply`); a body's own appearance override still shows over the
+material's colour. Drop a new library into the folder and reload the page to see it.
+
+`Libraries/workshop-materials.solidcraft-library.json` holds woods, sheet goods, aluminium, copper
+alloys and steels with typical densities and preview colours, plus finish appearances (stains,
+anodizing, black oxide, patina). The values are illustrative, not graded design data. Library v1
+carries colour and opacity only: no metallic/roughness, and no image textures (upstream renders
+none yet). It is written by `W:\scripts\solidcraft-library` (outside the repo: edit its tables,
+then `cargo run --release -- <output.json>`); an edited library needs fresh entry revisions
+(SHA-256 of `[provenance, definition]`, `Entry::new` in `crates/io/src/catalog.rs`), so
+regenerate rather than hand-edit it.
+
 ## Going back
 
 To the small `server-storage` build (nginx WebDAV, no sign-in, no history): check out

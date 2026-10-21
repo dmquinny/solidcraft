@@ -12,7 +12,9 @@
 //! files. The endpoint is probed once at start; without it (404, or anything but a JSON
 //! listing) nothing changes. Designs can be filed in a subfolder of the server's folder (the
 //! file panel's folder field, remembered per browser in local storage; nginx makes the folder on
-//! the first save). The autosave stays in the browser: it is written on every edit.
+//! the first save). The autosave stays in the browser: it is written on every edit. Material and
+//! appearance libraries (`*.solidcraft-library.json`) in the server's `Libraries` folder are
+//! fetched once at start, for the Appearance panel to offer.
 //!
 //! With the storage service (apps/solidcraft-server) behind `files/`, saves carry the version
 //! they replace (`If-Match`): when someone else saved in between, the server answers 412, the
@@ -446,6 +448,38 @@ fn fetch_shared_files(files: &Rc<Files>, shared: &[Shared]) {
             files.wake();
         });
     }
+}
+
+/// Where the libraries in the server's `Libraries` folder appear to the engine; the Appearance
+/// panel lists them (`SERVER_LIBRARIES` in crates/ui-egui/src/dialogs_library.rs).
+pub const LIBRARIES: &str = "/libraries/";
+/// The folder, in the server's design folder, that material and appearance libraries are kept in.
+const LIBRARY_FOLDER: &str = "Libraries";
+const LIBRARY_SUFFIX: &str = ".solidcraft-library.json";
+
+/// Fetch the material and appearance libraries (`*.solidcraft-library.json`) in the server's
+/// `Libraries` folder into the engine's files under `LIBRARIES`, once at start. Without the
+/// folder nothing happens.
+fn fetch_libraries(files: &Rc<Files>) {
+    let files = files.clone();
+    spawn_local(async move {
+        let Ok(r) = remote_request("GET", &format!("{REMOTE_DIR}{LIBRARY_FOLDER}/"), None, &[]).await else { return };
+        if !is_listing(&r) {
+            return;
+        }
+        let Ok(rows) = json_rows(r).await else { return };
+        for row in rows.iter().take(64) {
+            let Some(name) = row.get("name") else { continue };
+            if row.get("type").is_some_and(|t| t == "directory") || name.starts_with('.') || !name.to_lowercase().ends_with(LIBRARY_SUFFIX) {
+                continue;
+            }
+            match remote_bytes(&remote_path_url(&format!("{LIBRARY_FOLDER}/{name}"))).await {
+                Ok(bytes) => vfs::insert(&format!("{LIBRARIES}{name}"), bytes),
+                Err(e) => log::warn!("{LIBRARY_FOLDER}/{name}: {e}"),
+            }
+        }
+        files.wake();
+    });
 }
 
 /// Go to something another user shared: a folder is shown in the panel; a design's folder is
@@ -1213,6 +1247,9 @@ pub fn start(files: &Rc<Files>) {
             );
         }
         install(&files, loaded);
+        if remote_only() {
+            fetch_libraries(&files);
+        }
     });
 }
 

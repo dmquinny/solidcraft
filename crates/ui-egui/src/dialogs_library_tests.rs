@@ -164,3 +164,41 @@ fn delayed_library_export_refuses_an_internally_changed_design_without_overwriti
     assert_eq!((h.app.session.undo.len(), h.app.session.revision), history);
     assert!(matches!(&h.app.status, Some((_, _, true))));
 }
+
+/// Self-hosting patch: a library's physical material is listed after its appearances, and
+/// "Assign library material" gives the selected body its density and look in one undo step.
+/// OK then adds nothing on top (no appearance override hiding the material's colour).
+#[test]
+fn library_material_assigns_density_and_look_to_the_selected_body() {
+    let mut h = Harness::new();
+    h.call("ui.resize", json!({"width":1600,"height":1400}));
+    let path = h.dir.join("materials-library.json").to_string_lossy().into_owned();
+    let mut source = Session::default();
+    source.execute("material.create", &json!({"name":"Walnut, Black","density_g_cm3":0.62,"color":[104,70,50]})).unwrap();
+    source.execute("library.export", &json!({"path":path})).unwrap();
+    h.app.run("solid.box", json!({"length":10,"width":10,"height":10})).unwrap();
+    h.app.session.mark_saved();
+    h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+    h.app.start("appearance.assign");
+    if let Some(dialog) = &mut h.app.dialog
+        && let Kind::Appearance(state) = &mut dialog.kind
+    {
+        state.local.path = path;
+    }
+    h.frames(3);
+    let undo = h.app.session.undo.len();
+    h.step(&json!({"widget":"Load library"})).unwrap();
+    // The export carries the material and its look as an appearance; appearances come first.
+    h.step(&json!({"click":{"handle":"library:entry:1"}})).unwrap();
+    h.step(&json!({"widget":"Assign library material"})).unwrap();
+    assert_eq!(h.app.session.doc.materials.get("Body1").map(String::as_str), Some("Walnut, Black"));
+    let material = h.app.session.doc.user_materials.iter().find(|m| m.name == "Walnut, Black").unwrap();
+    assert_eq!(material.density, 0.62);
+    assert_eq!(material.appearance.as_ref().map(|look| look.color), Some([104, 70, 50]));
+    assert!(!h.app.session.doc.appearances.bodies.contains_key("Body1"));
+    assert_eq!(h.app.session.undo.len(), undo + 1);
+    h.step(&json!({"widget":"OK"})).unwrap();
+    assert!(h.app.dialog.is_none());
+    assert!(!h.app.session.doc.appearances.bodies.contains_key("Body1"), "OK must not paint over the material's look");
+    assert_eq!(h.app.session.undo.len(), undo + 1);
+}
