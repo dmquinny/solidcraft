@@ -252,6 +252,15 @@ coordinates (`crates/doc/src/pattern_appearance.rs`; pending format change `look
 | `mottled` | patches of the second colour (patina, rust, mill scale, galvanizing spangle) | patch size |
 | `speckled` | grains of the second colour with lighter flecks (concrete aggregate, granite, terrazzo, sandstone, brick) | grain size |
 | `veined` | thin winding veins of the second colour with finer ones between (marble, travertine) | vein spacing |
+| `knotty` | wood with knots where branches left the pith, the rings flowing round them (knotty pine) | ring spacing |
+| `plywood` | veneers across the part's thinnest side (the viewport packs it beside the grain axis), grain crossing ply to ply, glue lines | ply thickness |
+| `strands` | OSB: nearest-flake cells three times as long as wide along the axis, each its own shade, darker where they meet | flake width |
+
+Picking a look is the usual way to get a pattern: the Appearance window's swatches include every
+look of the loaded libraries (`swatch_looks` in `dialogs_library.rs`: in the browser all the
+server's libraries, decoded again only when they change), under the category their name starts
+with, and clicking or dropping one brings its pattern and PBR response. The pattern controls are
+folded into a "Pattern: <kind>" section (`pattern_rows` in `dialogs_appearance.rs`).
 
 Each also has `contrast` (0–1), `color` (the second colour: latewood, patina, rust), `axis`
 (`auto`, the body's longest side, or `x`/`y`/`z`) and `seed`; the body's name turns the seed, so

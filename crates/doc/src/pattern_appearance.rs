@@ -21,11 +21,29 @@ pub enum PatternKind {
     Speckled,
     /// Thin winding veins of the second colour: marble (`scale_mm`: the vein spacing).
     Veined,
+    /// Wood grain with knots, the grain flowing round them: knotty pine (`scale_mm`: the ring
+    /// spacing; the knots are the second colour, darkened).
+    Knotty,
+    /// Plywood: veneers along the part's thinnest side, their grain crossing from one ply to the
+    /// next, glue lines between, so the edges show the plies (`scale_mm`: a ply's thickness).
+    Plywood,
+    /// Oriented strand board: overlapping flakes along the axis, each its own shade between the
+    /// colour and the second colour (`scale_mm`: a flake's width).
+    Strands,
 }
 
 impl PatternKind {
-    pub const ALL: [PatternKind; 6] =
-        [PatternKind::Wood, PatternKind::Brushed, PatternKind::Blasted, PatternKind::Mottled, PatternKind::Speckled, PatternKind::Veined];
+    pub const ALL: [PatternKind; 9] = [
+        PatternKind::Wood,
+        PatternKind::Brushed,
+        PatternKind::Blasted,
+        PatternKind::Mottled,
+        PatternKind::Speckled,
+        PatternKind::Veined,
+        PatternKind::Knotty,
+        PatternKind::Plywood,
+        PatternKind::Strands,
+    ];
 
     /// The viewport's number for it (0 is no pattern).
     pub fn code(self) -> u8 {
@@ -36,6 +54,9 @@ impl PatternKind {
             PatternKind::Mottled => 4,
             PatternKind::Speckled => 5,
             PatternKind::Veined => 6,
+            PatternKind::Knotty => 7,
+            PatternKind::Plywood => 8,
+            PatternKind::Strands => 9,
         }
     }
 }
@@ -119,12 +140,13 @@ impl Pattern {
         self.seed
     }
 
-    /// The viewport's packed form: kind, grain axis (`axis`: 0 x, 1 y, 2 z, already resolved),
-    /// scale in quarter millimetres and contrast (0–255).
-    pub fn gpu_bytes(self, axis: u8) -> [u8; 4] {
+    /// The viewport's packed form: kind; the grain axis (`axis`: 0 x, 1 y, 2 z, already
+    /// resolved) and, two bits up, the part's thinnest side (`thin`, for plywood's plies); scale
+    /// in quarter millimetres; contrast (0–255).
+    pub fn gpu_bytes(self, axis: u8, thin: u8) -> [u8; 4] {
         let scale = (self.scale_mm * 4.0).round().clamp(1.0, 255.0) as u8;
         let contrast = (self.contrast * 255.0).round().clamp(0.0, 255.0) as u8;
-        [self.kind.code(), axis.min(2), scale, contrast]
+        [self.kind.code(), axis.min(2) | (thin.min(2) << 2), scale, contrast]
     }
 }
 
@@ -177,12 +199,13 @@ mod tests {
     #[test]
     fn the_viewport_gets_quarter_millimetres_and_a_resolved_axis() {
         let p = Pattern::new(PatternKind::Mottled, 60.0, 1.0, [0; 3], PatternAxis::Auto, 3).unwrap();
-        assert_eq!(p.gpu_bytes(2), [4, 2, 240, 255]);
+        assert_eq!(p.gpu_bytes(2, 0), [4, 2, 240, 255]);
+        assert_eq!(p.gpu_bytes(0, 2), [4, 8, 240, 255]);
         let tiny = Pattern::new(PatternKind::Blasted, 0.25, 0.0, [0; 3], PatternAxis::X, 0).unwrap();
-        assert_eq!(tiny.gpu_bytes(9), [3, 2, 1, 0]);
+        assert_eq!(tiny.gpu_bytes(9, 9), [3, 10, 1, 0]);
         // Every kind has its own number, in the order the viewport's shader reads them.
         let codes: Vec<u8> = PatternKind::ALL.iter().map(|k| k.code()).collect();
-        assert_eq!(codes, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(codes, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let marble = serde_json::to_value(Pattern::new(PatternKind::Veined, 40.0, 0.6, [80, 80, 90], PatternAxis::Auto, 0).unwrap()).unwrap();
         assert_eq!(marble["kind"], "veined");
     }

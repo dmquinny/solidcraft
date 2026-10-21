@@ -5,6 +5,11 @@ server can use. The web app reads every `*.solidcraft-library.json` in the desig
 `Libraries` subfolder when a page loads, and the Appearance window lists them under
 **Local library**. This file can sit in that folder too: the app only reads library files.
 
+Every look in these libraries also appears among the Appearance window's swatches, under the
+**Library** category its name starts with (`"Wood - Pine, Knotty"` is under Wood). Click one and
+press **Apply to selection**, or drag it onto a part: its pattern and finish come with it. The
+pattern's own settings sit folded under **Pattern** in that window, for setting one by hand.
+
 ## The easy way: save one from the app
 
 1. Open a design (a scratch one is fine).
@@ -96,7 +101,7 @@ it no longer matches.
 
 | Field | What it is |
 | --- | --- |
-| `kind` | `wood`, `brushed`, `blasted`, `mottled`, `speckled` or `veined` |
+| `kind` | `wood`, `knotty`, `plywood`, `strands`, `brushed`, `blasted`, `mottled`, `speckled` or `veined` |
 | `scale_mm` | 0.25–60 mm; what it means depends on the kind (below) |
 | `contrast` | 0–1: how strongly the pattern shows (for `speckled` and `mottled`, also how much of the second colour) |
 | `color` | The second colour, `[red, green, blue]`: latewood, patina, rust, grains, veins |
@@ -111,6 +116,9 @@ it no longer matches.
 | `mottled` | soft patches of the second colour | patch size (10–40) | patina, rust, mill scale, slate, weathering |
 | `speckled` | grains of the second colour with lighter flecks | grain size (1–4) | concrete, granite, terrazzo, sandstone, brick |
 | `veined` | thin winding veins of the second colour | vein spacing (30–50) | marble, travertine |
+| `knotty` | wood grain with knots, the grain flowing round them | ring spacing (4–7) | knotty pine, rustic timber |
+| `plywood` | veneers across the part's thinnest side, grain crossing ply to ply, glue lines between | one ply's thickness (1.5–3) | plywood: a face shows its veneer, an edge the plies |
+| `strands` | overlapping flakes along the axis, each its own shade | a flake's width (15–35) | OSB |
 
 Patterns show in the Design view, on opaque parts, where the GPU runs compute shaders (WebGPU in the
 browser; the desktop app on most graphics cards). Elsewhere, and in the Render workspace, parts show

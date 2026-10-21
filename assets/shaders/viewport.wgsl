@@ -324,8 +324,8 @@ fn fs_tri_all(i: TOut) -> @location(0) vec4<f32> {
 
 // Surface patterns (a self-hosting patch, not upstream): wood grain, brushed, blasted and mottled
 // finishes, worked out from the surface point itself, so they need no texture or coordinates.
-// `pat`: kind (0 none, 1 wood, 2 brushed, 3 blasted, 4 mottled, 5 speckled, 6 veined), grain
-// axis (0 x, 1 y, 2 z),
+// `pat`: kind (0 none, 1 wood, 2 brushed, 3 blasted, 4 mottled, 5 speckled, 6 veined, 7 knotty
+// wood, 8 plywood, 9 strands), grain axis (0 x, 1 y, 2 z; two bits up: the part's thinnest side),
 // scale (a quarter millimetre per step), contrast (0-255). `pc`: the second colour, its alpha
 // the body's seed. `org`: the body's anchor (its box centre), so the pattern stays with it.
 
@@ -371,6 +371,58 @@ fn pat_keep(size: f32, foot: f32) -> f32 {
     return 1.0 - smoothstep(size * 0.35, size * 0.9, foot);
 }
 
+/// Wood in the frame `f` (along the grain, then across it): growth rings around a pith outside
+/// the part, wobbling along the grain, early and late wood, fibres streaking along the axis and,
+/// with `knots`, knots where branches grew out of the pith, the rings flowing round them.
+fn wood_color(base: vec3<f32>, late_color: vec3<f32>, f: vec3<f32>, s: f32, contrast: f32, seed: f32, foot: f32, knots: bool) -> vec3<f32> {
+    let angle = seed * 6.2831853;
+    let pith = vec2<f32>(cos(angle), sin(angle)) * (s * 9.0 + 25.0 + seed * 45.0);
+    let d = f.yz - pith;
+    let warp = (pat_fbm(vec3<f32>(f.x * 0.012, f.y * 0.06, f.z * 0.06) + vec3<f32>(seed * 31.0)) - 0.5) * s * 3.2;
+    var r = length(d) + warp;
+    var knot = 0.0;
+    var knot_r = 0.0;
+    if (knots) {
+        // Branches leave the pith at random places along the trunk, about one every 120 mm,
+        // heading roughly toward the part (a board shows the knots of branches that crossed it).
+        let spacing = 120.0;
+        let toward = atan2(-pith.y, -pith.x);
+        let c0 = floor(f.x / spacing);
+        for (var k = -1; k <= 1; k = k + 1) {
+            let cell = c0 + f32(k);
+            if (pat_hash(vec3<f32>(cell, seed * 13.0, 1.0)) > 0.8) { continue; }
+            let along = (cell + 0.2 + 0.6 * pat_hash(vec3<f32>(cell, seed * 13.0, 2.0))) * spacing;
+            let a = toward + (pat_hash(vec3<f32>(cell, seed * 13.0, 3.0)) - 0.5) * 0.9;
+            let u = vec2<f32>(cos(a), sin(a));
+            let outward = dot(d, u);
+            if (outward <= 0.0) { continue; }
+            let across = d.x * u.y - d.y * u.x;
+            let radius = (5.0 + 9.0 * pat_hash(vec3<f32>(cell, seed, 4.0))) * clamp(0.35 + outward / 160.0, 0.35, 1.0);
+            let db = length(vec2<f32>(f.x - along, across));
+            r = r + radius * 1.6 * exp(-(db * db) / (radius * radius * 2.2));
+            let inside = 1.0 - smoothstep(radius * 0.85, radius, db);
+            if (inside > knot) {
+                knot = inside;
+                knot_r = db / radius;
+            }
+        }
+    }
+    let t = fract(r / s);
+    let late = smoothstep(0.5, 0.85, t) * (1.0 - smoothstep(0.92, 1.0, t));
+    let rings = mix(0.3, late, pat_keep(s, foot));
+    var c = mix(base, late_color, rings * contrast);
+    let fibre = pat_noise(vec3<f32>(f.x * 0.04, f.y * 3.0, f.z * 3.0) + vec3<f32>(seed * 7.0));
+    c = c * (1.0 + (fibre - 0.5) * 0.18 * pat_keep(0.6, foot));
+    if (knot > 0.0) {
+        // The knot: darker, its own tight rings, a dark rim.
+        let kr = fract(knot_r * 4.0);
+        var kc = mix(late_color * 0.8, late_color * 0.55, smoothstep(0.4, 0.8, kr));
+        kc = mix(kc, late_color * 0.4, smoothstep(0.75, 0.95, knot_r));
+        c = mix(c, kc, knot);
+    }
+    return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 fn pattern_color(i: TOut, foot: f32) -> vec3<f32> {
     let kind = i.pat.x;
     let base = i.c.rgb;
@@ -378,22 +430,60 @@ fn pattern_color(i: TOut, foot: f32) -> vec3<f32> {
     let s = max(f32(i.pat.z) * 0.25, 0.25);
     let contrast = f32(i.pat.w) / 255.0;
     let seed = i.pc.a;
-    let f = pat_frame(i.wp - i.org, i.pat.y);
-    if (kind == 1u) {
-        // Wood: growth rings around a pith outside the part, wobbling along the grain, then
-        // early and late wood, and fibres streaking along the axis.
-        let angle = seed * 6.2831853;
-        let pith = vec2<f32>(cos(angle), sin(angle)) * (s * 9.0 + 25.0 + seed * 45.0);
-        let d = f.yz - pith;
-        let warp = (pat_fbm(vec3<f32>(f.x * 0.012, f.y * 0.06, f.z * 0.06) + vec3<f32>(seed * 31.0)) - 0.5) * s * 3.2;
-        let r = length(d) + warp;
-        let t = fract(r / s);
-        let late = smoothstep(0.5, 0.85, t) * (1.0 - smoothstep(0.92, 1.0, t));
-        let rings = mix(0.3, late, pat_keep(s, foot));
-        var c = mix(base, i.pc.rgb, rings * contrast);
-        let fibre = pat_noise(vec3<f32>(f.x * 0.04, f.y * 3.0, f.z * 3.0) + vec3<f32>(seed * 7.0));
-        c = c * (1.0 + (fibre - 0.5) * 0.18 * pat_keep(0.6, foot));
-        return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let axis = i.pat.y & 3u;
+    let thin = (i.pat.y >> 2u) & 3u;
+    let f = pat_frame(i.wp - i.org, axis);
+    if (kind == 1u || kind == 7u) {
+        return wood_color(base, i.pc.rgb, f, s, contrast, seed, foot, kind == 7u);
+    }
+    if (kind == 8u) {
+        // Plywood: plies across the part's thinnest side, each a veneer whose grain crosses the
+        // one before, a shade of its own, and a dark glue line between; a face shows its veneer,
+        // an edge the plies.
+        let q = i.wp - i.org;
+        let t = q[min(thin, 2u)] / s;
+        let layer = floor(t);
+        let odd = fract(layer * 0.5) > 0.25;
+        var grain = axis;
+        if (odd && thin != axis) { grain = 3u - thin - axis; }
+        let veneer = wood_color(base, i.pc.rgb, pat_frame(q, min(grain, 2u)), 3.0, contrast, fract(seed + layer * 0.37), foot, false);
+        let shade = 0.92 + 0.12 * pat_hash(vec3<f32>(layer, seed * 5.0, 7.0));
+        let glue = smoothstep(0.0, 0.07 + foot / s, min(fract(t), 1.0 - fract(t)));
+        return clamp(veneer * shade * (0.72 + 0.28 * glue), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    if (kind == 9u) {
+        // Strands (OSB): flakes three times as long as wide along the axis, the nearest one's
+        // shade wins, darker where two meet, and a little fibre in each.
+        let w = max(s, foot * 3.0);
+        let q = vec3<f32>(f.x / (w * 3.0), f.y / w, f.z / w);
+        let cell = floor(q);
+        var d1 = 9.0;
+        var d2 = 9.0;
+        var shade = 0.0;
+        for (var x = -1; x <= 1; x = x + 1) {
+            for (var y = -1; y <= 1; y = y + 1) {
+                for (var z = -1; z <= 1; z = z + 1) {
+                    let c = cell + vec3<f32>(f32(x), f32(y), f32(z));
+                    let h = vec3<f32>(pat_hash(c + vec3<f32>(seed)), pat_hash(c + vec3<f32>(3.1, seed, 7.7)), pat_hash(c + vec3<f32>(5.3, 1.9, seed)));
+                    let dist = length(c + h - q);
+                    if (dist < d1) {
+                        d2 = d1;
+                        d1 = dist;
+                        shade = pat_hash(c + vec3<f32>(9.4, seed, 2.2));
+                    } else if (dist < d2) {
+                        d2 = dist;
+                    }
+                }
+            }
+        }
+        var c = mix(base, i.pc.rgb, pow(shade, 1.5) * contrast);
+        c = c * (0.88 + 0.12 * smoothstep(0.0, 0.05, d2 - d1));
+        // Each flake lies a little askew, so its fibres do too.
+        let tilt = (shade - 0.5) * 0.7;
+        let along = f.x * cos(tilt) + f.y * sin(tilt);
+        let across = f.y * cos(tilt) - f.x * sin(tilt);
+        let fibre = pat_noise(vec3<f32>(along * 0.05, across * 0.9, f.z * 0.9) + vec3<f32>(shade * 40.0));
+        return clamp(c * (1.0 + (fibre - 0.5) * 0.2), vec3<f32>(0.0), vec3<f32>(1.0));
     }
     if (kind == 2u) {
         // Brushed: streaks along the axis, long and thin. Real brushing is finer than a pixel at

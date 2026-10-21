@@ -28,6 +28,73 @@ pub struct LocalLibrary {
     pub save_name: String,
 }
 
+/// The looks of the loaded libraries, for the Appearance window's swatches (a self-hosting
+/// patch): every appearance and every material's default look, with its pattern and surface
+/// response, in the category its name starts with ("Wood - Pine, Knotty" is Wood). In the
+/// browser, every library the web host fetched from the server's Libraries folder (decoded again
+/// only when they change); everywhere, the library open in this window.
+pub fn swatch_looks(local: &LocalLibrary) -> Vec<crate::dialogs_appearance::Look> {
+    #[cfg(target_arch = "wasm32")]
+    let mut out = server_looks();
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut out = Vec::new();
+    if let Some(catalog) = &local.catalog {
+        for look in catalog_looks(catalog) {
+            if !out.iter().any(|l: &crate::dialogs_appearance::Look| l.name.eq_ignore_ascii_case(&look.name)) {
+                out.push(look);
+            }
+        }
+    }
+    out
+}
+
+fn catalog_looks(catalog: &Catalog) -> Vec<crate::dialogs_appearance::Look> {
+    catalog
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.definition {
+            Definition::Appearance(look) => Some(look),
+            Definition::Material(material) => material.appearance.as_ref(),
+        })
+        .map(|look| crate::dialogs_appearance::Look {
+            name: look.name.clone(),
+            category: look.name.split(" - ").next().map(str::trim).filter(|c| !c.is_empty() && *c != look.name).unwrap_or("Library").to_string(),
+            color: look.color,
+            opacity: look.opacity,
+            pbr: look.pbr,
+            pattern: look.pattern,
+        })
+        .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// The server libraries' looks, and the files (path, size) they were read from.
+    static SERVER_LOOKS: std::cell::RefCell<(Vec<(String, u64)>, Vec<crate::dialogs_appearance::Look>)> = Default::default();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn server_looks() -> Vec<crate::dialogs_appearance::Look> {
+    let mut files = solidcraft_engine::io::vfs::list(SERVER_LIBRARIES);
+    files.sort();
+    SERVER_LOOKS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 != files {
+            let mut looks: Vec<crate::dialogs_appearance::Look> = Vec::new();
+            for (path, _) in &files {
+                let Ok(catalog) = Catalog::read(path) else { continue };
+                for look in catalog_looks(&catalog) {
+                    if !looks.iter().any(|l| l.name.eq_ignore_ascii_case(&look.name)) {
+                        looks.push(look);
+                    }
+                }
+            }
+            *cache = (files, looks);
+        }
+        cache.1.clone()
+    })
+}
+
 fn display_order(mut catalog: Catalog) -> Catalog {
     catalog.entries.sort_by(|a, b| a.definition.name().cmp(b.definition.name()).then_with(|| a.id.cmp(&b.id)));
     catalog

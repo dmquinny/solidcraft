@@ -2317,6 +2317,8 @@ fn planned_patterns(
     let size: Vec<f64> = (0..3).map(|k| if hi[k] >= lo[k] { hi[k] - lo[k] } else { 0.0 }).collect();
     let anchor: [f32; 3] = std::array::from_fn(|k| if hi[k] >= lo[k] { ((lo[k] + hi[k]) / 2.0) as f32 } else { 0.0 });
     let longest = (0..3u8).max_by(|a, c| size[*a as usize].total_cmp(&size[*c as usize])).unwrap_or(2);
+    // The thinnest side: a sheet's thickness, across which plywood has its plies.
+    let thinnest = (0..3u8).min_by(|a, c| size[*a as usize].total_cmp(&size[*c as usize])).unwrap_or(2);
     // Boards that share a look still differ: the body's name turns the pattern's seed.
     let turn = b.name.bytes().fold(0u8, |h, c| h.wrapping_mul(31).wrapping_add(c));
     let pack = |pattern: Option<Pattern>| -> [u8; 8] {
@@ -2327,7 +2329,7 @@ fn planned_patterns(
             PatternAxis::Y => 1,
             PatternAxis::Z => 2,
         };
-        let [kind, axis, scale, contrast] = p.gpu_bytes(axis);
+        let [kind, axis, scale, contrast] = p.gpu_bytes(axis, thinnest);
         let [r, g, bl] = p.color();
         [kind, axis, scale, contrast, r, g, bl, p.seed() ^ turn]
     };

@@ -211,14 +211,33 @@ pub fn commands(k: &Ap, inputs: &[SelInput]) -> Vec<(String, Value)> {
     p.map(|p| vec![("appearance.assign".to_string(), p)]).unwrap_or_default()
 }
 
-/// The surface pattern's controls (a self-hosting patch): the pattern, then its scale, contrast,
-/// second colour and grain direction.
+/// What the pattern list calls each kind (`PatternKind::code` order, "None" first).
+const PATTERN_KINDS: [&str; 10] = [
+    "None",
+    "Wood grain",
+    "Brushed",
+    "Blasted / anodized",
+    "Mottled (patina, rust)",
+    "Speckled (concrete, granite)",
+    "Veined (marble)",
+    "Knotty wood",
+    "Plywood",
+    "Strands (OSB)",
+];
+
+/// The surface pattern (a self-hosting patch), folded away: a library look brings its own, so
+/// this is only for setting one by hand. The heading says which pattern the look has.
 fn pattern_rows(ui: &mut egui::Ui, k: &mut Ap) {
-    const KINDS: [&str; 7] =
-        ["None", "Wood grain", "Brushed", "Blasted / anodized", "Mottled (patina, rust)", "Speckled (concrete, granite)", "Veined (marble)"];
+    let current = k.pattern.map_or(0, |p| usize::from(p.kind().code()));
+    let title = format!("Pattern: {}", PATTERN_KINDS.get(current).copied().unwrap_or("None"));
+    ui_kit::section(ui, "appearance_pattern", &title, false, |ui| pattern_controls(ui, k));
+}
+
+/// The pattern, then its scale, contrast, second colour and grain direction.
+fn pattern_controls(ui: &mut egui::Ui, k: &mut Ap) {
     const AXES: [&str; 4] = ["Longest side", "X", "Y", "Z"];
     let mut kind = k.pattern.map_or(0, |p| usize::from(p.kind().code()));
-    let row = ui_kit::row(ui, "Pattern", |ui| ui_kit::dropdown(ui, "appearance_pattern", &mut kind, &KINDS));
+    let row = ui_kit::row(ui, "Pattern", |ui| ui_kit::dropdown(ui, "appearance_pattern", &mut kind, &PATTERN_KINDS));
     crate::scenario::publish_handle("appearance:pattern", row.rect.center());
     let wanted = kind.checked_sub(1).and_then(|i| PatternKind::ALL.get(i).copied());
     if wanted != k.pattern.map(Pattern::kind) {
@@ -226,12 +245,14 @@ fn pattern_rows(ui: &mut egui::Ui, k: &mut Ap) {
         // darker shade of the main one.
         k.pattern = wanted.and_then(|kind| {
             let (scale, contrast) = match kind {
-                PatternKind::Wood => (4.0, 0.7),
+                PatternKind::Wood | PatternKind::Knotty => (4.0, 0.7),
                 PatternKind::Brushed => (0.5, 0.4),
                 PatternKind::Blasted => (0.4, 0.3),
                 PatternKind::Mottled => (15.0, 0.5),
                 PatternKind::Speckled => (2.0, 0.5),
                 PatternKind::Veined => (40.0, 0.6),
+                PatternKind::Plywood => (1.5, 0.5),
+                PatternKind::Strands => (25.0, 0.6),
             };
             let darker = k.color.map(|c| (f64::from(c) * 0.62).round() as u8);
             Pattern::new(kind, scale, contrast, darker, PatternAxis::Auto, 0).ok()
@@ -463,7 +484,13 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
         });
     }
     // The library, by category.
-    let lib = library(app);
+    let mut lib = library(app);
+    // The loaded libraries' looks (a self-hosting patch) join the swatches, patterns and all.
+    for look in crate::dialogs_library::swatch_looks(&k.local) {
+        if !lib.iter().any(|l| l.name.eq_ignore_ascii_case(&look.name)) {
+            lib.push(look);
+        }
+    }
     let mut cats: Vec<String> = vec!["All".into()];
     for l in &lib {
         if !cats.contains(&l.category) {
@@ -491,7 +518,14 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
             egui::Id::new(("ap_lib", *i)),
             c32(l.color, l.opacity),
             picked_look,
-            &format!("{} (drag onto a body or face)", l.name),
+            &match l.pattern {
+                Some(p) => format!(
+                    "{} · {} (drag onto a body or face)",
+                    l.name,
+                    PATTERN_KINDS.get(usize::from(p.kind().code())).copied().unwrap_or("pattern").to_lowercase()
+                ),
+                None => format!("{} (drag onto a body or face)", l.name),
+            },
             (*l).clone(),
         )
         .clicked()
@@ -601,6 +635,9 @@ mod tests {
         let before = h.app.session.undo.len();
         h.app.start("appearance.assign");
         h.frames(3);
+        // The pattern is folded away until it's wanted.
+        assert!(h.widget("Pattern scale (mm)").is_none());
+        h.step(&json!({"widget":"Pattern: None"})).unwrap();
         h.step(&json!({"click":{"handle":"appearance:pattern"}})).unwrap();
         h.step(&json!({"widget":"Wood grain"})).unwrap();
         h.step(&json!({"widget":"Apply to selection"})).unwrap();
