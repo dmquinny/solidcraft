@@ -221,7 +221,7 @@ mod web {
                 ui.label(name);
                 if users.admin && *name != users.me {
                     let mut is_admin = *admin;
-                    if ui.checkbox(&mut is_admin, "admin").changed() {
+                    if solidcraft_ui_egui::host_ui::checkbox(ui, "admin", &mut is_admin).changed() {
                         act = Some(("admin", name.clone(), is_admin));
                     }
                     if ui.small_button("Remove").clicked() {
@@ -240,7 +240,7 @@ mod web {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut form.new_user.0).hint_text("name").desired_width(120.0));
                 ui.add(egui::TextEdit::singleline(&mut form.new_user.1).hint_text("password").password(true).desired_width(140.0));
-                ui.checkbox(&mut form.new_user.2, "admin");
+                solidcraft_ui_egui::host_ui::checkbox(ui, "admin", &mut form.new_user.2);
                 if ui.small_button("Add").clicked() && !form.new_user.0.trim().is_empty() && !form.new_user.1.is_empty() {
                     act = Some(("add", form.new_user.0.trim().to_string(), form.new_user.2));
                 }
@@ -594,7 +594,7 @@ mod web {
                     let shared = self.files.shared.borrow().clone();
                     if remote && !shared.is_empty() {
                         ui.separator();
-                        egui::CollapsingHeader::new("Shared with me").default_open(true).show(ui, |ui| {
+                        solidcraft_ui_egui::host_ui::section(ui, "files_shared_with_me", "Shared with me", true, |ui| {
                             for s in &shared {
                                 ui.horizontal(|ui| {
                                     let what = match (s.folder, s.path.is_empty()) {
@@ -619,7 +619,7 @@ mod web {
                     let changes = self.files.changes.borrow().clone();
                     if remote && !changes.is_empty() {
                         ui.separator();
-                        egui::CollapsingHeader::new("Recent changes").default_open(true).show(ui, |ui| {
+                        solidcraft_ui_egui::host_ui::section(ui, "files_recent_changes", "Recent changes", true, |ui| {
                             for c in changes.iter().take(12) {
                                 ui.label(format!("{} {} \u{b7} {}", c.author, c.message, files::ago(c.date))).on_hover_text(format!(
                                     "{} \u{b7} {}",
@@ -729,11 +729,11 @@ mod web {
                     }
                     ui.separator();
                     ui.label("Merge into:");
-                    egui::ComboBox::from_id_salt("merge_target").selected_text(if self.merge_target.is_empty() { "\u{2026}" } else { self.merge_target.as_str() }).show_ui(ui, |ui| {
-                        for n in &others {
-                            ui.selectable_value(&mut self.merge_target, n.clone(), n);
-                        }
-                    });
+                    let mut options = vec!["\u{2026}"];
+                    options.extend(others.iter().map(String::as_str));
+                    let mut index = others.iter().position(|n| *n == self.merge_target).map_or(0, |i| i + 1);
+                    solidcraft_ui_egui::host_ui::dropdown(ui, "merge_target", &mut index, &options);
+                    self.merge_target = index.checked_sub(1).and_then(|i| others.get(i)).cloned().unwrap_or_default();
                     if !self.merge_target.is_empty() && ui.small_button("Merge").on_hover_text("Replays this design's edits onto that one (opens it, unsaved)").clicked() {
                         act = Some(("merge", self.merge_target.clone(), 0.0));
                     }
@@ -827,19 +827,15 @@ mod web {
                         for (what, chosen) in [("Can see it:", &mut self.share_view), ("Can change it:", &mut self.share_edit)] {
                             ui.separator();
                             ui.label(what);
-                            ui.horizontal(|ui| {
-                                if ui.radio(chosen.is_none(), "everyone").clicked() {
-                                    *chosen = None;
-                                }
-                                if ui.radio(chosen.is_some(), "only these people (and the owner)").clicked() && chosen.is_none() {
-                                    *chosen = Some(Default::default());
-                                }
-                            });
+                            let mut only = usize::from(chosen.is_some());
+                            if solidcraft_ui_egui::host_ui::choice(ui, &mut only, &["everyone", "only these people (and the owner)"]) {
+                                *chosen = (only == 1).then(Default::default);
+                            }
                             if let Some(set) = chosen {
                                 ui.horizontal_wrapped(|ui| {
                                     for u in &users {
                                         let mut on = set.contains(u);
-                                        if ui.checkbox(&mut on, u).changed() {
+                                        if solidcraft_ui_egui::host_ui::checkbox(ui, u, &mut on).changed() {
                                             if on {
                                                 set.insert(u.clone());
                                             } else {

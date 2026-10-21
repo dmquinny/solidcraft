@@ -227,7 +227,7 @@ fn entry_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &[SelIn
             .chain(catalog.entries.iter().filter(|entry| matches!(&entry.definition, Definition::Material(_))).filter(found))
             .collect();
         if shown.is_empty() {
-            ui_kit::text(ui, crate::i18n::tr_label("No matching appearance presets or materials."), ui_kit::Text::Note("library_empty"));
+            ui_kit::text(ui, crate::i18n::tr_label("No matching appearance presets."), ui_kit::Text::Note("library_empty"));
         }
         let row_height = ui_kit::row_height();
         ui_kit::list_frame(ui, "local_library_entries", |ui| {

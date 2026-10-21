@@ -64,6 +64,7 @@ mod hole_direction_ui_tests;
 #[cfg(test)]
 mod hole_placement_ui_tests;
 pub mod home;
+pub mod host_ui;
 pub mod i18n;
 #[cfg(test)]
 mod i18n_menu_tests;
