@@ -373,15 +373,24 @@ fn pat_keep(size: f32, foot: f32) -> f32 {
 
 /// Wood in the frame `f` (along the grain, then across it): growth rings around a pith outside
 /// the part, wobbling along the grain, early and late wood, fibres streaking along the axis and,
-/// with `knots`, knots where branches grew out of the pith, the rings flowing round them.
-fn wood_color(base: vec3<f32>, late_color: vec3<f32>, f: vec3<f32>, s: f32, contrast: f32, seed: f32, foot: f32, knots: bool) -> vec3<f32> {
-    let angle = seed * 6.2831853;
+/// with `knots`, knots where branches grew out of the pith, the rings flowing round them. `side`
+/// (an angle across the grain, or negative for anywhere) puts the pith under a face, as in a
+/// flat-sawn board, so that face's knots come out round.
+fn wood_color(base: vec3<f32>, late_color: vec3<f32>, f: vec3<f32>, s: f32, contrast: f32, seed: f32, foot: f32, knots: bool, side: f32) -> vec3<f32> {
+    var angle = seed * 6.2831853;
+    if (side >= 0.0) {
+        angle = side + (seed - 0.5) * 0.7;
+    }
     let pith = vec2<f32>(cos(angle), sin(angle)) * (s * 9.0 + 25.0 + seed * 45.0);
     let d = f.yz - pith;
-    let warp = (pat_fbm(vec3<f32>(f.x * 0.012, f.y * 0.06, f.z * 0.06) + vec3<f32>(seed * 31.0)) - 0.5) * s * 3.2;
+    let wobble = select(3.2, 2.0, knots);
+    let warp = (pat_fbm(vec3<f32>(f.x * 0.012, f.y * 0.06, f.z * 0.06) + vec3<f32>(seed * 31.0)) - 0.5) * s * wobble;
     var r = length(d) + warp;
     var knot = 0.0;
     var knot_r = 0.0;
+    var dead = false;
+    // The nearest knot's distance in its own radii, for the light halo round it.
+    var near = 9.0;
     if (knots) {
         // Branches leave the pith at random places along the trunk, about one every 120 mm,
         // heading roughly toward the part (a board shows the knots of branches that crossed it).
@@ -390,34 +399,50 @@ fn wood_color(base: vec3<f32>, late_color: vec3<f32>, f: vec3<f32>, s: f32, cont
         let c0 = floor(f.x / spacing);
         for (var k = -1; k <= 1; k = k + 1) {
             let cell = c0 + f32(k);
-            if (pat_hash(vec3<f32>(cell, seed * 13.0, 1.0)) > 0.8) { continue; }
+            if (pat_hash(vec3<f32>(cell, seed * 13.0, 1.0)) > 0.85) { continue; }
             let along = (cell + 0.2 + 0.6 * pat_hash(vec3<f32>(cell, seed * 13.0, 2.0))) * spacing;
             let a = toward + (pat_hash(vec3<f32>(cell, seed * 13.0, 3.0)) - 0.5) * 0.9;
             let u = vec2<f32>(cos(a), sin(a));
             let outward = dot(d, u);
             if (outward <= 0.0) { continue; }
             let across = d.x * u.y - d.y * u.x;
-            let radius = (5.0 + 9.0 * pat_hash(vec3<f32>(cell, seed, 4.0))) * clamp(0.35 + outward / 160.0, 0.35, 1.0);
+            // Mostly small knots, now and then a big one.
+            let radius = (3.0 + 14.0 * pow(pat_hash(vec3<f32>(cell, seed, 4.0)), 1.5)) * clamp(0.4 + outward / 150.0, 0.4, 1.0);
             let db = length(vec2<f32>(f.x - along, across));
-            r = r + radius * 1.6 * exp(-(db * db) / (radius * radius * 2.2));
-            let inside = 1.0 - smoothstep(radius * 0.85, radius, db);
+            // The grain wraps round the knot.
+            r = r + radius * 1.8 * exp(-(db * db) / (radius * radius * 3.0));
+            near = min(near, db / radius);
+            let inside = 1.0 - smoothstep(radius * 0.9, radius, db);
             if (inside > knot) {
                 knot = inside;
                 knot_r = db / radius;
+                dead = pat_hash(vec3<f32>(cell, seed, 5.0)) < 0.3;
             }
         }
     }
     let t = fract(r / s);
-    let late = smoothstep(0.5, 0.85, t) * (1.0 - smoothstep(0.92, 1.0, t));
-    let rings = mix(0.3, late, pat_keep(s, foot));
+    // Pine's latewood (the knotty kind) is a thin line; other woods' a broader band.
+    var late = smoothstep(0.5, 0.85, t) * (1.0 - smoothstep(0.92, 1.0, t));
+    if (knots) {
+        late = smoothstep(0.74, 0.9, t) * (1.0 - smoothstep(0.95, 1.0, t));
+    }
+    let rings = mix(select(0.3, 0.15, knots), late, pat_keep(s, foot));
     var c = mix(base, late_color, rings * contrast);
     let fibre = pat_noise(vec3<f32>(f.x * 0.04, f.y * 3.0, f.z * 3.0) + vec3<f32>(seed * 7.0));
     c = c * (1.0 + (fibre - 0.5) * 0.18 * pat_keep(0.6, foot));
+    if (knots) {
+        // Just round a knot the wood is lighter, where the grain swirls past.
+        c = c * (1.0 + 0.09 * smoothstep(1.0, 1.25, near) * (1.0 - smoothstep(1.25, 2.8, near)));
+    }
     if (knot > 0.0) {
-        // The knot: darker, its own tight rings, a dark rim.
-        let kr = fract(knot_r * 4.0);
-        var kc = mix(late_color * 0.8, late_color * 0.55, smoothstep(0.4, 0.8, kr));
-        kc = mix(kc, late_color * 0.4, smoothstep(0.75, 0.95, knot_r));
+        // The knot: reddish amber with fine rings of its own, darker toward a dark rim; a dead
+        // knot's rim is nearly black.
+        let amber = late_color * vec3<f32>(0.95, 0.66, 0.46);
+        let kr = fract(knot_r * 5.0 + 0.3);
+        var kc = mix(amber, amber * 0.76, smoothstep(0.3, 0.75, kr) * pat_keep(1.0, foot));
+        kc = mix(kc, amber * 0.66, smoothstep(0.3, 0.9, knot_r));
+        let rim = select(amber * 0.45, vec3<f32>(0.1, 0.06, 0.04), dead);
+        kc = mix(kc, rim, smoothstep(select(0.8, 0.66, dead), 0.97, knot_r));
         c = mix(c, kc, knot);
     }
     return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -434,7 +459,20 @@ fn pattern_color(i: TOut, foot: f32) -> vec3<f32> {
     let thin = (i.pat.y >> 2u) & 3u;
     let f = pat_frame(i.wp - i.org, axis);
     if (kind == 1u || kind == 7u) {
-        return wood_color(base, i.pc.rgb, f, s, contrast, seed, foot, kind == 7u);
+        // Knotty boards are flat-sawn: the pith lies beyond their wide face (below or above, as
+        // the seed has it), across the part's thinnest side.
+        var side = -1.0;
+        if (kind == 7u) {
+            if (thin == (axis + 1u) % 3u) {
+                side = 0.0;
+            } else if (thin == (axis + 2u) % 3u) {
+                side = 1.5707963;
+            }
+            if (side >= 0.0 && fract(seed * 7.0) > 0.5) {
+                side = side + 3.1415927;
+            }
+        }
+        return wood_color(base, i.pc.rgb, f, s, contrast, seed, foot, kind == 7u, side);
     }
     if (kind == 8u) {
         // Plywood: plies across the part's thinnest side, each a veneer whose grain crosses the
@@ -446,7 +484,7 @@ fn pattern_color(i: TOut, foot: f32) -> vec3<f32> {
         let odd = fract(layer * 0.5) > 0.25;
         var grain = axis;
         if (odd && thin != axis) { grain = 3u - thin - axis; }
-        let veneer = wood_color(base, i.pc.rgb, pat_frame(q, min(grain, 2u)), 3.0, contrast, fract(seed + layer * 0.37), foot, false);
+        let veneer = wood_color(base, i.pc.rgb, pat_frame(q, min(grain, 2u)), 3.0, contrast, fract(seed + layer * 0.37), foot, false, -1.0);
         let shade = 0.92 + 0.12 * pat_hash(vec3<f32>(layer, seed * 5.0, 7.0));
         let glue = smoothstep(0.0, 0.07 + foot / s, min(fract(t), 1.0 - fract(t)));
         return clamp(veneer * shade * (0.72 + 0.28 * glue), vec3<f32>(0.0), vec3<f32>(1.0));

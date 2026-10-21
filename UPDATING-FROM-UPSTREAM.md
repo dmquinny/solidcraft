@@ -256,11 +256,23 @@ coordinates (`crates/doc/src/pattern_appearance.rs`; pending format change `look
 | `plywood` | veneers across the part's thinnest side (the viewport packs it beside the grain axis), grain crossing ply to ply, glue lines | ply thickness |
 | `strands` | OSB: nearest-flake cells three times as long as wide along the axis, each its own shade, darker where they meet | flake width |
 
-Picking a look is the usual way to get a pattern: the Appearance window's swatches include every
-look of the loaded libraries (`swatch_looks` in `dialogs_library.rs`: in the browser all the
+Picking a look is the usual way to get a pattern. The Appearance window (`rows` in
+`dialogs_appearance.rs`) is reordered for it: the looks first, as a short scrolling list with names
+(`ui_kit::swatch_row`, in `ui_kit/choice.rs` with a gallery entry) holding upstream's library and
+every look of the loaded libraries (`swatch_looks` in `dialogs_library.rs`: in the browser all the
 server's libraries, decoded again only when they change), under the category their name starts
-with, and clicking or dropping one brings its pattern and PBR response. The pattern controls are
-folded into a "Pattern: <kind>" section (`pattern_rows` in `dialogs_appearance.rs`).
+with; a click applies the look, its pattern and PBR response to the picked objects at once (`pick`,
+one undo step, OK adds nothing). Then In This Design, colour and opacity; surface response and the
+pattern controls are folded under "Advanced"; the Local library section (opening and saving library
+files) is folded too, under a new id (`local_library_files`) so it starts folded where it was open.
+Upstream tests that click inside those sections open them first (marked "a self-hosting patch").
+The right-click Appearance submenu (`context_menu.rs`, the `ui.appearance` children) lists the
+same looks under category headings and sends their `pbr` and `pattern` with `appearance.assign`.
+Upstream's built-in looks (`builtin()` in `dialogs_appearance.rs` and the doc's
+`appearance::library`, which `appearance.library` lists) take the finish their name implies from
+`pattern_appearance::builtin_finish`: brushed/stainless brushed, satin/anodized/cast blasted,
+polished/chrome smooth, woods grained; plastics, paints and glass stay plain. If upstream renames
+or adds built-in looks, check they still read right.
 
 Each also has `contrast` (0–1), `color` (the second colour: latewood, patina, rust), `axis`
 (`auto`, the body's longest side, or `x`/`y`/`z`) and `seed`; the body's name turns the seed, so

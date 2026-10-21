@@ -902,7 +902,7 @@
   "keymap.command_id": "Command ID",
   "keymap.empty": "No matching commands",
   "keymap.use_anyway": "Use {key} here anyway",
-  "manage.appearance_hint": "Choose a look for the selection, or drag a swatch onto a body or face.",
+  "manage.appearance_hint": "Click a look to apply it to the selection, or drag it onto a body or face.",
   "manage.assign_hint": "Select bodies and choose their plastic design rule.",
   "manage.config_hint": "Edit configuration rows, columns and rules, then activate or preview a row.",
   "manage.empty": "No matching rows.",

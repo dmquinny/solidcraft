@@ -178,7 +178,9 @@ fn load(app: &mut SolveApp, library: &mut LocalLibrary) -> Result<String, String
 }
 
 pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &[SelInput]) {
-    ui_kit::section(ui, "local_library", "Local library", true, |ui| {
+    // Folded (a self-hosting patch): its looks are already among the window's, so this is for
+    // opening and saving library files. A new id, so it starts folded where it was open.
+    ui_kit::section(ui, "local_library_files", "Local library", false, |ui| {
         #[cfg(not(target_arch = "wasm32"))]
         open_rows(app, ui, k);
         #[cfg(target_arch = "wasm32")]

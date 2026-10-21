@@ -7,8 +7,9 @@ server can use. The web app reads every `*.solidcraft-library.json` in the desig
 
 Every look in these libraries also appears among the Appearance window's swatches, under the
 **Library** category its name starts with (`"Wood - Pine, Knotty"` is under Wood). Click one and
-press **Apply to selection**, or drag it onto a part: its pattern and finish come with it. The
-pattern's own settings sit folded under **Pattern** in that window, for setting one by hand.
+press **Apply to selection**, or drag it onto a part: its pattern and finish come with it. They
+are also in the **Appearance** submenu when you right-click a part. The pattern's own settings
+sit folded under **Pattern** in the Appearance window, for setting one by hand.
 
 ## The easy way: save one from the app
 

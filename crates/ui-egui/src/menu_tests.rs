@@ -970,6 +970,16 @@ fn appearance_submenu_swatches_apply_to_the_clicked_body_and_keep_library_action
     let swatch = appearance.children.iter().find(|row| row.swatch.is_some()).unwrap();
     context_menu::run_item(&mut app, swatch, pos2(0.0, 0.0));
     assert_eq!(app.session.doc.appearances.bodies[&name].color, swatch.swatch.unwrap());
+    // A look with a finish brings it (a self-hosting patch); a plain one clears it again.
+    let brushed = appearance.children.iter().find(|row| row.label == "Steel - Brushed").unwrap();
+    context_menu::run_item(&mut app, brushed, pos2(0.0, 0.0));
+    let look = &app.session.doc.appearances.bodies[&name];
+    assert_eq!(look.pattern.map(|p| p.kind()), Some(solidcraft_engine::doc::pattern_appearance::PatternKind::Brushed));
+    assert!(look.pbr.is_some_and(|p| p.metallic() == 1.0));
+    assert!(appearance.children.iter().any(|row| row.id == "#Metal"), "looks sit under their category");
+    let plain = appearance.children.iter().find(|row| row.label == "ABS - White").unwrap();
+    context_menu::run_item(&mut app, plain, pos2(0.0, 0.0));
+    assert!(app.session.doc.appearances.bodies[&name].pattern.is_none());
 }
 
 #[test]

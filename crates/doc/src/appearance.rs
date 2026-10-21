@@ -142,14 +142,12 @@ impl Appearances {
 mod defaults;
 pub use defaults::LIBRARY;
 
-/// A library appearance by name (case-insensitive).
+/// A library appearance by name (case-insensitive), with the finish its name implies (a
+/// self-hosting patch: `pattern_appearance::builtin_finish`).
 pub fn library(name: &str) -> Option<Look> {
-    LIBRARY.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(name.trim())).map(|(n, c, o)| Look {
-        name: n.to_string(),
-        color: *c,
-        opacity: *o,
-        pbr: None,
-        pattern: None,
+    LIBRARY.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(name.trim())).map(|(n, c, o)| {
+        let (pbr, pattern) = crate::pattern_appearance::builtin_finish(n, *c);
+        Look { name: n.to_string(), color: *c, opacity: *o, pbr, pattern }
     })
 }
 

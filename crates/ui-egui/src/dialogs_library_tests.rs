@@ -5,7 +5,8 @@ use solidcraft_engine::{Sel, Session};
 #[test]
 fn catalog_clicked_load_apply_export_and_ok_keep_one_design_undo_step() {
     let mut h = Harness::new();
-    h.call("ui.resize", json!({"width":1600,"height":1400}));
+    // Tall enough for the looks list above the opened library files (a self-hosting patch).
+    h.call("ui.resize", json!({"width":1600,"height":2000}));
     let path = h.dir.join("source-library.json").to_string_lossy().into_owned();
     let mut source = Session::default();
     source.execute("solid.box", &json!({"length":10,"width":10,"height":10})).unwrap();
@@ -29,6 +30,8 @@ fn catalog_clicked_load_apply_export_and_ok_keep_one_design_undo_step() {
     }
     h.frames(3);
     let undo = h.app.session.undo.len();
+    // The library files are folded (a self-hosting patch).
+    h.step(&json!({"click":{"handle":"dialog:section:Local library"}})).unwrap();
     h.step(&json!({"widget":"Load library"})).unwrap();
     for handle in [
         "library:path",
@@ -211,6 +214,8 @@ fn library_material_assigns_density_and_look_to_the_selected_body() {
     }
     h.frames(3);
     let undo = h.app.session.undo.len();
+    // The library files are folded (a self-hosting patch).
+    h.step(&json!({"click":{"handle":"dialog:section:Local library"}})).unwrap();
     h.step(&json!({"widget":"Load library"})).unwrap();
     // The export carries the material and its look as an appearance; appearances come first.
     h.step(&json!({"click":{"handle":"library:entry:1"}})).unwrap();

@@ -411,6 +411,9 @@ const ELEMENTS: &[Element] = &[
     element!("color_swatch", |ui, _| {
         color_swatch(ui, ui.id().with("swatch"), Tokens::get().accent, true, "Sample", 1);
     }),
+    element!("swatch_row", |ui, _| {
+        swatch_row(ui, ui.id().with("swatch_row"), Tokens::get().accent, true, "Wood - Pine", "Sample", 1);
+    }),
     element!("swatch_grid", |ui, _| {
         swatch_grid(ui, &[1, 2, 3], |ui, n| {
             color_swatch(ui, ui.id().with(n), Tokens::get().accent, true, "Sample", *n);

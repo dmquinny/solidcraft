@@ -26,10 +26,13 @@ pub struct Look {
     pub pattern: Option<Pattern>,
 }
 
-/// Built-in looks, used until the engine offers a library (`appearance.library`).
+/// Built-in looks, used until the engine offers a library (`appearance.library`), each with the
+/// finish its name implies (a self-hosting patch).
 pub(crate) fn builtin() -> Vec<Look> {
-    let l =
-        |cat: &str, name: &str, c: [u8; 3], o: f64| Look { name: name.into(), category: cat.into(), color: c, opacity: o, pbr: None, pattern: None };
+    let l = |cat: &str, name: &str, c: [u8; 3], o: f64| {
+        let (pbr, pattern) = solidcraft_engine::doc::pattern_appearance::builtin_finish(name, c);
+        Look { name: name.into(), category: cat.into(), color: c, opacity: o, pbr, pattern }
+    };
     vec![
         l("Metal", "Aluminum - Satin", [196, 199, 204], 1.0),
         l("Metal", "Steel - Brushed", [160, 164, 170], 1.0),
@@ -225,14 +228,6 @@ const PATTERN_KINDS: [&str; 10] = [
     "Strands (OSB)",
 ];
 
-/// The surface pattern (a self-hosting patch), folded away: a library look brings its own, so
-/// this is only for setting one by hand. The heading says which pattern the look has.
-fn pattern_rows(ui: &mut egui::Ui, k: &mut Ap) {
-    let current = k.pattern.map_or(0, |p| usize::from(p.kind().code()));
-    let title = format!("Pattern: {}", PATTERN_KINDS.get(current).copied().unwrap_or("None"));
-    ui_kit::section(ui, "appearance_pattern", &title, false, |ui| pattern_controls(ui, k));
-}
-
 /// The pattern, then its scale, contrast, second colour and grain direction.
 fn pattern_controls(ui: &mut egui::Ui, k: &mut Ap) {
     const AXES: [&str; 4] = ["Longest side", "X", "Y", "Z"];
@@ -363,7 +358,12 @@ fn c32(c: [u8; 3], opacity: f64) -> Color32 {
     Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (opacity.clamp(0.0, 1.0) * 255.0) as u8)
 }
 
-/// The dialog's rows (after the Objects input); applies drops and Apply at once.
+/// The dialog's rows (after the Objects input); applies swatch clicks, drops and Apply at once.
+///
+/// A self-hosting patch orders them for picking a look: the library's swatches first (a click
+/// puts the look, its pattern and surface response on the picked objects), the design's own
+/// looks, colour and opacity, then surface response and pattern folded under Advanced, and the
+/// library files folded at the bottom.
 pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [SelInput]) -> bool {
     // Apply To: bodies or faces (the input follows).
     if let Some(component) = &k.component {
@@ -381,6 +381,82 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
             }
         }
     }
+    let picked: Vec<Sel> = inputs.first().map(|i| i.items.clone()).unwrap_or_default();
+    let mut clicked: Option<Look> = None;
+    // The library, by category.
+    let mut lib = library(app);
+    // The loaded libraries' looks (a self-hosting patch) join the swatches, patterns and all.
+    for look in crate::dialogs_library::swatch_looks(&k.local) {
+        if !lib.iter().any(|l| l.name.eq_ignore_ascii_case(&look.name)) {
+            lib.push(look);
+        }
+    }
+    let mut cats: Vec<String> = vec!["All".into()];
+    for l in &lib {
+        if !cats.contains(&l.category) {
+            cats.push(l.category.clone());
+        }
+    }
+    let refs: Vec<&str> = cats.iter().map(String::as_str).collect();
+    ui_kit::row(ui, "Library", |ui| combo(ui, "ap_cat", &refs, &mut k.category));
+    let search = ui_kit::row(ui, "Search", |ui| {
+        let id = ui.make_persistent_id("ap_search");
+        ui_kit::search_field(ui, id, &mut k.search, "Appearance name")
+    });
+    crate::scenario::publish_handle("appearance:search", search.rect.center());
+    let want = cats.get(k.category).cloned().unwrap_or_default();
+    let query = k.search.trim().to_lowercase();
+    let shown: Vec<(usize, &Look)> =
+        lib.iter().enumerate().filter(|(_, l)| (k.category == 0 || l.category == want) && l.name.to_lowercase().contains(&query)).collect();
+    if shown.is_empty() {
+        ui_kit::text(ui, crate::i18n::tr_label("No matching appearances"), ui_kit::Text::Note("appearances_empty"));
+    }
+    // A list with names (a self-hosting patch): a long library of similar colours is picked by
+    // name, a few rows at a time.
+    let row_height = ui_kit::row_height();
+    ui_kit::list_frame(ui, "appearance_looks", |ui| {
+        egui::ScrollArea::vertical().id_salt("appearance_looks").max_height(row_height * 8.0).show_rows(ui, row_height, shown.len(), |ui, range| {
+            for (i, l) in shown.get(range).unwrap_or_default() {
+                let picked_look = k.look.as_deref() == Some(l.name.as_str()) && k.pbr == l.pbr && k.pattern == l.pattern;
+                let tip = match l.pattern {
+                    Some(p) => format!(
+                        "{} · {} (click to apply, or drag onto a body or face)",
+                        l.name,
+                        PATTERN_KINDS.get(usize::from(p.kind().code())).copied().unwrap_or("pattern").to_lowercase()
+                    ),
+                    None => format!("{} (click to apply, or drag onto a body or face)", l.name),
+                };
+                if ui_kit::swatch_row(ui, egui::Id::new(("ap_lib", *i)), c32(l.color, l.opacity), picked_look, &l.name, &tip, (*l).clone()).clicked()
+                {
+                    clicked = Some((*l).clone());
+                }
+            }
+        });
+    });
+    // In this design.
+    let used = in_design(app);
+    if !used.is_empty() {
+        ui_kit::section_count(ui, "in_design", "In This Design", true, Some(used.len()), |ui| {
+            let items: Vec<_> = used.iter().enumerate().collect();
+            ui_kit::swatch_grid(ui, &items, |ui, (i, (look, n))| {
+                if ui_kit::color_swatch(
+                    ui,
+                    egui::Id::new(("ap_used", *i)),
+                    c32(look.color, look.opacity),
+                    k.color == look.color && k.opacity == look.opacity && k.pbr == look.pbr && k.pattern == look.pattern,
+                    &format!("{} · {n} item(s)", look.name),
+                    look.clone(),
+                )
+                .clicked()
+                {
+                    clicked = Some(look.clone());
+                }
+            });
+        });
+    }
+    if let Some(look) = clicked {
+        pick(app, k, &look, &picked);
+    }
     ui_kit::row(ui, "Colour", |ui| {
         let mut rgb = k.color;
         if ui_kit::color_field(ui, &mut rgb).changed() {
@@ -395,38 +471,40 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
             k.remove_override = false;
         }
     });
-    let mut enabled = k.pbr.is_some();
-    let toggle = ui_kit::row(ui, app.tr("appearance.surface_response"), |ui| ui_kit::checkbox(ui, app.tr("appearance.pbr_opaque"), &mut enabled))
-        .on_hover_text(app.tr("appearance.pbr_help"));
-    crate::scenario::publish_handle("appearance:pbr", toggle.rect.center());
-    if toggle.changed() {
-        k.pbr = enabled.then(PbrParameters::default);
-        if enabled {
-            k.opacity = 1.0;
+    // Surface response and pattern: a look brings its own, so they are only for setting by hand.
+    ui_kit::section(ui, "appearance_advanced", "Advanced", false, |ui| {
+        let mut enabled = k.pbr.is_some();
+        let toggle = ui_kit::row(ui, app.tr("appearance.surface_response"), |ui| ui_kit::checkbox(ui, app.tr("appearance.pbr_opaque"), &mut enabled))
+            .on_hover_text(app.tr("appearance.pbr_help"));
+        crate::scenario::publish_handle("appearance:pbr", toggle.rect.center());
+        if toggle.changed() {
+            k.pbr = enabled.then(PbrParameters::default);
+            if enabled {
+                k.opacity = 1.0;
+            }
+            k.remove_override = false;
         }
-        k.remove_override = false;
-    }
-    if let Some(parameters) = k.pbr {
-        let mut metallic = parameters.metallic();
-        let mut roughness = parameters.roughness();
-        let mut ior = parameters.dielectric_ior();
-        for (label, handle, value, range) in [
-            ("appearance.metallic", "appearance:metallic", &mut metallic, 0.0..=1.0),
-            ("appearance.roughness", "appearance:roughness", &mut roughness, 0.045..=1.0),
-            ("appearance.dielectric_ior", "appearance:ior", &mut ior, 1.0..=3.0),
-        ] {
-            let response = ui_kit::row(ui, app.tr(label), |ui| ui_kit::scalar_field(ui, value, range));
-            crate::scenario::publish_handle(handle, response.rect.center());
-            if response.changed() {
-                k.remove_override = false;
+        if let Some(parameters) = k.pbr {
+            let mut metallic = parameters.metallic();
+            let mut roughness = parameters.roughness();
+            let mut ior = parameters.dielectric_ior();
+            for (label, handle, value, range) in [
+                ("appearance.metallic", "appearance:metallic", &mut metallic, 0.0..=1.0),
+                ("appearance.roughness", "appearance:roughness", &mut roughness, 0.045..=1.0),
+                ("appearance.dielectric_ior", "appearance:ior", &mut ior, 1.0..=3.0),
+            ] {
+                let response = ui_kit::row(ui, app.tr(label), |ui| ui_kit::scalar_field(ui, value, range));
+                crate::scenario::publish_handle(handle, response.rect.center());
+                if response.changed() {
+                    k.remove_override = false;
+                }
+            }
+            if let Ok(parameters) = PbrParameters::new(metallic, roughness, ior) {
+                k.pbr = Some(parameters);
             }
         }
-        if let Ok(parameters) = PbrParameters::new(metallic, roughness, ior) {
-            k.pbr = Some(parameters);
-        }
-    }
-    pattern_rows(ui, k);
-    let picked: Vec<Sel> = inputs.first().map(|i| i.items.clone()).unwrap_or_default();
+        pattern_controls(ui, k);
+    });
     ui.horizontal_wrapped(|ui| {
         let has_target = !picked.is_empty() || k.component.is_some();
         if ui_kit::button(ui, "Apply to selection", ui_kit::Button::Enabled(has_target)).clicked()
@@ -457,87 +535,6 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
         }
     });
     crate::dialogs_library::rows(app, ui, k, inputs);
-    // In this design.
-    let used = in_design(app);
-    if !used.is_empty() {
-        ui_kit::section_count(ui, "in_design", "In This Design", true, Some(used.len()), |ui| {
-            let items: Vec<_> = used.iter().enumerate().collect();
-            ui_kit::swatch_grid(ui, &items, |ui, (i, (look, n))| {
-                if ui_kit::color_swatch(
-                    ui,
-                    egui::Id::new(("ap_used", *i)),
-                    c32(look.color, look.opacity),
-                    k.color == look.color && k.opacity == look.opacity && k.pbr == look.pbr && k.pattern == look.pattern,
-                    &format!("{} · {n} item(s)", look.name),
-                    look.clone(),
-                )
-                .clicked()
-                {
-                    k.color = look.color;
-                    k.opacity = look.opacity;
-                    k.pbr = look.pbr;
-                    k.pattern = look.pattern;
-                    k.look = Some(look.name.clone());
-                    k.remove_override = false;
-                }
-            });
-        });
-    }
-    // The library, by category.
-    let mut lib = library(app);
-    // The loaded libraries' looks (a self-hosting patch) join the swatches, patterns and all.
-    for look in crate::dialogs_library::swatch_looks(&k.local) {
-        if !lib.iter().any(|l| l.name.eq_ignore_ascii_case(&look.name)) {
-            lib.push(look);
-        }
-    }
-    let mut cats: Vec<String> = vec!["All".into()];
-    for l in &lib {
-        if !cats.contains(&l.category) {
-            cats.push(l.category.clone());
-        }
-    }
-    let refs: Vec<&str> = cats.iter().map(String::as_str).collect();
-    ui_kit::row(ui, "Library", |ui| combo(ui, "ap_cat", &refs, &mut k.category));
-    let search = ui_kit::row(ui, "Search", |ui| {
-        let id = ui.make_persistent_id("ap_search");
-        ui_kit::search_field(ui, id, &mut k.search, "Appearance name")
-    });
-    crate::scenario::publish_handle("appearance:search", search.rect.center());
-    let want = cats.get(k.category).cloned().unwrap_or_default();
-    let query = k.search.trim().to_lowercase();
-    let shown: Vec<(usize, &Look)> =
-        lib.iter().enumerate().filter(|(_, l)| (k.category == 0 || l.category == want) && l.name.to_lowercase().contains(&query)).collect();
-    if shown.is_empty() {
-        ui_kit::text(ui, crate::i18n::tr_label("No matching appearances"), ui_kit::Text::Note("appearances_empty"));
-    }
-    ui_kit::swatch_grid(ui, &shown, |ui, (i, l)| {
-        let picked_look = k.look.as_deref() == Some(l.name.as_str()) && k.pbr == l.pbr && k.pattern == l.pattern;
-        if ui_kit::color_swatch(
-            ui,
-            egui::Id::new(("ap_lib", *i)),
-            c32(l.color, l.opacity),
-            picked_look,
-            &match l.pattern {
-                Some(p) => format!(
-                    "{} · {} (drag onto a body or face)",
-                    l.name,
-                    PATTERN_KINDS.get(usize::from(p.kind().code())).copied().unwrap_or("pattern").to_lowercase()
-                ),
-                None => format!("{} (drag onto a body or face)", l.name),
-            },
-            (*l).clone(),
-        )
-        .clicked()
-        {
-            k.color = l.color;
-            k.opacity = l.opacity;
-            k.pbr = l.pbr;
-            k.pattern = l.pattern;
-            k.look = Some(l.name.clone());
-            k.remove_override = false;
-        }
-    });
     // A swatch dropped on the model or the Browser.
     let released = ui.input(|i| i.pointer.any_released());
     if released && let Some(look) = egui::DragAndDrop::take_payload::<Look>(ui.ctx()) {
@@ -568,6 +565,28 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
         ui_kit::text(ui, n, ui_kit::Text::Report("appearance_status", false));
     }
     false
+}
+
+/// A swatch clicked (a self-hosting patch): its look, pattern and surface response become the
+/// dialog's and go onto the picked objects at once, one undo step; OK then has nothing to add.
+fn pick(app: &mut SolveApp, k: &mut Ap, look: &Look, picked: &[Sel]) {
+    k.color = look.color;
+    k.opacity = look.opacity;
+    k.pbr = look.pbr;
+    k.pattern = look.pattern;
+    k.look = Some(look.name.clone());
+    k.remove_override = false;
+    let Some(p) = selected_params(k, picked) else { return };
+    if k.applied.as_ref() == Some(&p) {
+        return;
+    }
+    k.note = Some(match app.run("appearance.assign", p.clone()) {
+        Ok(_) => {
+            k.applied = Some(p);
+            format!("{} applied", look.name)
+        }
+        Err(e) => e,
+    });
 }
 
 fn target_names(targets: &[Sel]) -> String {
@@ -608,6 +627,8 @@ mod tests {
         let before = h.app.session.undo.len();
         h.app.start("appearance.assign");
         h.frames(3);
+        // Surface response is folded under Advanced (a self-hosting patch).
+        h.step(&json!({"click":{"handle":"dialog:section:Advanced"}})).unwrap();
         h.step(&json!({"click":{"handle":"appearance:pbr"}})).unwrap();
         h.step(&json!({"widget":"Apply to selection"})).unwrap();
         assert!(h.app.session.doc.appearances.bodies["Body1"].pbr.is_some());
@@ -635,9 +656,9 @@ mod tests {
         let before = h.app.session.undo.len();
         h.app.start("appearance.assign");
         h.frames(3);
-        // The pattern is folded away until it's wanted.
+        // The pattern is folded under Advanced until it's wanted.
         assert!(h.widget("Pattern scale (mm)").is_none());
-        h.step(&json!({"widget":"Pattern: None"})).unwrap();
+        h.step(&json!({"click":{"handle":"dialog:section:Advanced"}})).unwrap();
         h.step(&json!({"click":{"handle":"appearance:pattern"}})).unwrap();
         h.step(&json!({"widget":"Wood grain"})).unwrap();
         h.step(&json!({"widget":"Apply to selection"})).unwrap();
@@ -652,6 +673,29 @@ mod tests {
         assert_eq!(k.pattern, Some(pattern));
         let params = selected_params(k, &h.app.dialog.as_ref().unwrap().inputs[0].items).unwrap();
         assert_eq!(params["pattern"]["kind"], "wood");
+    }
+
+    /// Clicking a look (a self-hosting patch) puts it on the picked body at once, its pattern and
+    /// surface response with it; OK adds nothing more.
+    #[test]
+    fn clicked_look_applies_at_once_with_its_finish() {
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.resize", json!({"width":1600,"height":1400}));
+        h.app.run("solid.box", json!({"length":10,"width":10,"height":10})).unwrap();
+        h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+        let before = h.app.session.undo.len();
+        h.app.start("appearance.assign");
+        h.frames(3);
+        assert!(h.widget("Pattern scale (mm)").is_none(), "the pattern is folded under Advanced");
+        h.step(&json!({"click":{"handle":"swatch:Stainless Steel - Brushed"}})).unwrap();
+        let look = h.app.session.doc.appearances.bodies["Body1"].clone();
+        assert_eq!(look.name, "Stainless Steel - Brushed");
+        assert_eq!(look.pattern.map(Pattern::kind), Some(PatternKind::Brushed));
+        assert!(look.pbr.is_some_and(|p| p.metallic() == 1.0));
+        assert_eq!(h.app.session.undo.len(), before + 1);
+        h.step(&json!({"widget":"OK"})).unwrap();
+        assert_eq!(h.app.session.undo.len(), before + 1);
+        assert!(h.app.dialog.is_none());
     }
 
     #[test]
@@ -823,6 +867,10 @@ mod tests {
         h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
         h.app.start("appearance.assign");
         h.frames(5);
+        // Surface response and the library files are folded (a self-hosting patch).
+        h.step(&json!({"click":{"handle":"dialog:section:Advanced"}})).unwrap();
+        h.step(&json!({"click":{"handle":"dialog:section:Local library"}})).unwrap();
+        h.frames(2);
         for handle in [
             "dialog:Objects",
             "dialog:clear:Objects",

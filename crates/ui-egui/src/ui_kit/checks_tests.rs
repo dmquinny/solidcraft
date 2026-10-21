@@ -195,6 +195,11 @@ fn surface(
             crate::dialogs_motion::rows(app, ui, editor, &mut []);
         }),
         "appearance" => ui_kit::scope(ui, |ui| {
+            // Surface response and the library files are folded (a self-hosting patch).
+            for section in ["appearance_advanced", "local_library_files"] {
+                let id = ui.make_persistent_id(section);
+                ui.ctx().data_mut(|d| d.insert_persisted(id, true));
+            }
             crate::dialogs_appearance::rows(app, ui, appearance, inputs);
         }),
         "preferences" => crate::prefs::show(app, ui.ctx()),

@@ -410,14 +410,37 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
         };
         item.children.push(original);
         if ["bodies", "components", "faces"].iter().any(|key| targets.get(key).and_then(Value::as_array).is_some_and(|v| !v.is_empty())) {
-            for look in crate::dialogs_appearance::builtin() {
-                let mut params = targets.clone();
-                params["appearance"] = json!(look.name);
-                params["color"] = json!(crate::dialogs_appearance::hex(look.color));
-                params["opacity"] = json!(look.opacity);
-                let mut child = cmd(app, "appearance.assign", &look.name).with(params);
-                child.swatch = Some(look.color);
-                item.children.push(child);
+            // The built-in looks and the loaded libraries' (a self-hosting patch), under their
+            // categories, each bringing its pattern and surface response.
+            let mut looks = crate::dialogs_appearance::builtin();
+            for look in crate::dialogs_library::swatch_looks(&Default::default()) {
+                if !looks.iter().any(|l| l.name.eq_ignore_ascii_case(&look.name)) {
+                    looks.push(look);
+                }
+            }
+            let mut categories: Vec<&str> = Vec::new();
+            for look in &looks {
+                if !categories.contains(&look.category.as_str()) {
+                    categories.push(&look.category);
+                }
+            }
+            for category in categories {
+                item.children.push(Item::heading(category));
+                for look in looks.iter().filter(|l| l.category == category) {
+                    let mut params = targets.clone();
+                    params["appearance"] = json!(look.name);
+                    params["color"] = json!(crate::dialogs_appearance::hex(look.color));
+                    params["opacity"] = json!(look.opacity);
+                    if let Some(pbr) = look.pbr {
+                        params["pbr"] = json!(pbr);
+                    }
+                    if let Some(pattern) = look.pattern {
+                        params["pattern"] = json!(pattern);
+                    }
+                    let mut child = cmd(app, "appearance.assign", &look.name).with(params);
+                    child.swatch = Some(look.color);
+                    item.children.push(child);
+                }
             }
             item.children.push(Item::sep());
             item.children.push(cmd(app, "appearance.assign", "Remove override").with(targets));

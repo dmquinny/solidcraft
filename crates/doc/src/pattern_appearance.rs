@@ -163,10 +163,58 @@ impl From<Pattern> for Wire {
     }
 }
 
+/// The finish a built-in look gets from its name (a self-hosting patch), so picking one brings
+/// its texture: brushed and stainless metals are brushed, satin, anodized and cast ones blasted,
+/// polished ones and chrome smooth, all with a metal surface response; woods get their grain.
+/// Plastics, paints, rubber and glass stay plain. The second colour is a darker shade.
+pub fn builtin_finish(name: &str, color: [u8; 3]) -> (Option<crate::pbr_appearance::PbrParameters>, Option<Pattern>) {
+    let n = name.to_ascii_lowercase();
+    let has = |w: &str| n.contains(w);
+    let wood = ["wood", "oak", "walnut", "pine", "maple", "birch", "cherry"].iter().any(|w| has(w));
+    let metal = ["aluminum", "aluminium", "steel", "iron", "brass", "copper", "bronze", "chrome", "titanium", "anodized"].iter().any(|w| has(w));
+    let (kind, scale, contrast, metallic, roughness) = if wood {
+        (Some(PatternKind::Wood), if has("walnut") { 3.0 } else { 4.0 }, 0.7, 0.0, 0.7)
+    } else if !metal {
+        return (None, None);
+    } else if has("chrome") || has("polished") {
+        (None, 0.0, 0.0, 1.0, 0.08)
+    } else if has("brushed") || has("stainless") {
+        (Some(PatternKind::Brushed), 0.4, 0.45, 1.0, 0.3)
+    } else if has("cast") {
+        (Some(PatternKind::Blasted), 0.6, 0.45, 1.0, 0.7)
+    } else if has("satin") || has("anodized") || has("titanium") {
+        (Some(PatternKind::Blasted), 0.4, 0.3, 1.0, 0.45)
+    } else {
+        (Some(PatternKind::Brushed), 0.5, 0.3, 1.0, 0.3)
+    };
+    let darker = color.map(|c| (f64::from(c) * 0.62).round() as u8);
+    let pattern = kind.and_then(|k| Pattern::new(k, scale, contrast, darker, PatternAxis::Auto, 0).ok());
+    (crate::pbr_appearance::PbrParameters::new(metallic, roughness, 1.5).ok(), pattern)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn built_in_looks_bring_their_finish() {
+        let kind = |name: &str| builtin_finish(name, [200, 200, 200]).1.map(Pattern::kind);
+        assert_eq!(kind("Steel - Brushed"), Some(PatternKind::Brushed));
+        assert_eq!(kind("Stainless Steel"), Some(PatternKind::Brushed));
+        assert_eq!(kind("Aluminum - Satin"), Some(PatternKind::Blasted));
+        assert_eq!(kind("Anodized Black"), Some(PatternKind::Blasted));
+        assert_eq!(kind("Cast Iron"), Some(PatternKind::Blasted));
+        assert_eq!(kind("Wood - Oak"), Some(PatternKind::Wood));
+        assert_eq!(kind("Walnut"), Some(PatternKind::Wood));
+        assert_eq!(kind("Chrome"), None);
+        assert!(builtin_finish("Chrome", [200; 3]).0.is_some_and(|p| p.metallic() == 1.0));
+        for plain in ["ABS - White", "Paint - Red", "Glass - Clear", "Rubber - Black", "Polycarbonate - Clear"] {
+            assert_eq!(builtin_finish(plain, [200; 3]), (None, None), "{plain}");
+        }
+        let grain = builtin_finish("Oak", [190, 150, 100]).1.unwrap();
+        assert_eq!(grain.color(), [118, 93, 62]);
+    }
 
     #[test]
     fn patterns_round_trip_and_refuse_what_they_cannot_draw() {

@@ -324,6 +324,42 @@ pub(crate) fn color_swatch<T: Send + Sync + 'static>(
     response
 }
 
+/// A named sample in a list: its colour, then its name. A click picks it and it drags like a
+/// swatch (a self-hosting patch, for long libraries whose looks are told apart by name).
+pub(crate) fn swatch_row<T: Send + Sync + 'static>(
+    ui: &mut Ui,
+    id: egui::Id,
+    color: egui::Color32,
+    selected: bool,
+    label: &str,
+    tip: &str,
+    payload: T,
+) -> egui::Response {
+    let t = Tokens::get();
+    let response = ui
+        .dnd_drag_source(id, payload, |ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(dimension(ui.available_width()), row_height()), egui::Sense::hover());
+            if selected {
+                ui.painter().rect_filled(rect, t.control_radius, t.selected_bg);
+            } else if ui.rect_contains_pointer(rect) {
+                ui.painter().rect_filled(rect, t.control_radius, t.hover);
+            }
+            let side = (rect.height() - t.space_8).max(4.0);
+            let chip = egui::Rect::from_min_size(egui::pos2(rect.left() + t.space_4, rect.center().y - side / 2.0), vec2(side, side));
+            ui.painter().rect(chip, t.control_radius, color, egui::Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+            let text = egui::Rect::from_min_max(egui::pos2((chip.right() + t.space_8).min(rect.right()), rect.top()), rect.max);
+            paint_text(ui, text, label, egui::FontId::proportional(t.font_label), if selected { t.selected_ink } else { t.form_ink }, false);
+        })
+        .response;
+    let response = ui.interact(response.rect, id.with("click"), egui::Sense::click()).on_hover_text(tip);
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label));
+    scenario::publish_handle(&format!("swatch:{label}"), response.rect.center());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    response
+}
+
 /// Wrapped samples with common token spacing. Keeps native drag-and-drop payloads intact.
 pub(crate) fn swatch_grid<T>(ui: &mut Ui, values: &[T], mut each: impl FnMut(&mut Ui, &T)) {
     let t = Tokens::get();

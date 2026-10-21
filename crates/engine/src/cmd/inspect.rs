@@ -588,11 +588,14 @@ pub(super) fn attach_pbr(cmd: &str, params: &Value, look: &mut solidcraft_doc::a
 }
 
 fn appearance_library(_s: &mut Session, _p: &Value) -> Result<Value> {
+    // Each with the finish its name implies (a self-hosting patch).
     let list: Vec<Value> = solidcraft_doc::appearance::LIBRARY
         .iter()
-        .map(|(n, c, o)| {
-            let category = n.split(" - ").next().unwrap_or(n);
-            json!({"name": n, "category": category, "color": format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]), "opacity": o})
+        .filter_map(|(n, _, _)| solidcraft_doc::appearance::library(n))
+        .map(|look| {
+            let mut value = look_json(&look);
+            value["category"] = json!(look.name.split(" - ").next().unwrap_or(&look.name));
+            value
         })
         .collect();
     Ok(json!({"appearances": list}))
