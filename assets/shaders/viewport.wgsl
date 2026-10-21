@@ -324,7 +324,8 @@ fn fs_tri_all(i: TOut) -> @location(0) vec4<f32> {
 
 // Surface patterns (a self-hosting patch, not upstream): wood grain, brushed, blasted and mottled
 // finishes, worked out from the surface point itself, so they need no texture or coordinates.
-// `pat`: kind (0 none, 1 wood, 2 brushed, 3 blasted, 4 mottled), grain axis (0 x, 1 y, 2 z),
+// `pat`: kind (0 none, 1 wood, 2 brushed, 3 blasted, 4 mottled, 5 speckled, 6 veined), grain
+// axis (0 x, 1 y, 2 z),
 // scale (a quarter millimetre per step), contrast (0-255). `pc`: the second colour, its alpha
 // the body's seed. `org`: the body's anchor (its box centre), so the pattern stays with it.
 
@@ -408,13 +409,46 @@ fn pattern_color(i: TOut, foot: f32) -> vec3<f32> {
         let n = pat_noise(q + vec3<f32>(seed * 11.0)) * 0.65 + pat_noise(q * 0.27) * 0.35;
         return clamp(base * (1.0 + (n - 0.5) * contrast * 0.5), vec3<f32>(0.0), vec3<f32>(1.0));
     }
-    // Mottled: patches of the second colour (patina, rust, wear), with a little grit.
-    let q = (i.wp - i.org) / s;
-    let n = pat_fbm(q + vec3<f32>(seed * 23.0));
-    let edge = 0.62 - 0.3 * contrast;
-    let blot = smoothstep(edge - 0.06, edge + 0.06, n);
-    let grit = (pat_noise(q * 9.0) - 0.5) * 0.12 * pat_keep(s * 0.11, foot);
-    return clamp(mix(base, i.pc.rgb, blot) * (1.0 + grit), vec3<f32>(0.0), vec3<f32>(1.0));
+    if (kind == 4u) {
+        // Mottled: patches of the second colour (patina, rust, wear), with a little grit.
+        let q = (i.wp - i.org) / s;
+        let n = pat_fbm(q + vec3<f32>(seed * 23.0));
+        let edge = 0.62 - 0.3 * contrast;
+        let blot = smoothstep(edge - 0.06, edge + 0.06, n);
+        let grit = (pat_noise(q * 9.0) - 0.5) * 0.12 * pat_keep(s * 0.11, foot);
+        return clamp(mix(base, i.pc.rgb, blot) * (1.0 + grit), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    if (kind == 5u) {
+        // Speckled: grains of the second colour (aggregate, granite crystals, terrazzo), lighter
+        // flecks among them and a fine grit; `contrast` sets how many grains there are. Grains
+        // stay at least about a pixel across.
+        let q = (i.wp - i.org) / max(s, foot * 1.2);
+        // Two octaves, so grains are small and irregular; the threshold keeps them apart (much
+        // lower and they merge into patches).
+        let a = pat_noise(q + vec3<f32>(seed * 19.0)) * 0.65 + pat_noise(q * 2.7 + vec3<f32>(9.1)) * 0.35;
+        let b = pat_noise(q * 2.3 + vec3<f32>(5.2, seed * 7.0, 1.3));
+        let edge = 0.66 - 0.16 * contrast;
+        let dark = smoothstep(edge, edge + 0.035, a);
+        let light = smoothstep(0.8, 0.86, b) * 0.6 * (1.0 - dark);
+        var c = mix(base, i.pc.rgb, dark);
+        c = mix(c, min(base * 1.25 + vec3<f32>(0.06), vec3<f32>(1.0)), light);
+        let grit = (pat_noise(q * 6.0) - 0.5) * 0.1;
+        return clamp(c * (1.0 + grit), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    // Veined: thin winding veins of the second colour (marble), with finer veins between them
+    // and a cloudy ground; a vein stays at least about a pixel wide.
+    let q = f / s;
+    let warp = pat_fbm(q * 0.4 + vec3<f32>(seed * 29.0)) * 2.5;
+    let t = q.y * 0.8 + q.z * 0.5 + q.x * 0.25 + warp;
+    let d = min(fract(t), 1.0 - fract(t)) * 2.0;
+    let width = 0.05 + foot / s * 1.5;
+    let vein = 1.0 - smoothstep(0.0, width, d);
+    let t2 = t * 3.1 + pat_fbm(q * 1.3 + vec3<f32>(3.7)) * 2.0;
+    let d2 = min(fract(t2), 1.0 - fract(t2)) * 2.0;
+    let fine = (1.0 - smoothstep(0.0, width * 1.6, d2)) * 0.45 * pat_keep(s * 0.3, foot);
+    let cloud = 0.95 + 0.1 * pat_fbm(q * 0.3 + vec3<f32>(11.0));
+    let c = mix(base * cloud, i.pc.rgb, clamp(vein + fine, 0.0, 1.0) * contrast);
+    return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn shade(i: TOut) -> vec4<f32> {

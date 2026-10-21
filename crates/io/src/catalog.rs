@@ -20,6 +20,9 @@ fn invalid(message: impl Into<String>) -> IoError {
 fn text(value: &str, max: usize) -> bool {
     !value.is_empty() && value == value.trim() && value.len() <= max && !value.chars().any(char::is_control)
 }
+fn opaque() -> f64 {
+    1.0
+}
 fn identifier(value: &str) -> bool {
     value.len() <= 64
         && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
@@ -58,6 +61,8 @@ impl Provenance {
 pub struct ScalarLook {
     pub name: String,
     pub color: [u8; 3],
+    /// 1 (opaque) when a hand-written library leaves it out.
+    #[serde(default = "opaque")]
     pub opacity: f64,
     /// Library format 2 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,11 +157,16 @@ impl Definition {
     }
 }
 
+/// A hand-written library (a self-hosting patch) may leave out an entry's `id`, `revision` and
+/// `provenance`: reading fills them in (`Catalog::decode`). A stated revision must still match.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub revision: String,
+    #[serde(default)]
     pub provenance: Provenance,
     pub definition: Definition,
 }
@@ -215,7 +225,8 @@ fn bounded_entries<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::re
                 }
                 let Some(entry) = sequence.next_element::<Entry>()? else { break };
                 let revision = entry.content_revision().map_err(serde::de::Error::custom)?;
-                if entry.revision != revision || entry.id.len() > 129 {
+                // A hand-written entry without a revision gets its own in `Catalog::decode`.
+                if (!entry.revision.is_empty() && entry.revision != revision) || entry.id.len() > 129 {
                     return Err(serde::de::Error::custom("invalid scalar library revision or identity"));
                 }
                 entries.try_reserve(1).map_err(|_| serde::de::Error::custom("could not reserve scalar library entries"))?;
@@ -248,7 +259,19 @@ impl Catalog {
         if bytes.len() > MAX_BYTES {
             return Err(invalid("scalar library exceeds 4 MiB"));
         }
-        let catalog: Self = serde_json::from_slice(bytes).map_err(|e| invalid(format!("invalid scalar library: {e}")))?;
+        let mut catalog: Self = serde_json::from_slice(bytes).map_err(|e| invalid(format!("invalid scalar library: {e}")))?;
+        // Hand-written entries: the revision their content has, and the identity `Entry::new`
+        // would give them.
+        if identifier(&catalog.id) {
+            for entry in catalog.entries.iter_mut().filter(|e| e.revision.is_empty() || e.id.is_empty()) {
+                let revision = entry.content_revision()?;
+                if entry.id.is_empty() {
+                    let prefix = revision.get(..16).ok_or_else(|| invalid("invalid library revision"))?;
+                    entry.id = format!("{}/{}-{prefix}", catalog.id, entry.definition.kind());
+                }
+                entry.revision = revision;
+            }
+        }
         catalog.validate()?;
         Ok(catalog)
     }

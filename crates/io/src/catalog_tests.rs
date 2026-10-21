@@ -188,3 +188,34 @@ fn rich_looks_export_as_v2_from_every_design_owned_appearance_location() {
     rich.format = FORMAT.into();
     assert!(rich.validate().is_err());
 }
+
+/// A hand-written library (a self-hosting patch): entries without `id`, `revision`,
+/// `provenance` or `opacity` get them on reading, exactly as `Entry::new` would; a stated
+/// revision that doesn't match is still refused.
+#[test]
+fn hand_written_entries_get_their_identity_and_revision_on_reading() {
+    let hand = json!({
+        "format": "solidcraft-library/2",
+        "id": "my.stones",
+        "name": "My stones",
+        "entries": [
+            {"definition": {"kind": "appearance", "value": {"name": "Stone - Grey granite", "color": [128, 128, 130],
+                "pattern": {"kind": "speckled", "scale_mm": 2.5, "contrast": 0.5, "color": [40, 40, 44]}}}},
+            {"definition": {"kind": "material", "value": {"name": "Granite", "density_g_cm3": 2.7,
+                "appearance": {"name": "Stone - Grey granite", "color": [128, 128, 130]}}}}
+        ]
+    });
+    let library = Catalog::decode(&serde_json::to_vec(&hand).unwrap()).unwrap();
+    assert_eq!(library.entries.len(), 2);
+    for entry in &library.entries {
+        let made = Entry::new("my.stones", entry.definition.clone(), Provenance::default()).unwrap();
+        assert_eq!((&entry.id, &entry.revision, &entry.provenance), (&made.id, &made.revision, &made.provenance));
+    }
+    assert_eq!(Catalog::decode(&library.encode().unwrap()).unwrap(), library);
+    let mut wrong = hand.clone();
+    wrong["entries"][0]["revision"] = json!("0".repeat(64));
+    assert!(Catalog::decode(&serde_json::to_vec(&wrong).unwrap()).is_err());
+    let mut v1 = hand.clone();
+    v1["format"] = json!("solidcraft-library/1");
+    assert!(Catalog::decode(&serde_json::to_vec(&v1).unwrap()).is_err(), "a v1 file can't carry a pattern");
+}

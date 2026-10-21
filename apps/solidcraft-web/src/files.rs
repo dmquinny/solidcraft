@@ -500,6 +500,26 @@ fn fetch_libraries(files: &Rc<Files>) {
     });
 }
 
+/// Put a library the Appearance window saved (`LIBRARIES`) in the server's `Libraries` folder,
+/// for every browser; without server storage it is downloaded instead.
+fn save_library(files: &Rc<Files>, name: String, bytes: Vec<u8>) {
+    if !remote_only() {
+        if let Err(e) = download(&name, &bytes) {
+            files.say(format!("{name}: {e}"), true);
+        }
+        return;
+    }
+    let files = files.clone();
+    spawn_local(async move {
+        let url = remote_path_url(&format!("{LIBRARY_FOLDER}/{name}"));
+        match remote_request("PUT", &url, Some(&bytes), &[("Content-Type", "application/json")]).await {
+            Ok(r) if r.ok() => files.say(format!("{name} is in the server's Libraries folder"), false),
+            Ok(r) => files.say(format!("{name}: the server answered HTTP {}", r.status()), true),
+            Err(e) => files.say(format!("{name}: {e}"), true),
+        }
+    });
+}
+
 /// Go to something another user shared: a folder is shown in the panel; a design's folder is
 /// entered and the design opened once its entries are in (the host's frame does that).
 pub fn open_shared(files: &Rc<Files>, shared: &Shared) {
@@ -1358,6 +1378,11 @@ pub fn set_remote_folder(files: &Rc<Files>, folder: &str) -> Result<(), String> 
 /// Store what commands wrote: OPFS paths into OPFS, download paths as downloads.
 pub fn flush(files: &Rc<Files>) {
     for (path, bytes) in vfs::take_writes() {
+        // A library saved in the Appearance window: to the server's Libraries folder.
+        if let Some(name) = path.strip_prefix(LIBRARIES) {
+            save_library(files, name.to_string(), bytes);
+            continue;
+        }
         match disk::route(&path) {
             disk::WriteTo::Opfs => {
                 let name = path.strip_prefix(OPFS).unwrap_or(&path).to_string();

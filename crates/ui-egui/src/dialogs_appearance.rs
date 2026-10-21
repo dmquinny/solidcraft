@@ -214,7 +214,8 @@ pub fn commands(k: &Ap, inputs: &[SelInput]) -> Vec<(String, Value)> {
 /// The surface pattern's controls (a self-hosting patch): the pattern, then its scale, contrast,
 /// second colour and grain direction.
 fn pattern_rows(ui: &mut egui::Ui, k: &mut Ap) {
-    const KINDS: [&str; 5] = ["None", "Wood grain", "Brushed", "Blasted / anodized", "Mottled (patina, rust)"];
+    const KINDS: [&str; 7] =
+        ["None", "Wood grain", "Brushed", "Blasted / anodized", "Mottled (patina, rust)", "Speckled (concrete, granite)", "Veined (marble)"];
     const AXES: [&str; 4] = ["Longest side", "X", "Y", "Z"];
     let mut kind = k.pattern.map_or(0, |p| usize::from(p.kind().code()));
     let row = ui_kit::row(ui, "Pattern", |ui| ui_kit::dropdown(ui, "appearance_pattern", &mut kind, &KINDS));
@@ -229,6 +230,8 @@ fn pattern_rows(ui: &mut egui::Ui, k: &mut Ap) {
                 PatternKind::Brushed => (0.5, 0.4),
                 PatternKind::Blasted => (0.4, 0.3),
                 PatternKind::Mottled => (15.0, 0.5),
+                PatternKind::Speckled => (2.0, 0.5),
+                PatternKind::Veined => (40.0, 0.6),
             };
             let darker = k.color.map(|c| (f64::from(c) * 0.62).round() as u8);
             Pattern::new(kind, scale, contrast, darker, PatternAxis::Auto, 0).ok()
@@ -249,7 +252,7 @@ fn pattern_rows(ui: &mut egui::Ui, k: &mut Ap) {
     crate::scenario::publish_handle("appearance:pattern_scale", scale_row.rect.center());
     ui_kit::row(ui, "Pattern contrast", |ui| ui_kit::slider(ui, &mut contrast, 0.0..=1.0, Default::default()));
     ui_kit::row(ui, "Second colour", |ui| ui_kit::color_field(ui, &mut second));
-    if p.kind() != PatternKind::Blasted {
+    if !matches!(p.kind(), PatternKind::Blasted | PatternKind::Speckled) {
         ui_kit::row(ui, "Grain along", |ui| ui_kit::dropdown(ui, "appearance_pattern_axis", &mut axis, &AXES));
     }
     let axis = [PatternAxis::Auto, PatternAxis::X, PatternAxis::Y, PatternAxis::Z].get(axis).copied().unwrap_or_default();

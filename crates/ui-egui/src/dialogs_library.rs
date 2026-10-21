@@ -24,6 +24,8 @@ pub struct LocalLibrary {
     pub catalog: Option<Catalog>,
     pub selected: Option<String>,
     pub overwrite: bool,
+    /// The name a library is saved to the server under (the browser).
+    pub save_name: String,
 }
 
 fn display_order(mut catalog: Catalog) -> Catalog {
@@ -167,9 +169,10 @@ fn server_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap) {
     if found.is_empty() {
         ui_kit::text(
             ui,
-            "Put .solidcraft-library.json files in the server's Libraries folder to use them here.",
+            "Put .solidcraft-library.json files in the server's Libraries folder to use them here, or save this design's looks there below.",
             ui_kit::Text::Note("library_platform"),
         );
+        save_rows(app, ui, k);
         return;
     }
     let mut options = vec!["Choose a library"];
@@ -194,6 +197,58 @@ fn server_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap) {
         k.local.search.clear();
         k.note = Some(load(app, &mut k.local).unwrap_or_else(|error| error));
     }
+    save_rows(app, ui, k);
+}
+
+/// Save this design's appearances and materials (their patterns too) as a library in the
+/// server's Libraries folder, where every browser finds it: written under `SERVER_LIBRARIES`,
+/// which the web host uploads (or downloads, without server storage). Make your own looks first
+/// (Appearance, or a physical material with a default look), then name the library and save.
+#[cfg(target_arch = "wasm32")]
+fn save_rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap) {
+    let name = ui_kit::row(ui, "Save as library", |ui| {
+        let id = ui.make_persistent_id("library_save_name");
+        ui_kit::cell_editor(ui, id, &mut k.local.save_name, "My stones", false)
+    });
+    crate::scenario::publish_handle("library:save_name", name.rect.center());
+    let title = k.local.save_name.trim().to_string();
+    let save = ui_kit::button(ui, "Save to the server", ui_kit::Button::Enabled(!title.is_empty()));
+    crate::scenario::publish_handle("library:save_server", save.rect.center());
+    if !save.clicked() {
+        return;
+    }
+    if app.session.doc.appearances.is_empty() && app.session.doc.user_materials.is_empty() {
+        k.note = Some("Give bodies an appearance or make a physical material first: those are what a library keeps".into());
+        return;
+    }
+    let slug: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .take(48)
+        .collect();
+    let slug = if slug.is_empty() { "library".to_string() } else { slug };
+    let path = format!("{SERVER_LIBRARIES}{slug}.solidcraft-library.json");
+    let params =
+        json!({"path": path, "id": format!("user.{slug}"), "name": title.chars().take(128).collect::<String>(), "overwrite": k.local.overwrite});
+    k.note = Some(match app.run("library.export", params) {
+        Ok(result) => {
+            k.local.path = path;
+            match load(app, &mut k.local) {
+                Ok(_) => {
+                    format!("{title}: {} definitions saved as {slug}.solidcraft-library.json in the server's Libraries folder", result["entries"])
+                }
+                Err(error) => error,
+            }
+        }
+        Err(error) => error,
+    });
 }
 
 /// The open library's entries (appearances, then physical materials) and the button that

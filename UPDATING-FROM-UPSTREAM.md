@@ -223,6 +223,14 @@ then `cargo run --release -- <output.json>`); an edited library needs fresh entr
 (SHA-256 of `[provenance, definition]`, `Entry::new` in `crates/io/src/catalog.rs`), so
 regenerate rather than hand-edit it.
 
+Your own libraries: `packaging/docker/libraries/README.md` (a copy sits in the Libraries folder as
+`HOW-TO-MAKE-A-LIBRARY.md`) explains both ways. In the browser, the Appearance window's **Save as
+library** / **Save to the server** exports the design's looks and materials (`library.export` to
+`/libraries/<name>.solidcraft-library.json`; `save_rows` in `dialogs_library.rs`) and the web host
+uploads that path to `files/Libraries/` (`save_library` in `files.rs`; a download without server
+storage). By hand, entries may leave out `id`, `revision` and `provenance`, and looks `opacity`:
+`Catalog::decode` fills them in as `Entry::new` would, while a stated revision must still match.
+
 Library format 2 (`FORMAT_V2` in `crates/io/src/catalog.rs`): a look may also carry `pbr` and
 `pattern`. Export writes 2 only when a look has one of them, so plain libraries stay version 1 and
 open in upstream builds; v1 entries keep their revisions. Upstream refuses to export a PBR look
@@ -242,6 +250,8 @@ coordinates (`crates/doc/src/pattern_appearance.rs`; pending format change `look
 | `brushed` | long thin streaks along the grain axis | streak width |
 | `blasted` | an even fine speckle (bead blast, anodizing, castings, powder coat, MDF) | speckle size |
 | `mottled` | patches of the second colour (patina, rust, mill scale, galvanizing spangle) | patch size |
+| `speckled` | grains of the second colour with lighter flecks (concrete aggregate, granite, terrazzo, sandstone, brick) | grain size |
+| `veined` | thin winding veins of the second colour with finer ones between (marble, travertine) | vein spacing |
 
 Each also has `contrast` (0–1), `color` (the second colour: latewood, patina, rust), `axis`
 (`auto`, the body's longest side, or `x`/`y`/`z`) and `seed`; the body's name turns the seed, so

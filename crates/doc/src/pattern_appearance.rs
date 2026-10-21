@@ -16,10 +16,16 @@ pub enum PatternKind {
     Blasted,
     /// Patches of the second colour: patina, rust, wear (`scale_mm`: the patch size).
     Mottled,
+    /// Grains of the second colour with lighter flecks: concrete aggregate, granite, terrazzo
+    /// (`scale_mm`: the grain size; `contrast`: how many grains).
+    Speckled,
+    /// Thin winding veins of the second colour: marble (`scale_mm`: the vein spacing).
+    Veined,
 }
 
 impl PatternKind {
-    pub const ALL: [PatternKind; 4] = [PatternKind::Wood, PatternKind::Brushed, PatternKind::Blasted, PatternKind::Mottled];
+    pub const ALL: [PatternKind; 6] =
+        [PatternKind::Wood, PatternKind::Brushed, PatternKind::Blasted, PatternKind::Mottled, PatternKind::Speckled, PatternKind::Veined];
 
     /// The viewport's number for it (0 is no pattern).
     pub fn code(self) -> u8 {
@@ -28,6 +34,8 @@ impl PatternKind {
             PatternKind::Brushed => 2,
             PatternKind::Blasted => 3,
             PatternKind::Mottled => 4,
+            PatternKind::Speckled => 5,
+            PatternKind::Veined => 6,
         }
     }
 }
@@ -172,5 +180,10 @@ mod tests {
         assert_eq!(p.gpu_bytes(2), [4, 2, 240, 255]);
         let tiny = Pattern::new(PatternKind::Blasted, 0.25, 0.0, [0; 3], PatternAxis::X, 0).unwrap();
         assert_eq!(tiny.gpu_bytes(9), [3, 2, 1, 0]);
+        // Every kind has its own number, in the order the viewport's shader reads them.
+        let codes: Vec<u8> = PatternKind::ALL.iter().map(|k| k.code()).collect();
+        assert_eq!(codes, vec![1, 2, 3, 4, 5, 6]);
+        let marble = serde_json::to_value(Pattern::new(PatternKind::Veined, 40.0, 0.6, [80, 80, 90], PatternAxis::Auto, 0).unwrap()).unwrap();
+        assert_eq!(marble["kind"], "veined");
     }
 }
