@@ -20,6 +20,10 @@ pub struct Look {
     pub opacity: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pbr: Option<crate::pbr_appearance::PbrParameters>,
+    /// A surface pattern drawn over the colour (wood grain, brushed, blasted, mottled; a
+    /// self-hosting patch, `pattern_appearance`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<crate::pattern_appearance::Pattern>,
 }
 
 #[derive(Deserialize)]
@@ -30,6 +34,8 @@ struct LookWire {
     opacity: f64,
     #[serde(default)]
     pbr: Option<crate::pbr_appearance::PbrParameters>,
+    #[serde(default)]
+    pattern: Option<crate::pattern_appearance::Pattern>,
 }
 
 impl TryFrom<LookWire> for Look {
@@ -38,7 +44,7 @@ impl TryFrom<LookWire> for Look {
         if value.pbr.is_some() && value.opacity != 1.0 {
             return Err("opaque PBR requires opacity 1; refraction/transmission is not supported".into());
         }
-        Ok(Self { name: value.name, color: value.color, opacity: value.opacity, pbr: value.pbr })
+        Ok(Self { name: value.name, color: value.color, opacity: value.opacity, pbr: value.pbr, pattern: value.pattern })
     }
 }
 
@@ -48,7 +54,7 @@ fn opaque() -> f64 {
 
 impl Look {
     pub fn custom(color: [u8; 3], opacity: f64) -> Look {
-        Look { name: "Custom".into(), color, opacity: opacity.clamp(0.0, 1.0), pbr: None }
+        Look { name: "Custom".into(), color, opacity: opacity.clamp(0.0, 1.0), pbr: None, pattern: None }
     }
     pub fn opaque_surface(&self) -> crate::Result<Option<solidcraft_render::surface::OpaqueSurface>> {
         if self.pbr.is_some() && self.opacity != 1.0 {
@@ -143,6 +149,7 @@ pub fn library(name: &str) -> Option<Look> {
         color: *c,
         opacity: *o,
         pbr: None,
+        pattern: None,
     })
 }
 
@@ -150,7 +157,7 @@ pub fn library(name: &str) -> Option<Look> {
 pub fn material_look(material: &str) -> Option<Look> {
     let color = crate::material_color(material)?;
     let opacity = if material == "Glass" { 0.25 } else { 1.0 };
-    Some(Look { name: material.to_string(), color, opacity, pbr: None })
+    Some(Look { name: material.to_string(), color, opacity, pbr: None, pattern: None })
 }
 
 impl Document {

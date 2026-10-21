@@ -32,7 +32,15 @@ const UNIFORM_SIZE: u64 = 384;
 pub struct PlannedBody {
     pub plan: Arc<solidcraft_geom::tess::TessPlan>,
     pub face_colors: Vec<[u8; 4]>,
+    /// Each face's surface pattern (a self-hosting patch): kind, grain axis, scale and contrast,
+    /// then the second colour and the seed; zeros for none (faces past the end take the last).
+    pub face_patterns: Vec<[u8; 8]>,
+    /// Where the body's patterns are anchored (its box centre), so they move with it.
+    pub anchor: [f32; 3],
 }
+
+/// Bytes per planned vertex in its attribute buffer: colour (4), pattern (8), anchor (12).
+const PLANNED_ATTRS: usize = 24;
 
 /// CPU-side geometry waiting to be uploaded. The model scene changes with the design; the
 /// highlight scene (hover, selection, the origin widget) changes often and is small.
@@ -532,13 +540,19 @@ impl Batches {
                     }
                 }
             };
-            let mut bytes = Vec::with_capacity(mesh.vertex_face.len() * 4);
+            let mut bytes = Vec::with_capacity(mesh.vertex_face.len() * PLANNED_ATTRS);
             for (part, b) in mesh.parts.iter().zip(chunk) {
                 let last = b.face_colors.last().copied().unwrap_or([200, 200, 200, 255]);
+                let last_pattern = b.face_patterns.last().copied().unwrap_or([0; 8]);
+                let anchor: Vec<u8> = b.anchor.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let faces = mesh.vertex_face.get(part.vertices.start as usize..part.vertices.end as usize).unwrap_or_default();
-                bytes.extend(faces.iter().flat_map(|f| b.face_colors.get(*f as usize).copied().unwrap_or(last)));
+                for f in faces {
+                    bytes.extend(b.face_colors.get(*f as usize).copied().unwrap_or(last));
+                    bytes.extend(b.face_patterns.get(*f as usize).copied().unwrap_or(last_pattern));
+                    bytes.extend_from_slice(&anchor);
+                }
             }
-            if let Some((colors, _)) = upload(device, "sc_planned_colors", &bytes, 4).and_then(|c| c.parts.into_iter().next()) {
+            if let Some((colors, _)) = upload(device, "sc_planned_colors", &bytes, PLANNED_ATTRS).and_then(|c| c.parts.into_iter().next()) {
                 out.push(PlannedDraw { mesh, colors });
             }
         }
@@ -741,10 +755,11 @@ fn planned_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout { array_stride: crate::VERTEX_STRIDE, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A }
 }
 
-/// A planned body's colours, one per vertex.
+/// A planned body's colour, surface pattern (kind, axis, scale, contrast), second colour and
+/// seed, and pattern anchor, one record per vertex ([`PLANNED_ATTRS`] bytes).
 fn color_layout() -> wgpu::VertexBufferLayout<'static> {
-    const A: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![2 => Unorm8x4];
-    wgpu::VertexBufferLayout { array_stride: 4, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A }
+    const A: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![2 => Unorm8x4, 3 => Uint8x4, 4 => Unorm8x4, 5 => Float32x3];
+    wgpu::VertexBufferLayout { array_stride: PLANNED_ATTRS as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &A }
 }
 
 fn line_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -982,7 +997,7 @@ impl Renderer {
                 layout: Some(&solid_layout),
                 vertex: wgpu::VertexState {
                     module: &module,
-                    entry_point: Some("vs_tri"),
+                    entry_point: Some(if planned { "vs_planned" } else { "vs_tri" }),
                     buffers: if planned { &evaluated[..] } else { &built[..] },
                     compilation_options: Default::default(),
                 },

@@ -70,7 +70,7 @@ impl Resources {
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module,
-                    entry_point: Some("vs_tri"),
+                    entry_point: Some(if planned { "vs_planned" } else { "vs_tri" }),
                     buffers: if planned { &evaluated } else { &built },
                     compilation_options: Default::default(),
                 },

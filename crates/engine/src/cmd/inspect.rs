@@ -31,7 +31,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("appearance.assign", "Appearance", appearance).at("SOLID", "MODIFY").icon("appearance").key("A").params(
         "bodies?: [names]; faces?: [[x,y,z] on faces] (body?: which body, default the nearest); components?: [names or ids, or occurrence names]; \
              appearance?: library name (appearance.library) | color: \"#rrggbb\" or [r, g, b] (0–255), opacity? (0–1, default 1); \
-             pbr?: {metallic:0..1, roughness:0.045..1, dielectric_ior:1..3} (requires color/appearance and opacity 1); omitted/null uses legacy scalar shading. Neither appearance nor color (or color: null): clear, so the face follows its body, the body its component, the component its material",
+             pbr?: {metallic:0..1, roughness:0.045..1, dielectric_ior:1..3} (requires color/appearance and opacity 1); omitted/null uses legacy scalar shading; pattern?: {kind: wood|brushed|blasted|mottled, scale_mm: 0.25..60, contrast: 0..1, color: [r,g,b], axis?: auto|x|y|z, seed?: 0..255} (requires color/appearance; null clears). Neither appearance nor color (or color: null): clear, so the face follows its body, the body its component, the component its material",
     ),
     CommandSpec::new("appearance.library", "Appearance Library", appearance_library).icon("library")
         .noundo()
@@ -417,8 +417,11 @@ fn appearance(s: &mut Session, p: &Value) -> Result<Value> {
     };
     if let Some(l) = &mut look {
         attach_pbr(cmd, p, l)?;
+        attach_pattern(cmd, p, l)?;
     } else if p.get("pbr").is_some_and(|v| !v.is_null()) {
         return Err(bad(cmd, "`pbr` requires a color or appearance"));
+    } else if p.get("pattern").is_some_and(|v| !v.is_null()) {
+        return Err(bad(cmd, "`pattern` requires a color or appearance"));
     }
     let bodies = string_list(p, "bodies");
     let st = s.model.state();
@@ -534,7 +537,25 @@ pub(super) fn look_json(l: &solidcraft_doc::appearance::Look) -> Value {
     if let Some(pbr) = l.pbr {
         value["pbr"] = json!(pbr);
     }
+    if let Some(pattern) = l.pattern {
+        value["pattern"] = json!(pattern);
+    }
     value
+}
+
+/// A look's surface pattern (a self-hosting patch): `pattern: {kind: wood|brushed|blasted|mottled,
+/// scale_mm: 0.25..60, contrast: 0..1, color: [r, g, b], axis?: auto|x|y|z, seed?: 0..255}`;
+/// null clears it.
+pub(super) fn attach_pattern(cmd: &str, params: &Value, look: &mut solidcraft_doc::appearance::Look) -> Result<()> {
+    let Some(value) = params.get("pattern") else { return Ok(()) };
+    if value.is_null() {
+        look.pattern = None;
+        return Ok(());
+    }
+    let pattern: solidcraft_doc::pattern_appearance::Pattern =
+        serde_json::from_value(value.clone()).map_err(|e| bad(cmd, format!("`pattern`: {e}")))?;
+    look.pattern = Some(pattern);
+    Ok(())
 }
 
 #[cfg(test)]

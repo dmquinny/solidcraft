@@ -52,6 +52,10 @@ struct TOut {
     @location(0) n: vec3<f32>,
     @location(1) c: vec4<f32>,
     @location(2) wp: vec3<f32>,
+    // A planned body's surface pattern (`pattern_color`; zeros: none).
+    @location(3) @interpolate(flat) pat: vec4<u32>,
+    @location(4) @interpolate(flat) pc: vec4<f32>,
+    @location(5) @interpolate(flat) org: vec3<f32>,
 };
 
 @vertex
@@ -61,6 +65,30 @@ fn vs_tri(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: 
     o.n = n;
     o.c = c;
     o.wp = p;
+    o.pat = vec4<u32>(0u);
+    o.pc = vec4<f32>(0.0);
+    o.org = vec3<f32>(0.0);
+    return o;
+}
+
+/// Planned bodies: `vs_tri` plus each vertex's surface pattern, second colour and anchor.
+@vertex
+fn vs_planned(
+    @location(0) p: vec3<f32>,
+    @location(1) n: vec3<f32>,
+    @location(2) c: vec4<f32>,
+    @location(3) pat: vec4<u32>,
+    @location(4) pc: vec4<f32>,
+    @location(5) org: vec3<f32>,
+) -> TOut {
+    var o: TOut;
+    o.pos = u.vp * vec4<f32>(p, 1.0);
+    o.n = n;
+    o.c = c;
+    o.wp = p;
+    o.pat = pat;
+    o.pc = pc;
+    o.org = org;
     return o;
 }
 
@@ -119,6 +147,8 @@ fn solid(i: TOut, front: bool) -> vec4<f32> {
     let k = curvature(i);
     let ndv = dot(normalize(i.n), normalize(u.back.xyz));
     let fw = fwidth(ndv);
+    // Millimetres per pixel, so a pattern's finest detail fades instead of shimmering.
+    let foot = length(fwidth(i.wp));
     if (clipped(i.wp)) { discard; }
     if (!front && length(u.clip.xyz) > 0.5) {
         // The cut face in its body's colour ("from component" colouring), tinted toward the
@@ -130,7 +160,7 @@ fn solid(i: TOut, front: bool) -> vec4<f32> {
     if (u.ana.x > 0.5 && length(i.n) > 0.5) {
         return analysis(i, k);
     }
-    let c = lit(i, occlusion(i));
+    let c = lit(i, occlusion(i), foot);
     // Silhouettes (styles with edges): where a curved surface turns away from the eye, a line
     // about 1.5 px wide, on the visible surface only (depth-correct).
     if (u.screen.w > 0.5 && length(i.n) > 0.5 && fw > 1e-6) {
@@ -292,11 +322,106 @@ fn fs_tri_all(i: TOut) -> @location(0) vec4<f32> {
     return shade(i);
 }
 
-fn shade(i: TOut) -> vec4<f32> {
-    return lit(i, 1.0);
+// Surface patterns (a self-hosting patch, not upstream): wood grain, brushed, blasted and mottled
+// finishes, worked out from the surface point itself, so they need no texture or coordinates.
+// `pat`: kind (0 none, 1 wood, 2 brushed, 3 blasted, 4 mottled), grain axis (0 x, 1 y, 2 z),
+// scale (a quarter millimetre per step), contrast (0-255). `pc`: the second colour, its alpha
+// the body's seed. `org`: the body's anchor (its box centre), so the pattern stays with it.
+
+fn pat_hash(p: vec3<f32>) -> f32 {
+    var q = fract(p * vec3<f32>(0.1031, 0.1030, 0.0973));
+    q = q + dot(q, q.yxz + vec3<f32>(33.33));
+    return fract((q.x + q.y) * q.z);
 }
 
-fn lit(i: TOut, visibility: f32) -> vec4<f32> {
+fn pat_noise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let w = f * f * (vec3<f32>(3.0) - 2.0 * f);
+    let x00 = mix(pat_hash(i), pat_hash(i + vec3<f32>(1.0, 0.0, 0.0)), w.x);
+    let x10 = mix(pat_hash(i + vec3<f32>(0.0, 1.0, 0.0)), pat_hash(i + vec3<f32>(1.0, 1.0, 0.0)), w.x);
+    let x01 = mix(pat_hash(i + vec3<f32>(0.0, 0.0, 1.0)), pat_hash(i + vec3<f32>(1.0, 0.0, 1.0)), w.x);
+    let x11 = mix(pat_hash(i + vec3<f32>(0.0, 1.0, 1.0)), pat_hash(i + vec3<f32>(1.0, 1.0, 1.0)), w.x);
+    return mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z);
+}
+
+fn pat_fbm(p: vec3<f32>) -> f32 {
+    var s = 0.0;
+    var a = 0.5;
+    var q = p;
+    for (var k = 0; k < 4; k = k + 1) {
+        s = s + a * pat_noise(q);
+        q = q * 2.03 + vec3<f32>(17.1, 9.2, 3.7);
+        a = a * 0.5;
+    }
+    return s;
+}
+
+/// The point in the body's frame: (along the grain axis, then the two across it).
+fn pat_frame(q: vec3<f32>, axis: u32) -> vec3<f32> {
+    if (axis == 0u) { return vec3<f32>(q.x, q.y, q.z); }
+    if (axis == 1u) { return vec3<f32>(q.y, q.z, q.x); }
+    return vec3<f32>(q.z, q.x, q.y);
+}
+
+/// How much of a detail `size` mm across survives at `foot` mm per pixel (1: all, 0: averaged
+/// away), so fine grain fades instead of shimmering when the view zooms out.
+fn pat_keep(size: f32, foot: f32) -> f32 {
+    return 1.0 - smoothstep(size * 0.35, size * 0.9, foot);
+}
+
+fn pattern_color(i: TOut, foot: f32) -> vec3<f32> {
+    let kind = i.pat.x;
+    let base = i.c.rgb;
+    if (kind == 0u) { return base; }
+    let s = max(f32(i.pat.z) * 0.25, 0.25);
+    let contrast = f32(i.pat.w) / 255.0;
+    let seed = i.pc.a;
+    let f = pat_frame(i.wp - i.org, i.pat.y);
+    if (kind == 1u) {
+        // Wood: growth rings around a pith outside the part, wobbling along the grain, then
+        // early and late wood, and fibres streaking along the axis.
+        let angle = seed * 6.2831853;
+        let pith = vec2<f32>(cos(angle), sin(angle)) * (s * 9.0 + 25.0 + seed * 45.0);
+        let d = f.yz - pith;
+        let warp = (pat_fbm(vec3<f32>(f.x * 0.012, f.y * 0.06, f.z * 0.06) + vec3<f32>(seed * 31.0)) - 0.5) * s * 3.2;
+        let r = length(d) + warp;
+        let t = fract(r / s);
+        let late = smoothstep(0.5, 0.85, t) * (1.0 - smoothstep(0.92, 1.0, t));
+        let rings = mix(0.3, late, pat_keep(s, foot));
+        var c = mix(base, i.pc.rgb, rings * contrast);
+        let fibre = pat_noise(vec3<f32>(f.x * 0.04, f.y * 3.0, f.z * 3.0) + vec3<f32>(seed * 7.0));
+        c = c * (1.0 + (fibre - 0.5) * 0.18 * pat_keep(0.6, foot));
+        return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    if (kind == 2u) {
+        // Brushed: streaks along the axis, long and thin. Real brushing is finer than a pixel at
+        // most zooms, so the streaks widen to about two pixels instead of fading away.
+        let w = max(s, foot * 2.5);
+        let n = pat_fbm(vec3<f32>(f.x / (w * 40.0), f.y / w, f.z / w) + vec3<f32>(seed * 13.0));
+        let streak = (n - 0.5) * contrast;
+        return clamp(base * (1.0 + streak * 0.6) + vec3<f32>(streak * 0.05), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    if (kind == 3u) {
+        // Blasted, anodized or cast: an even, fine speckle, at least a pixel and a half across.
+        let q = (i.wp - i.org) / max(s, foot * 1.5);
+        let n = pat_noise(q + vec3<f32>(seed * 11.0)) * 0.65 + pat_noise(q * 0.27) * 0.35;
+        return clamp(base * (1.0 + (n - 0.5) * contrast * 0.5), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    // Mottled: patches of the second colour (patina, rust, wear), with a little grit.
+    let q = (i.wp - i.org) / s;
+    let n = pat_fbm(q + vec3<f32>(seed * 23.0));
+    let edge = 0.62 - 0.3 * contrast;
+    let blot = smoothstep(edge - 0.06, edge + 0.06, n);
+    let grit = (pat_noise(q * 9.0) - 0.5) * 0.12 * pat_keep(s * 0.11, foot);
+    return clamp(mix(base, i.pc.rgb, blot) * (1.0 + grit), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn shade(i: TOut) -> vec4<f32> {
+    return lit(i, 1.0, 0.0);
+}
+
+fn lit(i: TOut, visibility: f32, foot: f32) -> vec4<f32> {
     // A zero normal marks flat colour (selection fills, translucent planes).
     if (length(i.n) < 0.5) {
         return out_color(i.c);
@@ -310,7 +435,8 @@ fn lit(i: TOut, visibility: f32) -> vec4<f32> {
     let h = normalize(key + v);
     let spec = pow(max(dot(n, h), 0.0), 40.0) * 0.25;
     let k = 0.42 + 0.38 * diff + 0.25 * fill - (0.42 + 0.25 * fill) * (1.0 - visibility);
-    return out_color(vec4<f32>(min(i.c.rgb * k + vec3<f32>(spec), vec3<f32>(1.0)), i.c.a));
+    let base = pattern_color(i, foot);
+    return out_color(vec4<f32>(min(base * k + vec3<f32>(spec), vec3<f32>(1.0)), i.c.a));
 }
 
 // Lines, decals and ghosts are drawn at their own depth: opaque faces are pushed back by their

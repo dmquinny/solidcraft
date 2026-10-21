@@ -4,7 +4,7 @@ use serde_json::json;
 fn catalog() -> Catalog {
     let entry = Entry::new(
         "user.test",
-        Definition::Appearance(ScalarLook { name: "Warm oak colour".into(), color: [180, 120, 70], opacity: 0.8 }),
+        Definition::Appearance(ScalarLook { name: "Warm oak colour".into(), color: [180, 120, 70], opacity: 0.8, pbr: None, pattern: None }),
         Provenance::default(),
     )
     .unwrap();
@@ -34,7 +34,8 @@ fn strict_schema_rejects_unknown_kinds_fields_versions_and_bad_identity() {
     for changed in [
         {
             let mut v = value.clone();
-            v["format"] = json!("solidcraft-library/2");
+            // 2 is the fork's richer format (FORMAT_V2); 3 is unknown here as 2 is upstream.
+            v["format"] = json!("solidcraft-library/3");
             v
         },
         {
@@ -103,7 +104,14 @@ fn scalar_validation_refuses_nonfinite_density_opacity_counts_strings_and_oversi
         );
     }
     for name in ["".into(), "x".repeat(129), "bad\nname".into(), " leading".into()] {
-        assert!(Entry::new("user.test", Definition::Appearance(ScalarLook { name, color: [1, 2, 3], opacity: 1.0 }), Provenance::default()).is_err());
+        assert!(
+            Entry::new(
+                "user.test",
+                Definition::Appearance(ScalarLook { name, color: [1, 2, 3], opacity: 1.0, pbr: None, pattern: None }),
+                Provenance::default()
+            )
+            .is_err()
+        );
     }
     assert!(Catalog::decode(&vec![b' '; MAX_BYTES + 1]).is_err());
     let source = Provenance { source_url: Some("x".repeat(2049)), ..Default::default() };
@@ -112,7 +120,7 @@ fn scalar_validation_refuses_nonfinite_density_opacity_counts_strings_and_oversi
 #[test]
 fn design_export_deduplicates_exact_looks_and_keeps_physical_properties_distinct() {
     let mut doc = Document::default();
-    let look = ScalarLook { name: "Warm oak colour".into(), color: [180, 120, 70], opacity: 0.8 }.to_look();
+    let look = ScalarLook { name: "Warm oak colour".into(), color: [180, 120, 70], opacity: 0.8, pbr: None, pattern: None }.to_look();
     doc.appearances.bodies.insert("Body1".into(), look.clone());
     doc.appearances.bodies.insert("Body2".into(), look.clone());
     doc.user_materials.push(UserMaterial { name: "Timber density".into(), density: 0.7, appearance: Some(look) });
@@ -125,10 +133,17 @@ fn design_export_deduplicates_exact_looks_and_keeps_physical_properties_distinct
 }
 
 #[test]
-fn scalar_export_refuses_pbr_in_every_design_owned_appearance_location() {
-    use solidcraft_doc::{appearance::FaceLook, pbr_appearance::PbrParameters};
-    let mut look = ScalarLook { name: "Original PBR specimen".into(), color: [180, 120, 70], opacity: 1.0 }.to_look();
+fn rich_looks_export_as_v2_from_every_design_owned_appearance_location() {
+    // Upstream's v1 refuses a PBR look rather than drop it; the fork's v2 keeps it (and a
+    // pattern) instead, so the export is still never lossy.
+    use solidcraft_doc::{
+        appearance::FaceLook,
+        pattern_appearance::{Pattern, PatternAxis, PatternKind},
+        pbr_appearance::PbrParameters,
+    };
+    let mut look = ScalarLook { name: "Original PBR specimen".into(), color: [180, 120, 70], opacity: 1.0, pbr: None, pattern: None }.to_look();
     look.pbr = Some(PbrParameters::new(1.0, 0.3, 1.5).unwrap());
+    look.pattern = Some(Pattern::new(PatternKind::Wood, 4.0, 0.7, [120, 80, 50], PatternAxis::Auto, 0).unwrap());
     for location in 0..4 {
         let mut doc = Document::default();
         match location {
@@ -149,8 +164,27 @@ fn scalar_export_refuses_pbr_in_every_design_owned_appearance_location() {
             _ => doc.user_materials.push(UserMaterial { name: "Original material".into(), density: 1.2, appearance: Some(look.clone()) }),
         }
         let before = doc.clone();
-        let error = Catalog::from_document(&doc, "user.test", "Test", Provenance::default()).unwrap_err();
-        assert!(error.to_string().contains("cannot preserve PBR"));
+        let library = Catalog::from_document(&doc, "user.test", "Test", Provenance::default()).unwrap();
+        assert_eq!(library.format, FORMAT_V2);
+        let reread = Catalog::decode(&library.encode().unwrap()).unwrap();
+        assert_eq!(reread, library);
+        let looks: Vec<Look> = reread
+            .entries
+            .iter()
+            .filter_map(|e| match &e.definition {
+                Definition::Appearance(l) => Some(l.to_look()),
+                Definition::Material(m) => m.appearance.as_ref().map(ScalarLook::to_look),
+            })
+            .collect();
+        assert!(looks.iter().all(|l| l.pbr == look.pbr && l.pattern == look.pattern), "{looks:?}");
         assert_eq!(doc, before);
     }
+    // A plain library stays v1, and a v1 file may not smuggle in the richer fields.
+    let plain = Catalog::from_document(&Document::default(), "user.test", "Test", Provenance::default()).unwrap();
+    assert_eq!(plain.format, FORMAT);
+    let mut doc = Document::default();
+    doc.appearances.bodies.insert("Specimen".into(), look.clone());
+    let mut rich = Catalog::from_document(&doc, "user.test", "Test", Provenance::default()).unwrap();
+    rich.format = FORMAT.into();
+    assert!(rich.validate().is_err());
 }

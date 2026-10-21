@@ -6,6 +6,7 @@
 use egui::Color32;
 use serde_json::{Value, json};
 use solidcraft_engine::Sel;
+use solidcraft_engine::doc::pattern_appearance::{Pattern, PatternAxis, PatternKind};
 use solidcraft_engine::doc::pbr_appearance::PbrParameters;
 
 use crate::SolveApp;
@@ -22,11 +23,13 @@ pub struct Look {
     pub color: [u8; 3],
     pub opacity: f64,
     pub pbr: Option<PbrParameters>,
+    pub pattern: Option<Pattern>,
 }
 
 /// Built-in looks, used until the engine offers a library (`appearance.library`).
 pub(crate) fn builtin() -> Vec<Look> {
-    let l = |cat: &str, name: &str, c: [u8; 3], o: f64| Look { name: name.into(), category: cat.into(), color: c, opacity: o, pbr: None };
+    let l =
+        |cat: &str, name: &str, c: [u8; 3], o: f64| Look { name: name.into(), category: cat.into(), color: c, opacity: o, pbr: None, pattern: None };
     vec![
         l("Metal", "Aluminum - Satin", [196, 199, 204], 1.0),
         l("Metal", "Steel - Brushed", [160, 164, 170], 1.0),
@@ -67,6 +70,7 @@ pub fn library(app: &mut SolveApp) -> Vec<Look> {
                     color: parse_color(x.get("color")?)?,
                     opacity: x.get("opacity").and_then(Value::as_f64).unwrap_or(1.0),
                     pbr: x.get("pbr").and_then(|p| serde_json::from_value(p.clone()).ok()),
+                    pattern: x.get("pattern").and_then(|p| serde_json::from_value(p.clone()).ok()),
                 })
             })
             .collect();
@@ -102,6 +106,8 @@ pub struct Ap {
     pub color: [u8; 3],
     pub opacity: f64,
     pub pbr: Option<PbrParameters>,
+    /// A surface pattern over the colour (a self-hosting patch).
+    pub pattern: Option<Pattern>,
     /// The look picked last (its name), if the colour came from one.
     pub look: Option<String>,
     /// Library category shown (0: all).
@@ -146,6 +152,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
                 color: existing.as_ref().map_or([196, 199, 204], |l| l.color),
                 opacity: existing.as_ref().map_or(1.0, |l| l.opacity),
                 pbr: existing.as_ref().and_then(|l| l.pbr),
+                pattern: existing.as_ref().and_then(|l| l.pattern),
                 look: existing.map(|l| l.name),
                 category: 0,
                 search: String::new(),
@@ -204,6 +211,56 @@ pub fn commands(k: &Ap, inputs: &[SelInput]) -> Vec<(String, Value)> {
     p.map(|p| vec![("appearance.assign".to_string(), p)]).unwrap_or_default()
 }
 
+/// The surface pattern's controls (a self-hosting patch): the pattern, then its scale, contrast,
+/// second colour and grain direction.
+fn pattern_rows(ui: &mut egui::Ui, k: &mut Ap) {
+    const KINDS: [&str; 5] = ["None", "Wood grain", "Brushed", "Blasted / anodized", "Mottled (patina, rust)"];
+    const AXES: [&str; 4] = ["Longest side", "X", "Y", "Z"];
+    let mut kind = k.pattern.map_or(0, |p| usize::from(p.kind().code()));
+    let row = ui_kit::row(ui, "Pattern", |ui| ui_kit::dropdown(ui, "appearance_pattern", &mut kind, &KINDS));
+    crate::scenario::publish_handle("appearance:pattern", row.rect.center());
+    let wanted = kind.checked_sub(1).and_then(|i| PatternKind::ALL.get(i).copied());
+    if wanted != k.pattern.map(Pattern::kind) {
+        // A new pattern starts from sensible values for its kind; the second colour is a
+        // darker shade of the main one.
+        k.pattern = wanted.and_then(|kind| {
+            let (scale, contrast) = match kind {
+                PatternKind::Wood => (4.0, 0.7),
+                PatternKind::Brushed => (0.5, 0.4),
+                PatternKind::Blasted => (0.4, 0.3),
+                PatternKind::Mottled => (15.0, 0.5),
+            };
+            let darker = k.color.map(|c| (f64::from(c) * 0.62).round() as u8);
+            Pattern::new(kind, scale, contrast, darker, PatternAxis::Auto, 0).ok()
+        });
+        k.remove_override = false;
+    }
+    let Some(p) = k.pattern else { return };
+    let mut scale = p.scale_mm();
+    let mut contrast = p.contrast();
+    let mut second = p.color();
+    let mut axis = match p.axis() {
+        PatternAxis::Auto => 0,
+        PatternAxis::X => 1,
+        PatternAxis::Y => 2,
+        PatternAxis::Z => 3,
+    };
+    let scale_row = ui_kit::row(ui, "Pattern scale (mm)", |ui| ui_kit::scalar_field(ui, &mut scale, 0.25..=60.0));
+    crate::scenario::publish_handle("appearance:pattern_scale", scale_row.rect.center());
+    ui_kit::row(ui, "Pattern contrast", |ui| ui_kit::slider(ui, &mut contrast, 0.0..=1.0, Default::default()));
+    ui_kit::row(ui, "Second colour", |ui| ui_kit::color_field(ui, &mut second));
+    if p.kind() != PatternKind::Blasted {
+        ui_kit::row(ui, "Grain along", |ui| ui_kit::dropdown(ui, "appearance_pattern_axis", &mut axis, &AXES));
+    }
+    let axis = [PatternAxis::Auto, PatternAxis::X, PatternAxis::Y, PatternAxis::Z].get(axis).copied().unwrap_or_default();
+    if let Ok(next) = Pattern::new(p.kind(), scale, contrast, second, axis, p.seed())
+        && next != p
+    {
+        k.pattern = Some(next);
+        k.remove_override = false;
+    }
+}
+
 pub(super) fn selected_params(k: &Ap, items: &[Sel]) -> Option<Value> {
     let mut p = if let Some(component) = &k.component {
         Some(json!({"components": [component], "color": hex(k.color), "opacity": k.opacity, "appearance": k.look}))
@@ -212,6 +269,9 @@ pub(super) fn selected_params(k: &Ap, items: &[Sel]) -> Option<Value> {
     }?;
     if let Some(pbr) = k.pbr {
         p["pbr"] = json!(pbr);
+    }
+    if let Some(pattern) = k.pattern {
+        p["pattern"] = json!(pattern);
     }
     Some(p)
 }
@@ -224,6 +284,7 @@ fn clear_params(k: &Ap, items: &[Sel]) -> Option<Value> {
         obj.remove("color");
         obj.remove("opacity");
         obj.remove("pbr");
+        obj.remove("pattern");
     }
     Some(p)
 }
@@ -255,6 +316,7 @@ fn in_design(app: &mut SolveApp) -> Vec<(Look, usize)> {
                         color: parse_color(x.get("color")?)?,
                         opacity: x.get("opacity").and_then(Value::as_f64).unwrap_or(1.0),
                         pbr: x.get("pbr").and_then(|p| serde_json::from_value(p.clone()).ok()),
+                        pattern: x.get("pattern").and_then(|p| serde_json::from_value(p.clone()).ok()),
                     },
                     count(x, "bodies") + count(x, "faces") + count(x, "components"),
                 ))
@@ -263,7 +325,8 @@ fn in_design(app: &mut SolveApp) -> Vec<(Look, usize)> {
     }
     let mut out: Vec<(Look, usize)> = Vec::new();
     for l in app.session.doc.appearances.bodies.values() {
-        let look = Look { name: l.name.clone(), category: "In This Design".into(), color: l.color, opacity: l.opacity, pbr: l.pbr };
+        let look =
+            Look { name: l.name.clone(), category: "In This Design".into(), color: l.color, opacity: l.opacity, pbr: l.pbr, pattern: l.pattern };
         match out.iter_mut().find(|(x, _)| *x == look) {
             Some(e) => e.1 += 1,
             None => out.push((look, 1)),
@@ -338,6 +401,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
             k.pbr = Some(parameters);
         }
     }
+    pattern_rows(ui, k);
     let picked: Vec<Sel> = inputs.first().map(|i| i.items.clone()).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
         let has_target = !picked.is_empty() || k.component.is_some();
@@ -379,7 +443,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
                     ui,
                     egui::Id::new(("ap_used", *i)),
                     c32(look.color, look.opacity),
-                    k.color == look.color && k.opacity == look.opacity && k.pbr == look.pbr,
+                    k.color == look.color && k.opacity == look.opacity && k.pbr == look.pbr && k.pattern == look.pattern,
                     &format!("{} · {n} item(s)", look.name),
                     look.clone(),
                 )
@@ -388,6 +452,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
                     k.color = look.color;
                     k.opacity = look.opacity;
                     k.pbr = look.pbr;
+                    k.pattern = look.pattern;
                     k.look = Some(look.name.clone());
                     k.remove_override = false;
                 }
@@ -417,7 +482,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
         ui_kit::text(ui, crate::i18n::tr_label("No matching appearances"), ui_kit::Text::Note("appearances_empty"));
     }
     ui_kit::swatch_grid(ui, &shown, |ui, (i, l)| {
-        let picked_look = k.look.as_deref() == Some(l.name.as_str()) && k.pbr == l.pbr;
+        let picked_look = k.look.as_deref() == Some(l.name.as_str()) && k.pbr == l.pbr && k.pattern == l.pattern;
         if ui_kit::color_swatch(
             ui,
             egui::Id::new(("ap_lib", *i)),
@@ -431,6 +496,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
             k.color = l.color;
             k.opacity = l.opacity;
             k.pbr = l.pbr;
+            k.pattern = l.pattern;
             k.look = Some(l.name.clone());
             k.remove_override = false;
         }
@@ -442,11 +508,15 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
         k.color = look.color;
         k.opacity = look.opacity;
         k.pbr = look.pbr;
+        k.pattern = look.pattern;
         k.look = Some(look.name.clone());
         k.remove_override = false;
         if let Some(mut p) = apply_params(&targets, look.color, look.opacity, k.look.as_deref()) {
             if let Some(pbr) = look.pbr {
                 p["pbr"] = json!(pbr);
+            }
+            if let Some(pattern) = look.pattern {
+                p["pattern"] = json!(pattern);
             }
             k.note = Some(match app.run("appearance.assign", p.clone()) {
                 Ok(_) => {
@@ -515,6 +585,33 @@ mod tests {
         assert_eq!(k.opacity, 1.0);
         let params = selected_params(k, &h.app.dialog.as_ref().unwrap().inputs[0].items).unwrap();
         assert_eq!(params["pbr"]["roughness"], 0.5);
+    }
+
+    /// Surface patterns (a self-hosting patch): picked in the editor, applied in one step,
+    /// shown again when the editor reopens.
+    #[test]
+    fn clicked_pattern_editor_applies_wood_grain_and_reopens_it() {
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.resize", json!({"width":1600,"height":1400}));
+        h.app.run("solid.box", json!({"length":10,"width":10,"height":10})).unwrap();
+        h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+        let before = h.app.session.undo.len();
+        h.app.start("appearance.assign");
+        h.frames(3);
+        h.step(&json!({"click":{"handle":"appearance:pattern"}})).unwrap();
+        h.step(&json!({"widget":"Wood grain"})).unwrap();
+        h.step(&json!({"widget":"Apply to selection"})).unwrap();
+        let pattern = h.app.session.doc.appearances.bodies["Body1"].pattern.expect("wood grain applied");
+        assert_eq!(pattern.kind(), PatternKind::Wood);
+        assert_eq!(h.app.session.undo.len(), before + 1);
+        h.step(&json!({"widget":"OK"})).unwrap();
+        assert_eq!(h.app.session.undo.len(), before + 1);
+        h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+        h.app.start("appearance.assign");
+        let Kind::Appearance(k) = &h.app.dialog.as_ref().unwrap().kind else { panic!("appearance editor") };
+        assert_eq!(k.pattern, Some(pattern));
+        let params = selected_params(k, &h.app.dialog.as_ref().unwrap().inputs[0].items).unwrap();
+        assert_eq!(params["pattern"]["kind"], "wood");
     }
 
     #[test]

@@ -146,6 +146,13 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
             target["appearance"] = json!(look.name);
             target["color"] = json!(look.color);
             target["opacity"] = json!(look.opacity);
+            // Library format 2 (a self-hosting patch): the look's PBR response and pattern too.
+            if let Some(pbr) = look.pbr {
+                target["pbr"] = json!(pbr);
+            }
+            if let Some(pattern) = look.pattern {
+                target["pattern"] = json!(pattern);
+            }
             nested(s, "appearance.assign", &target)?
         }
         Definition::Material(material) => {

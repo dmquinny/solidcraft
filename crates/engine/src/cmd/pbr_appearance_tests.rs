@@ -89,7 +89,9 @@ fn invalid_optical_requests_refuse_atomically_and_scalar_export_cannot_lose_them
         "pbr":{"metallic":0,"roughness":0.5,"dielectric_ior":1.5}}),
     )
     .unwrap();
-    assert!(solidcraft_io::catalog::Catalog::from_document(&s.doc, "user.fixture", "Original", Default::default()).is_err());
+    // Upstream's library v1 refuses to lose the response; the fork's v2 keeps it instead.
+    let library = solidcraft_io::catalog::Catalog::from_document(&s.doc, "user.fixture", "Original", Default::default()).unwrap();
+    assert_eq!(library.format, solidcraft_io::catalog::FORMAT_V2);
     let mut invalid: serde_json::Value = serde_json::from_str(&s.doc.to_json()).unwrap();
     invalid["appearances"]["bodies"]["Specimen"]["opacity"] = json!(0.5);
     assert!(crate::doc::Document::from_json(&invalid.to_string()).is_err());
@@ -115,7 +117,9 @@ fn physical_default_look_and_face_override_keep_independent_optical_meaning() {
     assert!(scene.meshes[0].surface.is_some());
     assert!(scene.meshes[0].faces.iter().any(|f| f.color == [0, 128, 160] && f.surface.is_none()));
     assert_eq!(s.doc.user_materials[0].density, 0.7);
-    assert!(solidcraft_io::catalog::Catalog::from_document(&s.doc, "user.fixture", "Original", Default::default()).is_err());
+    // Upstream's library v1 refuses to lose the response; the fork's v2 keeps it instead.
+    let library = solidcraft_io::catalog::Catalog::from_document(&s.doc, "user.fixture", "Original", Default::default()).unwrap();
+    assert_eq!(library.format, solidcraft_io::catalog::FORMAT_V2);
 }
 
 #[test]
@@ -143,4 +147,63 @@ fn independent_component_copy_keeps_its_opaque_response_after_source_edits_and_r
     assert_eq!(s.doc.appearances.components[&copied], original);
     let reopened = crate::doc::Document::from_json(&s.doc.to_json()).unwrap();
     assert_eq!(reopened.appearances.components[&copied], original);
+}
+
+/// Surface patterns (a self-hosting patch) go where `pbr` goes: assigned with a colour, listed,
+/// undone and redone, saved and reopened, carried by a material's default look, and refused
+/// whole when malformed or without a colour.
+#[test]
+fn surface_patterns_assign_list_reopen_and_refuse_bad_input() {
+    let mut s = fixture();
+    let doc = s.doc.clone();
+    let history = (s.undo.len(), s.redo.len(), s.revision);
+    for params in [
+        json!({"bodies":["Specimen"],"pattern":{"kind":"wood","scale_mm":4,"contrast":0.7,"color":[1,2,3]}}),
+        json!({"bodies":["Specimen"],"color":"#ffffff","pattern":{"kind":"plaid","scale_mm":4,"contrast":0.7,"color":[1,2,3]}}),
+        json!({"bodies":["Specimen"],"color":"#ffffff","pattern":{"kind":"wood","scale_mm":0,"contrast":0.7,"color":[1,2,3]}}),
+        json!({"bodies":["Specimen"],"color":"#ffffff","pattern":{"kind":"wood","scale_mm":4,"contrast":2,"color":[1,2,3]}}),
+        json!({"bodies":["Specimen"],"color":"#ffffff","pattern":{"kind":"wood","scale_mm":4,"contrast":0.7,"color":[1,2,3],"extra":1}}),
+        json!({"bodies":["Specimen"],"color":"#ffffff","pattern":"wood"}),
+    ] {
+        assert!(s.execute("appearance.assign", &params).is_err(), "{params}");
+        assert!(Arc::ptr_eq(&doc, &s.doc));
+        assert_eq!((s.undo.len(), s.redo.len(), s.revision), history);
+    }
+    s.execute(
+        "appearance.assign",
+        &json!({"bodies":["Specimen"],"color":"#b47846","appearance":"Original grain",
+        "pattern":{"kind":"wood","scale_mm":4,"contrast":0.7,"color":[110,70,40],"axis":"x","seed":9}}),
+    )
+    .unwrap();
+    let pattern = s.doc.appearances.bodies["Specimen"].pattern.expect("pattern assigned");
+    assert_eq!(pattern.scale_mm(), 4.0);
+    assert_eq!(pattern.axis(), crate::doc::pattern_appearance::PatternAxis::X);
+    let list = s.execute("appearance.list", &json!({})).unwrap();
+    assert_eq!(list["in_design"][0]["pattern"]["kind"], "wood");
+    let saved = s.doc.to_json();
+    let reopened = crate::doc::Document::from_json(&saved).unwrap();
+    assert_eq!(reopened.appearances.bodies["Specimen"].pattern, Some(pattern));
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(s.doc.appearances.bodies.get("Specimen").is_none_or(|l| l.pattern.is_none()));
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!(s.doc.appearances.bodies["Specimen"].pattern, Some(pattern));
+    // null clears it, keeping the colour.
+    s.execute("appearance.assign", &json!({"bodies":["Specimen"],"color":"#b47846","pattern":null})).unwrap();
+    assert!(s.doc.appearances.bodies["Specimen"].pattern.is_none());
+    // A material's default look carries one too.
+    s.execute(
+        "material.create",
+        &json!({"name":"Original patterned material","density_g_cm3":0.7,"color":"#b47846",
+        "pattern":{"kind":"brushed","scale_mm":0.5,"contrast":0.4,"color":[0,0,0]}}),
+    )
+    .unwrap();
+    let material = s.doc.user_materials.iter().find(|m| m.name == "Original patterned material").unwrap();
+    assert_eq!(material.appearance.as_ref().and_then(|l| l.pattern).map(|p| p.kind()), Some(crate::doc::pattern_appearance::PatternKind::Brushed));
+    assert!(
+        s.execute(
+            "material.create",
+            &json!({"name":"Original bad","density_g_cm3":0.7,"pattern":{"kind":"wood","scale_mm":4,"contrast":0.7,"color":[0,0,0]}})
+        )
+        .is_err()
+    );
 }

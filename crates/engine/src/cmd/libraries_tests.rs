@@ -33,7 +33,7 @@ fn catalog() -> Catalog {
         entries: vec![
             Entry::new(
                 "user.test",
-                Definition::Appearance(ScalarLook { name: "Warm oak colour".into(), color: [180, 120, 70], opacity: 0.8 }),
+                Definition::Appearance(ScalarLook { name: "Warm oak colour".into(), color: [180, 120, 70], opacity: 0.8, pbr: None, pattern: None }),
                 Provenance::default(),
             )
             .unwrap(),
@@ -42,7 +42,7 @@ fn catalog() -> Catalog {
                 Definition::Material(ScalarMaterial {
                     name: "Timber density".into(),
                     density_g_cm3: 0.7,
-                    appearance: Some(ScalarLook { name: "Timber tint".into(), color: [180, 120, 70], opacity: 1.0 }),
+                    appearance: Some(ScalarLook { name: "Timber tint".into(), color: [180, 120, 70], opacity: 1.0, pbr: None, pattern: None }),
                 }),
                 Provenance::default(),
             )
@@ -220,33 +220,31 @@ fn catalog_inspection_export_and_no_clobber_do_not_touch_design_or_history() {
 }
 
 #[test]
-fn lossy_scalar_export_never_creates_or_replaces_a_file_or_changes_history() {
+fn rich_export_writes_v2_and_applies_back_without_changing_history() {
+    // Upstream's v1 refuses a PBR look; the fork's v2 keeps it and its pattern (a
+    // self-hosting patch), and applying the entry gives another design the same look.
     let mut s = session();
     s.execute(
         "appearance.assign",
         &json!({"bodies":["Body1"],"color":[180,120,70],
-        "pbr":{"metallic":1.0,"roughness":0.3,"dielectric_ior":1.5}}),
+        "pbr":{"metallic":1.0,"roughness":0.3,"dielectric_ior":1.5},
+        "pattern":{"kind":"brushed","scale_mm":0.5,"contrast":0.4,"color":[0,0,0]}}),
     )
     .unwrap();
     s.mark_saved();
     let doc = s.doc.clone();
     let history = (s.undo.len(), s.redo.len(), s.revision);
-    for existing in [false, true] {
-        let file = File::new();
-        if existing {
-            std::fs::write(&file.0, b"preserve existing library").unwrap();
-        }
-        for overwrite in [false, true] {
-            let error = s.execute("library.export", &json!({"path":file.0,"overwrite":overwrite})).unwrap_err();
-            assert!(error.to_string().contains("cannot preserve PBR"));
-            if existing {
-                assert_eq!(std::fs::read(&file.0).unwrap(), b"preserve existing library");
-            } else {
-                assert!(!std::path::Path::new(&file.0).exists());
-            }
-            assert!(Arc::ptr_eq(&doc, &s.doc));
-            assert_eq!((s.undo.len(), s.redo.len(), s.revision), history);
-            assert!(!s.is_dirty());
-        }
-    }
+    let file = File::new();
+    let result = s.execute("library.export", &json!({"path":file.0})).unwrap();
+    assert_eq!(result["catalog"]["format"], "solidcraft-library/2");
+    assert!(Arc::ptr_eq(&doc, &s.doc));
+    assert_eq!((s.undo.len(), s.redo.len(), s.revision), history);
+    assert!(!s.is_dirty());
+    let entry = &result["catalog"]["entries"][0];
+    let mut other = session();
+    other.execute("library.apply", &json!({"path":file.0,"entry":entry["id"],"revision":entry["revision"],"targets":{"bodies":["Body1"]}})).unwrap();
+    let look = &other.doc.appearances.bodies["Body1"];
+    assert_eq!(look.pbr, s.doc.appearances.bodies["Body1"].pbr);
+    assert_eq!(look.pattern, s.doc.appearances.bodies["Body1"].pattern);
+    assert!(look.pattern.is_some());
 }

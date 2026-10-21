@@ -6,6 +6,10 @@ use solidcraft_doc::{Document, UserMaterial, appearance::Look, valid_density};
 use std::collections::BTreeMap;
 
 pub const FORMAT: &str = "solidcraft-library/1";
+/// The fork's richer library (a self-hosting patch): looks may also carry an opaque PBR
+/// response and a surface pattern. A library is written as 2 only when one of its looks does,
+/// so plain libraries stay readable by upstream builds; v1 entries keep their revisions.
+pub const FORMAT_V2: &str = "solidcraft-library/2";
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 1024;
 /// Bound source inspection even when many assignments reuse the same definition.
@@ -55,20 +59,30 @@ pub struct ScalarLook {
     pub name: String,
     pub color: [u8; 3],
     pub opacity: f64,
+    /// Library format 2 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pbr: Option<solidcraft_doc::pbr_appearance::PbrParameters>,
+    /// Library format 2 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<solidcraft_doc::pattern_appearance::Pattern>,
 }
 impl ScalarLook {
     pub fn from_look(look: &Look) -> Result<Self> {
-        if look.pbr.is_some() {
-            return Err(invalid("scalar catalog v1 cannot preserve PBR parameters; export refused"));
-        }
-        Ok(Self { name: look.name.clone(), color: look.color, opacity: look.opacity })
+        Ok(Self { name: look.name.clone(), color: look.color, opacity: look.opacity, pbr: look.pbr, pattern: look.pattern })
     }
     pub fn to_look(&self) -> Look {
-        Look { name: self.name.clone(), color: self.color, opacity: self.opacity, pbr: None }
+        Look { name: self.name.clone(), color: self.color, opacity: self.opacity, pbr: self.pbr, pattern: self.pattern }
+    }
+    /// Does it need library format 2?
+    pub fn rich(&self) -> bool {
+        self.pbr.is_some() || self.pattern.is_some()
     }
     fn validate(&self) -> Result<()> {
         if !text(&self.name, 128) || !self.opacity.is_finite() || !(0.0..=1.0).contains(&self.opacity) {
             return Err(invalid("library appearance needs a 1–128 byte name and finite opacity 0–1"));
+        }
+        if self.pbr.is_some() && self.opacity != 1.0 {
+            return Err(invalid("library appearance with a PBR response needs opacity 1"));
         }
         Ok(())
     }
@@ -127,6 +141,13 @@ impl Definition {
         match self {
             Self::Appearance(_) => "appearance",
             Self::Material(_) => "material",
+        }
+    }
+    /// Does it need library format 2 (a look with PBR or a pattern)?
+    pub fn rich(&self) -> bool {
+        match self {
+            Self::Appearance(l) => l.rich(),
+            Self::Material(m) => m.appearance.as_ref().is_some_and(ScalarLook::rich),
         }
     }
 }
@@ -207,8 +228,12 @@ fn bounded_entries<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::re
 }
 impl Catalog {
     pub fn validate(&self) -> Result<()> {
-        if self.format != FORMAT || !identifier(&self.id) || !text(&self.name, 128) || self.entries.len() > MAX_ENTRIES {
-            return Err(invalid("unsupported or invalid scalar library (v1, 1024 entries, 128 byte name)"));
+        if (self.format != FORMAT && self.format != FORMAT_V2) || !identifier(&self.id) || !text(&self.name, 128) || self.entries.len() > MAX_ENTRIES
+        {
+            return Err(invalid("unsupported or invalid scalar library (v1 or v2, 1024 entries, 128 byte name)"));
+        }
+        if self.format == FORMAT && self.entries.iter().any(|e| e.definition.rich()) {
+            return Err(invalid("a v1 library cannot carry PBR responses or patterns (they need solidcraft-library/2)"));
         }
         let mut ids = std::collections::BTreeSet::new();
         for entry in &self.entries {
@@ -281,7 +306,9 @@ impl Catalog {
                 insert(Definition::Appearance(ScalarLook::from_look(look)?))?;
             }
         }
-        let out = Self { format: FORMAT.into(), id: id.into(), name: name.into(), entries: entries.into_values().collect() };
+        let entries: Vec<Entry> = entries.into_values().collect();
+        let format = if entries.iter().any(|e| e.definition.rich()) { FORMAT_V2 } else { FORMAT };
+        let out = Self { format: format.into(), id: id.into(), name: name.into(), entries };
         out.validate()?;
         Ok(out)
     }

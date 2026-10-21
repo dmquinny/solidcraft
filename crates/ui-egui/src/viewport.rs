@@ -697,7 +697,8 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
                     None => col,
                 })
                 .collect();
-            sc.planned.push(crate::gpu::PlannedBody { plan, face_colors });
+            let (face_patterns, anchor) = planned_patterns(&s.doc, b, &plan, &face_looks, faded);
+            sc.planned.push(crate::gpu::PlannedBody { plan, face_colors, face_patterns, anchor });
         }
         let body = BodyDraw { mesh: drawn_mesh(app, b), col, faded, opacity, face_looks, on_gpu };
         let key = body.key(shaded, edges, hidden_edges, edge_col, hidden_col);
@@ -2286,6 +2287,52 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
 fn body_color(doc: &solidcraft_engine::doc::Document, b: &solidcraft_engine::doc::ModelBody) -> Option<Color32> {
     let to8 = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
     doc.body_color(b).map(|[r, g, b]| Color32::from_rgb(to8(r), to8(g), to8(b)))
+}
+
+/// A planned body's surface patterns (a self-hosting patch): per face its own look's pattern,
+/// else the body's, packed for the GPU (kind, grain axis, scale, contrast, second colour, seed),
+/// and the point they are drawn from (the box centre of the plan's edges, which also picks the
+/// automatic grain axis: the longest side). A faded body shows none.
+fn planned_patterns(
+    doc: &solidcraft_engine::doc::Document,
+    b: &solidcraft_engine::doc::ModelBody,
+    plan: &solidcraft_engine::geom::tess::TessPlan,
+    face_looks: &std::collections::HashMap<usize, solidcraft_engine::doc::appearance::Look>,
+    faded: bool,
+) -> (Vec<[u8; 8]>, [f32; 3]) {
+    use solidcraft_engine::doc::pattern_appearance::{Pattern, PatternAxis};
+    let body = if faded { None } else { doc.model_body_look(b).and_then(|l| l.pattern) };
+    if body.is_none() && (faded || face_looks.values().all(|l| l.pattern.is_none())) {
+        return (Vec::new(), [0.0; 3]);
+    }
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for p in plan.edges.iter().flatten() {
+        for (k, v) in [p.x, p.y, p.z].into_iter().enumerate() {
+            if v.is_finite() {
+                lo[k] = lo[k].min(v);
+                hi[k] = hi[k].max(v);
+            }
+        }
+    }
+    let size: Vec<f64> = (0..3).map(|k| if hi[k] >= lo[k] { hi[k] - lo[k] } else { 0.0 }).collect();
+    let anchor: [f32; 3] = std::array::from_fn(|k| if hi[k] >= lo[k] { ((lo[k] + hi[k]) / 2.0) as f32 } else { 0.0 });
+    let longest = (0..3u8).max_by(|a, c| size[*a as usize].total_cmp(&size[*c as usize])).unwrap_or(2);
+    // Boards that share a look still differ: the body's name turns the pattern's seed.
+    let turn = b.name.bytes().fold(0u8, |h, c| h.wrapping_mul(31).wrapping_add(c));
+    let pack = |pattern: Option<Pattern>| -> [u8; 8] {
+        let Some(p) = pattern else { return [0; 8] };
+        let axis = match p.axis() {
+            PatternAxis::Auto => longest,
+            PatternAxis::X => 0,
+            PatternAxis::Y => 1,
+            PatternAxis::Z => 2,
+        };
+        let [kind, axis, scale, contrast] = p.gpu_bytes(axis);
+        let [r, g, bl] = p.color();
+        [kind, axis, scale, contrast, r, g, bl, p.seed() ^ turn]
+    };
+    let faces = (0..b.body.face_count()).map(|f| pack(if faded { None } else { face_looks.get(&f).map_or(body, |l| l.pattern) })).collect();
+    (faces, anchor)
 }
 
 /// A body's display colour (else the theme's) as RGB.

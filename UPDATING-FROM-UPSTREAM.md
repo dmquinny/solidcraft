@@ -216,13 +216,67 @@ bodies in one undo step (`library.apply`); a body's own appearance override stil
 material's colour. Drop a new library into the folder and reload the page to see it.
 
 `Libraries/workshop-materials.solidcraft-library.json` holds woods, sheet goods, aluminium, copper
-alloys and steels with typical densities and preview colours, plus finish appearances (stains,
-anodizing, black oxide, patina). The values are illustrative, not graded design data. Library v1
-carries colour and opacity only: no metallic/roughness, and no image textures (upstream renders
-none yet). It is written by `W:\scripts\solidcraft-library` (outside the repo: edit its tables,
+alloys and steels with typical densities, colours, surface patterns and a PBR response, plus finish
+appearances (stains, anodizing, black oxide, patina, rust). The values are illustrative, not graded
+design data. It is written by `W:\scripts\solidcraft-library` (outside the repo: edit its tables,
 then `cargo run --release -- <output.json>`); an edited library needs fresh entry revisions
 (SHA-256 of `[provenance, definition]`, `Entry::new` in `crates/io/src/catalog.rs`), so
 regenerate rather than hand-edit it.
+
+Library format 2 (`FORMAT_V2` in `crates/io/src/catalog.rs`): a look may also carry `pbr` and
+`pattern`. Export writes 2 only when a look has one of them, so plain libraries stay version 1 and
+open in upstream builds; v1 entries keep their revisions. Upstream refuses to export a PBR look
+(it would be lost in v1); here it is kept instead, and `library.apply` passes both on. The two
+upstream tests about that refusal now check the round trip (`catalog_tests.rs`,
+`libraries_tests.rs`).
+
+## Surface patterns
+
+SolidCraft draws no image textures. Here a look can carry a procedural `pattern` instead, which the
+Design viewport works out from each surface point, so it needs no texture file and no texture
+coordinates (`crates/doc/src/pattern_appearance.rs`; pending format change `look-pattern.rs`):
+
+| Kind | What it draws | `scale_mm` |
+| --- | --- | --- |
+| `wood` | growth rings around a pith outside the part, early and late wood, fibres along the grain; the end grain shows the rings | ring spacing |
+| `brushed` | long thin streaks along the grain axis | streak width |
+| `blasted` | an even fine speckle (bead blast, anodizing, castings, powder coat, MDF) | speckle size |
+| `mottled` | patches of the second colour (patina, rust, mill scale, galvanizing spangle) | patch size |
+
+Each also has `contrast` (0–1), `color` (the second colour: latewood, patina, rust), `axis`
+(`auto`, the body's longest side, or `x`/`y`/`z`) and `seed`; the body's name turns the seed, so
+boards that share a look differ. The Appearance window has Pattern, Pattern scale, Pattern contrast,
+Second colour and Grain along under the surface response, and `appearance.assign`,
+`material.create` and `material.edit` take `pattern` like `pbr`.
+
+How it is drawn: `crates/ui-egui/src/viewport.rs` (`planned_patterns`) packs each face's pattern
+(its own look's, else the body's) with the body's anchor (the box centre of its display plan's
+edges); `crates/gpu/src/view.rs` puts them beside the colour in each planned vertex
+(`PLANNED_ATTRS`, 24 bytes); `assets/shaders/viewport.wgsl` (`vs_planned`, `pattern_color`)
+colours the surface before lighting and fades detail finer than about a pixel (`pat_keep`), with
+the derivative it needs taken in uniform control flow as browsers require. Limits: the Design
+viewport on WebGPU only (the bodies the GPU tessellates; WebGL2 and the CPU fallback show the plain
+colour), not the Render workspace or snapshots and thumbnails; the pattern follows a body that
+moves but not one that turns (the grain axis is in world coordinates).
+
+## Upstream 0.18.2 merge (22 Oct 2026)
+
+`collab` took upstream from 0.15.0 to 0.18.2 (merge commit `c308672f`). Where upstream redesigned
+what the fork had changed:
+
+- Preferences is a paged `ui_kit` window: the host's pages (the web host's Users page) are appended
+  through fixed slots (`HOST_PAGES` in `crates/ui-egui/src/prefs.rs`); `HostPage.title` is
+  `&'static str`.
+- The title bar has a right-hand cluster (Settings, Help, Report a bug): the account button sits
+  left of it.
+- Upstream's own web storage (`apps/solidcraft-web/src/disk.rs`, designs saved to the computer)
+  sits beside the server storage: `files::flush` routes through `disk::route`.
+- Upstream's UI guards (`ui_kit_guard_tests.rs`) scan the apps too: the web host draws its
+  checkboxes, choices, dropdowns and collapsible sections through `crates/ui-egui/src/host_ui.rs`,
+  a small public face of the kit, instead of raw egui widgets.
+- In a debug build, ten upstream UI tests (expression completion, slot previews, a browser filter)
+  panic in egui on unapplied texture deltas: an upstream test-harness issue (its open PR #4039),
+  not the fork's; CI's profile has debug assertions off.
 
 ## Going back
 
