@@ -233,6 +233,10 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
             }
             let _ = command.spawn();
         })),
+        // The web host's additions (a self-hosting patch): the desktop has none of them.
+        host_pages: Vec::new(),
+        home_sections: Vec::new(),
+        account: None,
     }
 }
 
