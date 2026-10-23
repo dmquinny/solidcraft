@@ -25,7 +25,7 @@ mod web {
 
     use solidcraft_engine::Session;
     use solidcraft_engine::io::vfs;
-    use solidcraft_ui_egui::{AccountMenu, HostPage, Services, SolveApp};
+    use solidcraft_ui_egui::{AccountMenu, HostPage, Services, SolveApp, ui_kit};
     use wasm_bindgen::JsCast as _;
 
     use crate::api::Api;
@@ -95,30 +95,32 @@ mod web {
         for key in files.repaint.borrow_mut().drain(..) {
             app.home.forget(&key);
         }
-        ui.add_space(24.0);
-        solidcraft_ui_egui::home::section(ui, "Shared with you");
-        if shared.is_empty() {
-            let who = files.me.borrow().as_ref().map(|m| format!(" You are signed in as {}.", m.name)).unwrap_or_default();
-            ui.label(egui::RichText::new(format!("Designs others share with you appear here.{who}")).weak());
-            return;
-        }
         let mut picked: Option<files::Shared> = None;
-        solidcraft_ui_egui::home::grid(ui, shared.len(), |ui, i| {
-            let Some(s) = shared.get(i) else { return };
-            let sub = format!("shared by {}{}", s.owner, if s.edit { "" } else { " (view only)" });
-            let response = if s.folder {
-                let name = if s.path.is_empty() { "The design folder".to_string() } else { format!("Folder: {}", s.path) };
-                solidcraft_ui_egui::home::plain_card(ui, &name, &sub)
-            } else {
-                let file = s.path.rsplit_once('/').map_or(s.path.as_str(), |(_, n)| n);
-                let name = file.trim_end_matches(".solidcraft").to_string();
-                // Open here (from its folder), the design is drawn as it is now.
-                let open = format!("{}{file}", files::OPFS);
-                solidcraft_ui_egui::home::design_card(app, ui, &format!("{}{}", files::SHARED, s.path), Some(&open), &name, &sub)
-            };
-            if response.on_hover_text(&s.path).clicked() {
-                picked = Some(s.clone());
+        solidcraft_ui_egui::home::host_section(ui, "Shared with you", |ui| {
+            if shared.is_empty() {
+                let who = files.me.borrow().as_ref().map(|m| format!(" You are signed in as {}.", m.name)).unwrap_or_default();
+                solidcraft_ui_egui::home::host_note(ui, &format!("Designs others share with you appear here.{who}"));
+                return;
             }
+            solidcraft_ui_egui::home::host_list(ui, |ui| {
+                for (i, s) in shared.iter().enumerate() {
+                    let id = format!("home:shared:{i}");
+                    let detail = format!("Shared by {}{}", s.owner, if s.edit { "" } else { " (view only)" });
+                    let response = if s.folder {
+                        let name = if s.path.is_empty() { "The design folder".to_string() } else { format!("Folder: {}", s.path) };
+                        solidcraft_ui_egui::home::host_plain_row(app, ui, &id, &name, &detail)
+                    } else {
+                        let file = s.path.rsplit_once('/').map_or(s.path.as_str(), |(_, n)| n);
+                        let name = file.trim_end_matches(".solidcraft").to_string();
+                        // Open here (from its folder), the design is drawn as it is now.
+                        let open = format!("{}{file}", files::OPFS);
+                        solidcraft_ui_egui::home::host_design_row(app, ui, &id, &format!("{}{}", files::SHARED, s.path), Some(&open), &name, &detail)
+                    };
+                    if response.on_hover_text(&s.path).clicked() {
+                        picked = Some(s.clone());
+                    }
+                }
+            });
         });
         if let Some(s) = picked {
             files::open_shared(files, &s);
@@ -143,7 +145,7 @@ mod web {
                 }
                 ui.separator();
                 if m.logout.is_some() {
-                    if ui.button("Sign out").clicked() {
+                    if ui_kit::button(ui, "Sign out", ui_kit::Button::Normal).clicked() {
                         files::sign_out(files);
                         ui.close();
                     }
@@ -164,7 +166,10 @@ mod web {
                 ui.separator();
             }
         }
-        if ui.button("Reload the app").on_hover_text("Loads the page again: a new build, or a sign-in that lapsed").clicked() {
+        if ui_kit::button(ui, "Reload the app", ui_kit::Button::Normal)
+            .on_hover_text("Loads the page again: a new build, or a sign-in that lapsed")
+            .clicked()
+        {
             files::reload();
             ui.close();
         }
@@ -203,14 +208,14 @@ mod web {
         let mut act: Option<(&'static str, String, bool)> = None;
         ui.horizontal(|ui| {
             ui.label(format!("Signed in as {}{}", users.me, if users.admin { " (admin)" } else { "" }));
-            if ui.small_button("Refresh").clicked() {
+            if ui_kit::button(ui, "Refresh", ui_kit::Button::Small).clicked() {
                 files::users(files);
             }
         });
         ui.horizontal(|ui| {
             ui.label("New password:");
-            ui.add(egui::TextEdit::singleline(&mut form.my_password).password(true).desired_width(160.0));
-            if ui.small_button("Change").clicked() && !form.my_password.is_empty() {
+            solidcraft_ui_egui::host_ui::password_field(ui, "users_my_password", &mut form.my_password, "new password", 160.0);
+            if ui_kit::button(ui, "Change", ui_kit::Button::Small).clicked() && !form.my_password.is_empty() {
                 act = Some(("password", std::mem::take(&mut form.my_password), false));
             }
         });
@@ -224,7 +229,7 @@ mod web {
                     if solidcraft_ui_egui::host_ui::checkbox(ui, "admin", &mut is_admin).changed() {
                         act = Some(("admin", name.clone(), is_admin));
                     }
-                    if ui.small_button("Remove").clicked() {
+                    if ui_kit::button(ui, "Remove", ui_kit::Button::Small).clicked() {
                         act = Some(("remove", name.clone(), false));
                     }
                 } else {
@@ -238,10 +243,10 @@ mod web {
             ui.separator();
             ui.label("Add a user, or give one a new password:");
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut form.new_user.0).hint_text("name").desired_width(120.0));
-                ui.add(egui::TextEdit::singleline(&mut form.new_user.1).hint_text("password").password(true).desired_width(140.0));
+                solidcraft_ui_egui::host_ui::text_field(ui, "users_new_name", &mut form.new_user.0, "name", 120.0);
+                solidcraft_ui_egui::host_ui::password_field(ui, "users_new_password", &mut form.new_user.1, "password", 140.0);
                 solidcraft_ui_egui::host_ui::checkbox(ui, "admin", &mut form.new_user.2);
-                if ui.small_button("Add").clicked() && !form.new_user.0.trim().is_empty() && !form.new_user.1.is_empty() {
+                if ui_kit::button(ui, "Add", ui_kit::Button::Small).clicked() && !form.new_user.0.trim().is_empty() && !form.new_user.1.is_empty() {
                     act = Some(("add", form.new_user.0.trim().to_string(), form.new_user.2));
                 }
             });
@@ -445,7 +450,6 @@ mod web {
             if !self.files.panel.get() {
                 return;
             }
-            let mut open = true;
             let mut act: Option<(&'static str, String)> = None;
             let remote = files::remote_only();
             let user = files::remote_user();
@@ -454,27 +458,26 @@ mod web {
                 (true, true) => "Files on the server".to_string(),
                 (true, false) => format!("Files on the server \u{b7} {user}"),
             };
-            egui::Window::new(title)
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(true)
-                .default_width(520.0)
-                .pivot(egui::Align2::CENTER_CENTER)
-                .default_pos(ctx.content_rect().center())
-                .show(ctx, |ui| {
+            let closed =
+                solidcraft_ui_egui::ui_kit::Window::new(egui::Id::new("sc_browser_files"), "folder", &title).cards(3.0).show_body(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.button("Open from computer…").clicked() {
+                        if ui_kit::button(ui, "Open from computer…", ui_kit::Button::Normal).clicked() {
                             files::pick_from_disk(&self.files, Intent::Open);
                         }
-                        if ui.button("Insert from computer…").on_hover_text("STEP, 3MF or STL into the open design").clicked() {
+                        if ui_kit::button(ui, "Insert from computer…", ui_kit::Button::Normal)
+                            .on_hover_text("STEP, 3MF or STL into the open design")
+                            .clicked()
+                        {
                             files::pick_from_disk(&self.files, Intent::Insert);
                         }
-                        if ui.button("Download open design").clicked() {
+                        if ui_kit::button(ui, "Download open design", ui_kit::Button::Normal).clicked() {
                             act = Some(("download_open", String::new()));
                         }
                         if remote
                             && !user.is_empty()
-                            && ui.button("Users\u{2026}").on_hover_text("Who can sign in; your password (Preferences)").clicked()
+                            && ui_kit::button(ui, "Users\u{2026}", ui_kit::Button::Normal)
+                                .on_hover_text("Who can sign in; your password (Preferences)")
+                                .clicked()
                         {
                             act = Some(("users", String::new()));
                         }
@@ -484,7 +487,7 @@ mod web {
                         ui.horizontal_wrapped(|ui| {
                             let current = files::remote_folder();
                             ui.label("Folder:");
-                            let r = ui.add(egui::TextEdit::singleline(&mut self.folder).hint_text("the design folder itself").desired_width(220.0));
+                            let r = solidcraft_ui_egui::host_ui::text_field(ui, "files_folder", &mut self.folder, "the design folder itself", 220.0);
                             if r.lost_focus() {
                                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                     act = Some(("folder", self.folder.clone()));
@@ -493,18 +496,17 @@ mod web {
                                 }
                             }
                             if !user.is_empty()
-                                && ui
-                                    .small_button("Share folder\u{2026}")
+                                && ui_kit::button(ui, "Share folder\u{2026}", ui_kit::Button::Small)
                                     .on_hover_text("Who may see and change the designs in this folder")
                                     .clicked()
                             {
                                 act = Some(("share_folder", String::new()));
                             }
-                            if !current.is_empty() && ui.small_button("Up").on_hover_text("The folder above").clicked() {
+                            if !current.is_empty() && ui_kit::button(ui, "Up", ui_kit::Button::Small).on_hover_text("The folder above").clicked() {
                                 act = Some(("folder", current.rsplit_once('/').map_or(String::new(), |(p, _)| p.to_string())));
                             }
                             for f in self.files.folders.borrow().iter() {
-                                if ui.small_button(format!("{f}/")).clicked() {
+                                if ui_kit::button(ui, format!("{f}/"), ui_kit::Button::Small).clicked() {
                                     act = Some(("folder", if current.is_empty() { f.clone() } else { format!("{current}/{f}") }));
                                 }
                             }
@@ -534,7 +536,7 @@ mod web {
                             for e in &entries {
                                 match &mut self.renaming {
                                     Some((from, to)) if *from == e.name => {
-                                        let r = ui.add(egui::TextEdit::singleline(to).desired_width(200.0));
+                                        let r = ui_kit::cell_editor(ui, ui.make_persistent_id(("stored_file_name", from.as_str())), to, "", false);
                                         if std::mem::take(&mut self.rename_focus) {
                                             r.request_focus();
                                         }
@@ -552,36 +554,45 @@ mod web {
                                 }
                                 ui.label(format!("{:.1} KB", e.size as f64 / 1024.0));
                                 ui.horizontal(|ui| {
-                                    if ui.small_button("Open").clicked() {
+                                    if ui_kit::button(ui, "Open", ui_kit::Button::Small).clicked() {
                                         act = Some(("open", e.name.clone()));
                                     }
                                     let design = solidcraft_engine::io::is_design_path(&e.name);
-                                    if !design && ui.small_button("Insert").on_hover_text("Into the open design (STEP, 3MF, STL)").clicked() {
+                                    if !design
+                                        && ui_kit::button(ui, "Insert", ui_kit::Button::Small)
+                                            .on_hover_text("Into the open design (STEP, 3MF, STL)")
+                                            .clicked()
+                                    {
                                         act = Some(("insert", e.name.clone()));
                                     }
-                                    if ui.small_button("Rename").clicked() {
+                                    if ui_kit::button(ui, "Rename", ui_kit::Button::Small).clicked() {
                                         self.renaming = Some((e.name.clone(), e.name.clone()));
                                         self.rename_focus = true;
                                     }
-                                    if ui
-                                        .small_button("Save to computer…")
+                                    if ui_kit::button(ui, "Save to computer…", ui_kit::Button::Small)
                                         .on_hover_text("A copy in a file you choose; the stored design stays here")
                                         .clicked()
                                     {
                                         act = Some(("save_copy", e.name.clone()));
                                     }
-                                    if ui.small_button("Download").clicked() {
+                                    if ui_kit::button(ui, "Download", ui_kit::Button::Small).clicked() {
                                         act = Some(("download", e.name.clone()));
                                     }
-                                    if ui.small_button("Delete").clicked() {
+                                    if ui_kit::button(ui, "Delete", ui_kit::Button::Small).clicked() {
                                         act = Some(("delete", e.name.clone()));
                                     }
-                                    if remote && ui.small_button("History").on_hover_text("Every version saved on the server").clicked() {
+                                    if remote
+                                        && ui_kit::button(ui, "History", ui_kit::Button::Small)
+                                            .on_hover_text("Every version saved on the server")
+                                            .clicked()
+                                    {
                                         act = Some(("history", e.name.clone()));
                                     }
                                     if remote
                                         && !user.is_empty()
-                                        && ui.small_button("Share").on_hover_text("Who may see and change this design").clicked()
+                                        && ui_kit::button(ui, "Share", ui_kit::Button::Small)
+                                            .on_hover_text("Who may see and change this design")
+                                            .clicked()
                                     {
                                         act = Some(("share", e.name.clone()));
                                     }
@@ -603,7 +614,7 @@ mod web {
                                         (false, _) => s.path.clone(),
                                     };
                                     ui.label(format!("{what} \u{b7} by {}{}", s.owner, if s.edit { "" } else { " (view only)" }));
-                                    if ui.small_button("Go").on_hover_text("Open that folder in this panel").clicked() {
+                                    if ui_kit::button(ui, "Go", ui_kit::Button::Small).on_hover_text("Open that folder in this panel").clicked() {
                                         let folder = if s.folder {
                                             s.path.clone()
                                         } else {
@@ -630,7 +641,7 @@ mod web {
                         });
                     }
                 });
-            if !open {
+            if closed {
                 self.files.panel.set(false);
                 self.renaming = None;
             }
@@ -712,10 +723,10 @@ mod web {
         /// The versions of a server design (files::history): put one back, or bring it in as a copy.
         fn history_window(&mut self, ctx: &egui::Context) {
             let Some((name, versions)) = self.files.history.borrow().clone() else { return };
-            let mut open = true;
             let mut act: Option<(&'static str, String, f64)> = None;
             let others: Vec<String> = self.files.entries.borrow().iter().map(|e| e.name.clone()).filter(|n| *n != name).collect();
-            egui::Window::new(format!("History of {name}")).open(&mut open).collapsible(false).resizable(true).default_width(620.0).show(ctx, |ui| {
+            let title = format!("History of {name}");
+            let closed = ui_kit::Window::new(egui::Id::new("sc_design_history"), "restore", &title).cards(2.5).show_body(ctx, |ui| {
                 // Work apart and bring it back: a branch is a copy whose edits can be replayed onto another design.
                 ui.horizontal(|ui| {
                     ui.label("Branch as:");
@@ -723,8 +734,8 @@ mod web {
                         let (stem, ext) = name.rsplit_once('.').map(|(s, e)| (s.to_string(), format!(".{e}"))).unwrap_or((name.clone(), String::new()));
                         self.branch_name = format!("{stem} (branch){ext}");
                     }
-                    ui.add(egui::TextEdit::singleline(&mut self.branch_name).desired_width(220.0));
-                    if ui.small_button("Branch").on_hover_text("A copy to work on apart; merge it back here later").clicked() {
+                    solidcraft_ui_egui::host_ui::text_field(ui, "history_branch_name", &mut self.branch_name, "", 220.0);
+                    if ui_kit::button(ui, "Branch", ui_kit::Button::Small).on_hover_text("A copy to work on apart; merge it back here later").clicked() {
                         act = Some(("branch", self.branch_name.clone(), 0.0));
                     }
                     ui.separator();
@@ -734,7 +745,7 @@ mod web {
                     let mut index = others.iter().position(|n| *n == self.merge_target).map_or(0, |i| i + 1);
                     solidcraft_ui_egui::host_ui::dropdown(ui, "merge_target", &mut index, &options);
                     self.merge_target = index.checked_sub(1).and_then(|i| others.get(i)).cloned().unwrap_or_default();
-                    if !self.merge_target.is_empty() && ui.small_button("Merge").on_hover_text("Replays this design's edits onto that one (opens it, unsaved)").clicked() {
+                    if !self.merge_target.is_empty() && ui_kit::button(ui, "Merge", ui_kit::Button::Small).on_hover_text("Replays this design's edits onto that one (opens it, unsaved)").clicked() {
                         act = Some(("merge", self.merge_target.clone(), 0.0));
                     }
                 });
@@ -754,10 +765,10 @@ mod web {
                             ui.label(&v.message);
                             ui.label(format!("{:.1} KB", v.size as f64 / 1024.0));
                             ui.horizontal(|ui| {
-                                if v.size > 0 && i > 0 && ui.small_button("Restore").clicked() {
+                                if v.size > 0 && i > 0 && ui_kit::button(ui, "Restore", ui_kit::Button::Small).clicked() {
                                     act = Some(("restore", v.hash.clone(), v.date));
                                 }
-                                if v.size > 0 && ui.small_button("Copy").clicked() {
+                                if v.size > 0 && ui_kit::button(ui, "Copy", ui_kit::Button::Small).clicked() {
                                     act = Some(("copy", v.hash.clone(), v.date));
                                 }
                             });
@@ -766,7 +777,7 @@ mod web {
                     });
                 });
             });
-            if !open {
+            if closed {
                 *self.files.history.borrow_mut() = None;
                 self.branch_name.clear();
                 self.merge_target.clear();
@@ -796,69 +807,68 @@ mod web {
                 self.share_edit = a.edit.clone().map(|v| v.into_iter().collect());
             }
             let users: Vec<String> = self.files.users.borrow().as_ref().map(|u| u.list.iter().map(|(n, _)| n.clone()).collect()).unwrap_or_default();
-            let mut open = true;
             let mut act: Option<&'static str> = None;
-            egui::Window::new(format!("Sharing of {label}")).open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(
-                ctx,
-                |ui| {
-                    let Some(a) = &access else {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Asking the server\u{2026}");
-                        });
-                        return;
-                    };
-                    match (&a.owner, &a.inherited_from) {
-                        (Some(owner), _) => ui.label(format!("Owner: {owner}")),
-                        (None, Some(from)) => ui.label(format!(
-                            "No sharing of its own: it follows {}",
-                            if from == "/" { "the whole design folder".to_string() } else { format!("the folder {from}") }
-                        )),
-                        (None, None) => ui.label(if a.default_open {
-                            "No sharing of its own: everyone may see and change it"
-                        } else {
-                            "No sharing of its own: only its creator and the admins"
-                        }),
-                    };
-                    if !a.can_manage {
-                        ui.label("Only its owner or an admin can change this.");
-                    }
-                    ui.add_enabled_ui(a.can_manage, |ui| {
-                        for (what, chosen) in [("Can see it:", &mut self.share_view), ("Can change it:", &mut self.share_edit)] {
-                            ui.separator();
-                            ui.label(what);
-                            let mut only = usize::from(chosen.is_some());
-                            if solidcraft_ui_egui::host_ui::choice(ui, &mut only, &["everyone", "only these people (and the owner)"]) {
-                                *chosen = (only == 1).then(Default::default);
-                            }
-                            if let Some(set) = chosen {
-                                ui.horizontal_wrapped(|ui| {
-                                    for u in &users {
-                                        let mut on = set.contains(u);
-                                        if solidcraft_ui_egui::host_ui::checkbox(ui, u, &mut on).changed() {
-                                            if on {
-                                                set.insert(u.clone());
-                                            } else {
-                                                set.remove(u);
-                                            }
+            let title = format!("Sharing of {label}");
+            let closed = ui_kit::Window::new(egui::Id::new("sc_design_sharing"), "web", &title).show_body(ctx, |ui| {
+                let Some(a) = &access else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Asking the server\u{2026}");
+                    });
+                    return;
+                };
+                match (&a.owner, &a.inherited_from) {
+                    (Some(owner), _) => ui.label(format!("Owner: {owner}")),
+                    (None, Some(from)) => ui.label(format!(
+                        "No sharing of its own: it follows {}",
+                        if from == "/" { "the whole design folder".to_string() } else { format!("the folder {from}") }
+                    )),
+                    (None, None) => ui.label(if a.default_open {
+                        "No sharing of its own: everyone may see and change it"
+                    } else {
+                        "No sharing of its own: only its creator and the admins"
+                    }),
+                };
+                if !a.can_manage {
+                    ui.label("Only its owner or an admin can change this.");
+                }
+                ui.add_enabled_ui(a.can_manage, |ui| {
+                    for (what, chosen) in [("Can see it:", &mut self.share_view), ("Can change it:", &mut self.share_edit)] {
+                        ui.separator();
+                        ui.label(what);
+                        let mut only = usize::from(chosen.is_some());
+                        if solidcraft_ui_egui::host_ui::choice(ui, &mut only, &["everyone", "only these people (and the owner)"]) {
+                            *chosen = (only == 1).then(Default::default);
+                        }
+                        if let Some(set) = chosen {
+                            ui.horizontal_wrapped(|ui| {
+                                for u in &users {
+                                    let mut on = set.contains(u);
+                                    if solidcraft_ui_egui::host_ui::checkbox(ui, u, &mut on).changed() {
+                                        if on {
+                                            set.insert(u.clone());
+                                        } else {
+                                            set.remove(u);
                                         }
                                     }
-                                });
-                            }
+                                }
+                            });
                         }
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui.button("Apply").clicked() {
-                                act = Some("apply");
-                            }
-                            if a.owner.is_some() && ui.button("Follow the folder").on_hover_text("Drop this sharing of its own").clicked() {
-                                act = Some("clear");
-                            }
-                        });
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui_kit::button(ui, "Apply", ui_kit::Button::Normal).clicked() {
+                            act = Some("apply");
+                        }
+                        if a.owner.is_some()
+                            && ui_kit::button(ui, "Follow the folder", ui_kit::Button::Normal).on_hover_text("Drop this sharing of its own").clicked()
+                        {
+                            act = Some("clear");
+                        }
                     });
-                },
-            );
-            if !open {
+                });
+            });
+            if closed {
                 *self.files.sharing.borrow_mut() = None;
                 self.share_for = None;
             }
@@ -891,34 +901,37 @@ mod web {
                 c => doc.components.iter().find(|k| k.id == c).map_or_else(|| format!("component {c}"), |k| k.name.clone()),
             };
             let mut act: Option<(u64, bool)> = None;
-            egui::Area::new(egui::Id::new("live_panel")).anchor(egui::Align2::RIGHT_TOP, [-16.0, 44.0]).show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(if others.is_empty() {
-                        "Shared on the server; nobody else here now".to_string()
-                    } else {
-                        format!("Also here: {}", others.join(", "))
+            ui_kit::Container::new(ctx, ui_kit::Surface::Toast)
+                .area(egui::Id::new("live_panel"))
+                .anchor(egui::Align2::RIGHT_TOP, [-16.0, 44.0])
+                .show(ctx, |ui| {
+                    ui_kit::Container::popup_frame(ui.style()).show(ui, |ui| {
+                        ui.label(if others.is_empty() {
+                            "Shared on the server; nobody else here now".to_string()
+                        } else {
+                            format!("Also here: {}", others.join(", "))
+                        });
+                        match locks.iter().find(|(c, _)| *c == active).map(|(_, u)| u.as_str()) {
+                            Some(u) if u == me => {
+                                if ui_kit::button(ui, format!("Unlock {}", name_of(active)), ui_kit::Button::Small).clicked() {
+                                    act = Some((active, false));
+                                }
+                            }
+                            Some(u) => {
+                                ui.label(format!("{} is locked by {u}", name_of(active)));
+                            }
+                            None => {
+                                let hint = "Only you can change it until you unlock it (or stop working for a few minutes)";
+                                if ui_kit::button(ui, format!("Lock {}", name_of(active)), ui_kit::Button::Small).on_hover_text(hint).clicked() {
+                                    act = Some((active, true));
+                                }
+                            }
+                        }
+                        for (c, u) in locks.iter().filter(|(c, _)| *c != active) {
+                            ui.label(format!("{} is locked by {u}", name_of(*c)));
+                        }
                     });
-                    match locks.iter().find(|(c, _)| *c == active).map(|(_, u)| u.as_str()) {
-                        Some(u) if u == me => {
-                            if ui.small_button(format!("Unlock {}", name_of(active))).clicked() {
-                                act = Some((active, false));
-                            }
-                        }
-                        Some(u) => {
-                            ui.label(format!("{} is locked by {u}", name_of(active)));
-                        }
-                        None => {
-                            let hint = "Only you can change it until you unlock it (or stop working for a few minutes)";
-                            if ui.small_button(format!("Lock {}", name_of(active))).on_hover_text(hint).clicked() {
-                                act = Some((active, true));
-                            }
-                        }
-                    }
-                    for (c, u) in locks.iter().filter(|(c, _)| *c != active) {
-                        ui.label(format!("{} is locked by {u}", name_of(*c)));
-                    }
                 });
-            });
             if let Some((component, take)) = act {
                 self.sync.lock(&self.files, component, take);
             }
@@ -928,20 +941,19 @@ mod web {
         fn recovery_prompt(&mut self, ctx: &egui::Context) {
             let Some((name, path)) = self.files.recovery.borrow().clone() else { return };
             let mut answer = None;
-            egui::Window::new("Recover unsaved work?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(
-                ctx,
-                |ui| {
+            let _ = solidcraft_ui_egui::ui_kit::Window::new(egui::Id::new("sc_browser_recovery"), "restore", "Recover unsaved work?")
+                .required()
+                .show_body(ctx, |ui| {
                     ui.label(format!("“{name}” had unsaved changes when this page last closed."));
                     ui.horizontal(|ui| {
-                        if ui.button("Recover").clicked() {
+                        if ui_kit::button(ui, "Recover", ui_kit::Button::Normal).clicked() {
                             answer = Some(true);
                         }
-                        if ui.button("Discard").clicked() {
+                        if ui_kit::button(ui, "Discard", ui_kit::Button::Normal).clicked() {
                             answer = Some(false);
                         }
                     });
-                },
-            );
+                });
             let Some(recover) = answer else { return };
             *self.files.recovery.borrow_mut() = None;
             if recover {

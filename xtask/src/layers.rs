@@ -56,6 +56,8 @@ pub const TABLE: &[(&str, Class)] = &[
     ("solidcraft", Class::Exempt),
     ("cli", Class::Exempt),
     ("web", Class::Exempt),
+    // The design storage service (a self-hosting patch)
+    ("server", Class::Exempt),
     ("xtask", Class::Exempt),
 ];
 

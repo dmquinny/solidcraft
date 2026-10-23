@@ -23,3 +23,15 @@ pub fn dropdown(ui: &mut Ui, id: &str, selected: &mut usize, options: &[&str]) -
 pub fn section<R>(ui: &mut Ui, id: &str, title: &str, default_open: bool, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     ui_kit::section(ui, id, title, default_open, add)
 }
+
+/// A one-line text field `width` points wide (its id is salted with `id`).
+pub fn text_field(ui: &mut Ui, id: &str, value: &mut String, hint: &str, width: f32) -> Response {
+    let id = ui.make_persistent_id(id);
+    ui.allocate_ui(egui::vec2(width, ui_kit::row_height()), |ui| ui_kit::cell_editor(ui, id, value, hint, false)).inner
+}
+
+/// A password field `width` points wide: masked, and never read out.
+pub fn password_field(ui: &mut Ui, id: &str, value: &mut String, hint: &str, width: f32) -> Response {
+    let id = ui.make_persistent_id(id);
+    ui.allocate_ui(egui::vec2(width, ui_kit::row_height()), |ui| ui_kit::password_field(ui, id, value, hint)).inner
+}

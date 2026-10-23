@@ -193,8 +193,7 @@ mod tests {
     fn shared_sessions_record_changes_only() {
         let _ = take_executed();
         set_locks([], "");
-        let mut s = crate::Session::default();
-        s.shared = true;
+        let mut s = crate::Session { shared: true, ..Default::default() };
         add_param(&mut s, "w").ok();
         s.execute("parameters.list", &Value::Null).ok();
         let got = take_executed();
@@ -224,8 +223,7 @@ mod tests {
     #[test]
     fn a_lock_held_by_someone_else_refuses_the_change() {
         let _ = take_executed();
-        let mut s = crate::Session::default();
-        s.shared = true;
+        let mut s = crate::Session { shared: true, ..Default::default() };
         set_locks([(0, "felix".to_string())], "ben");
         let before = s.doc.clone();
         let r = add_param(&mut s, "w");

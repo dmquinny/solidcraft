@@ -40,7 +40,7 @@ And on `collab`:
 | Users (`users.rs`, `http.rs`, `files.rs`, `main.rs`) | The users file has an admin flag (`name:hash:admin`; the first user ever added is an admin; `user add NAME --admin`). Over HTTP: `GET /files/?users`, `POST /files/?users` (`{"name","password","admin"}`: add, new password, or just the flag; admins only), `DELETE /files/?users=<name>` (admins only, never yourself or the last admin), `POST /files/?password` (your own). Preferences › Users (the panel's "Users…" button opens it) is a page the web app adds through `Services::host_pages`, a small hook in the UI crate: everyone changes their own password, admins add and remove users and tick who else is an admin. Without a user name from nginx the service answers 401 (`SOLIDCRAFT_ALLOW_ANONYMOUS=1` turns that off). |
 | Sign-in snippets (`packaging/docker/auth/`, `nginx.conf`, `Dockerfile`) | nginx.conf includes `/etc/nginx/solidcraft/server.conf` (server level) and `files.conf` (the `/files/` location). The image ships `auth/basic` (nginx's own sign-in against the users file, `X-Remote-User $remote_user`). Mounting `auth/header` over that folder makes nginx trust a proxy that already signed the user in: Authentik's forward auth at Nginx Proxy Manager sets `X-authentik-username`, which becomes `X-Remote-User` (Authelia: edit the snippet to `$http_remote_user`). In that mode only the proxy should reach the container (see the Authentik notes below). |
 | Sharing (`access.rs`, `http.rs`, `files.rs`, `main.rs`) | A design or folder can be shared with certain people: an entry in `<history>/access.json` names its owner, who may view and who may edit (`null` = everyone). A design without an entry follows the nearest folder with one, else the default (`SOLIDCRAFT_DEFAULT_ACCESS=everyone`, or `owner`: new designs start as their creator's own). The service hides what someone may not view (listings, logs) and answers 403 for the rest; a save by someone who may only view is refused with a message. Owners, admins and the creator of a design without an entry set it: `GET`/`POST`/`DELETE ?access` (a folder with its trailing slash). In the panel: "Share" per design and "Share folder…" next to the folder field open the Sharing window (everyone, or only the people ticked, for seeing and for changing; "Follow the folder" drops a design's own sharing). |
-| Shared with you (`access.rs`, `http.rs`, `files.rs`, `main.rs`, `crates/ui-egui/src/home.rs`) | `GET /files/?shared` lists what others shared with the signed-in user by name (designs and folders, owner, view or edit). The file panel shows it as "Shared with me" with a Go button, and the start page gets a "Shared with you" section (a host section through `Services::home_sections`, a small hook in the UI crate beside `host_pages`; `home::section` is public for the heading) drawn as cards with the designs' own pictures (`home::design_card`, `home::grid`, `home::plain_card` are public; the files of shared designs are fetched under `/shared/` for that); a click enters the design's folder and opens it. |
+| Shared with you (`access.rs`, `http.rs`, `files.rs`, `main.rs`, `crates/ui-egui/src/home.rs`) | `GET /files/?shared` lists what others shared with the signed-in user by name (designs and folders, owner, view or edit). The file panel shows it as "Shared with me" with a Go button, and the start page gets a "Shared with you" section (a host section through `Services::home_sections`, a small hook in the UI crate beside `host_pages`; `home::section` is public for the heading) drawn as rows like Recent's with the designs' own pictures (`home::host_section`, `host_note`, `host_list`, `host_design_row`, `host_plain_row` are public; the files of shared designs are fetched under `/shared/` for that); a click enters the design's folder and opens it. |
 | Branches (`store.rs`, `files.rs`, `sync.rs`) | `POST ?branch=<new path>` copies the design (commit "branched … from …"); the branch's first marker carries `from`. "Branch as" in the history window makes one in the current folder; "Merge into" fetches the branch's whole command log and replays it onto the chosen design, which is opened and left unsaved; commands that no longer apply are counted and skipped. |
 
 Outside the repo, `W:\docker-compose.yml` runs two services: `solidcraft` (nginx, the site) and
@@ -308,6 +308,28 @@ what the fork had changed:
 - In a debug build, ten upstream UI tests (expression completion, slot previews, a browser filter)
   panic in egui on unapplied texture deltas: an upstream test-harness issue (its open PR #4039),
   not the fork's; CI's profile has debug assertions off.
+
+## Upstream 0.20.0 merge (23 Oct 2026)
+
+`collab` took upstream from 0.18.2 to 0.20.0 (backup branch `collab-pre-upstream-merge-2026-10-23`).
+Where upstream redesigned what the fork had changed:
+
+- The start page is upstream's file view (rows, not picture cards). The fork's hooks were put
+  back on it: `live` (the open design's row shows it as it is now, on the web), the host
+  sections (`Services::home_sections`, drawn before Samples) and public row helpers for them
+  (`host_section`, `host_note`, `host_list`, `host_design_row`, `host_plain_row` in `home.rs`);
+  the web host's "Shared with you" uses them.
+- Upstream's rule that every outer window, panel, menu and overlay goes through
+  `ui_kit::Container` (`cargo xtask ui-containers`, which scans the apps too): the web host's
+  file panel, History and Sharing windows are `ui_kit::Window`s, the live panel a
+  `Container::area` with `Container::popup_frame`, and the title bar's account menu a
+  `Container` popup.
+- Preferences pages carry a `group`: the host's pages have none.
+- The viewport draws repeated and very large meshes instanced (`TriSource::Instanced`,
+  `vs_tri_inst`): those draw without a surface pattern (the shader zero-fills the pattern
+  fields); planned bodies still use `vs_planned` (`TriSource::entry`).
+- The timeline's chips paint through `HistoryChip::paint`; the author's dot is drawn after it.
+- `cargo xtask layers` needs every crate in its table: `server` is registered as an app.
 
 ## Going back
 
