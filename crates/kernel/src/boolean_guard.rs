@@ -6,9 +6,23 @@
 //! - a join never loses volume and a cut never gains any;
 //! - outside the tool's box nothing changes: there, the result's surface is the target's and
 //!   the target's surface is the result's. A join or a cut can only change the target where the
-//!   tool is, so geometry anywhere else (a slit through a wall, a face moved) is wrong.
+//!   tool is, so geometry anywhere else (a slit through a wall, a face moved) is wrong;
+//! - where the tool is, every piece of its surface the result keeps lies on the right side of
+//!   the target (inside it for a cut, outside for a join), and every piece of the target's
+//!   surface kept there on the right side of the tool ([`wrong_side`]). The numerical boolean
+//!   decides which pieces to keep from meshes of the operands; a piece it puts on the wrong
+//!   side (a ball cut into a face left as a bump below it, the ball's mesh at the coarse first
+//!   tolerance too crude to tell where the ball crosses an edge of the face) can be far too
+//!   small for the volume bounds or the sampled membership test to see. Pieces finer than a
+//!   thousandth of the size are within the resolution of the coarsest try and are left to the
+//!   volume bounds;
+//! - its box is what the operation allows ([`bounds_hold`]): a cut reaches no further than its
+//!   target, a join exactly as far as its operands, an intersection no further than both.
 //!
 //! A result that fails is refused with an error: a wrong result that looks right is worse.
+//! The whole-body strategies hold every candidate to the last two rules as well (`check` in
+//! `ops.rs`), not only the retries: the first numerical try is as able to put a piece on the
+//! wrong side as any retry.
 
 use solidcraft_geom::{Aabb3, Mesh, Vec3};
 
@@ -120,6 +134,67 @@ fn smallest_radius(body: &Body) -> Option<f64> {
         .min_by(f64::total_cmp)
 }
 
+/// Whether `result` may be the box of `op`'s result for operands with boxes `a` and `b`, with
+/// `slack` for the meshes' chords (the boxes are of meshes made at one tolerance): a cut never
+/// reaches outside its target, a join reaches exactly as far as its operands, an intersection
+/// no further than both.
+pub(crate) fn bounds_hold(op: BoolOp, a: &Aabb3, b: &Aabb3, result: &Aabb3, slack: f64) -> bool {
+    let within = |inner: &Aabb3, outer: &Aabb3| {
+        inner.min.x >= outer.min.x - slack
+            && inner.min.y >= outer.min.y - slack
+            && inner.min.z >= outer.min.z - slack
+            && inner.max.x <= outer.max.x + slack
+            && inner.max.y <= outer.max.y + slack
+            && inner.max.z <= outer.max.z + slack
+    };
+    match op {
+        BoolOp::Cut => within(result, a),
+        BoolOp::Union => {
+            let both = a.union(b);
+            within(result, &both) && within(&both, result)
+        }
+        BoolOp::Intersect => within(result, &a.intersection(b)),
+    }
+}
+
+/// A point of the result's surface (`mr`) that lies on one operand's surface alone (within
+/// `reach`: the meshes' chords and a little) but on the wrong side of the other operand for
+/// `op`, with what it is, if there is one: a piece of the tool's surface a cut kept outside the
+/// target (a ball cut into a face, left as a bump below it), a piece of the tool a join kept
+/// inside the target, a piece of the target's surface kept inside a cutting tool. Such a piece
+/// is a face the boolean classified wrongly; it can be a sliver whose volume and whose share of
+/// sampled points are far below what the volume bounds and the membership samples can see.
+/// Looked for where the tool is (its box, grown by the reach), which is the only place a join
+/// or a cut changes the target, on the result's triangles there (at most [`MAX_SAMPLES`],
+/// evenly spaced).
+pub(crate) fn wrong_side(op: BoolOp, ma: &Mesh, mb: &Mesh, mr: &Mesh, reach: f64) -> Option<(Vec3, &'static str)> {
+    let (near_a, near_b) = (Near::new(ma, reach)?, Near::new(mb, reach)?);
+    let mut region = mb.bounds();
+    region.min -= Vec3::new(reach, reach, reach) * 2.0;
+    region.max += Vec3::new(reach, reach, reach) * 2.0;
+    let there: Vec<Vec3> = mr.triangles.iter().filter_map(|t| mr.tri(t)).map(|[a, b, c]| (a + b + c) / 3.0).filter(|p| region.contains(*p)).collect();
+    if there.is_empty() {
+        return None;
+    }
+    // Which side of the other operand a kept piece of each operand's surface belongs on.
+    let (tool_inside_target, target_inside_tool) = match op {
+        BoolOp::Cut => (true, false),
+        BoolOp::Union => (false, false),
+        BoolOp::Intersect => (true, true),
+    };
+    let (ia, ib) = (ma.inside_index(), mb.inside_index());
+    let step = there.len().div_ceil(MAX_SAMPLES).max(1);
+    there.iter().step_by(step).find_map(|&p| match (near_a.close(p), near_b.close(p)) {
+        (false, true) => {
+            (ia.contains(p) != tool_inside_target).then_some((p, "a piece of the tool's surface would be kept on the wrong side of the body"))
+        }
+        (true, false) => {
+            (ib.contains(p) != target_inside_tool).then_some((p, "a piece of the body's surface would be kept on the wrong side of the tool"))
+        }
+        _ => None,
+    })
+}
+
 fn bad(op: BoolOp, what: String) -> KernelError {
     let verb = match op {
         BoolOp::Union => "join",
@@ -213,6 +288,13 @@ pub(crate) fn check_retry(a: &Body, b: &Body, op: BoolOp, result: Option<&Body>)
     }
     if let Some(p) = stray_point(&ma, &near_r, &region) {
         return Err(bad(op, format!("it would remove part of the body away from the tool, at {} (outside the tool's region)", at(p))));
+    }
+    let coarse = reach.max(size * 1e-3);
+    if !bounds_hold(op, &ma.bounds(), &mb.bounds(), &mr.bounds(), coarse) {
+        return Err(bad(op, "it would reach outside the box the operation allows".into()));
+    }
+    if let Some((p, what)) = wrong_side(op, &ma, &mb, &mr, coarse) {
+        return Err(bad(op, format!("{what}, at {}", at(p))));
     }
     Ok(())
 }

@@ -1308,6 +1308,9 @@ where
             && b.union_lumps().is_ok()
             && crate::coplanar::faces_touch(a, b)
     };
+    // Why the last candidate failed the surface and box rules below, for the error when no
+    // strategy answers (the volume bounds' message would blame the volume, which was plausible).
+    let refused: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
     let check = |r: &Body| -> (bool, f64) {
         if let Some(reason) = reach.as_ref().and_then(|reach| reach.runaway(r)) {
             reject(reason);
@@ -1321,6 +1324,33 @@ where
         }
         if unfused(r) || crate::coplanar::has_skin(r, &mr) {
             return (false, v);
+        }
+        // A piece of a face put on the wrong side of the other operand (a ball cut into a face
+        // kept as a bump below it: at a chord tolerance a tenth of the ball across, its mesh
+        // cannot tell where the ball crosses an edge of the face) can be far too small for the
+        // volume bounds and the samples below to see; it is caught on the surface, where the
+        // tool is, and so is a result reaching outside the box the operation allows. Pieces
+        // finer than a thousandth of the size are left alone: that is within the resolution the
+        // coarsest try works at (chords of 2e-3 of the size), and refusing them fails operations
+        // over slivers no one sees (robustness seed 20: a sliver 0.035 mm below a face of a 50 mm
+        // part, whose refusal failed its pattern of holes, the retries being worse).
+        if let (Some(ma), Some(mb)) = &meshes
+            && !a.is_mesh()
+            && !b.is_mesh()
+        {
+            let reach = (3.0 * tol_m + size * 1e-5).max(size * 1e-3);
+            if !crate::boolean_guard::bounds_hold(op, &ma.bounds(), &mb.bounds(), &mr.bounds(), reach) {
+                let what = "a result reaching outside the box the operation allows".to_string();
+                reject(what.clone());
+                refused.set(Some(what));
+                return (false, v);
+            }
+            if let Some((p, what)) = crate::boolean_guard::wrong_side(op, ma, mb, &mr, reach) {
+                let what = format!("{what}, at ({:.3}, {:.3}, {:.3})", p.x, p.y, p.z);
+                reject(what.clone());
+                refused.set(Some(what));
+                return (false, v);
+            }
         }
         let consistent = match &meshes {
             (Some(ma), Some(mb)) => mismatch(ma, mb, &mr, op).is_none_or(|f| f < 0.004),
@@ -1519,7 +1549,7 @@ where
                                 record(event);
                                 return Some(body);
                             }
-                            *last = format!("implausible result volume {v:.4}");
+                            *last = refused.take().unwrap_or_else(|| format!("implausible result volume {v:.4}"));
                         }
                         Err(e) => *last = e.to_string(),
                     },
@@ -1631,11 +1661,13 @@ where
                             }
                             return Ok(Some(body));
                         }
-                        last = if unfused(&body) {
-                            "the bodies touch along faces that could not be fused".into()
-                        } else {
-                            format!("implausible result volume {v:.4}")
-                        };
+                        last = refused.take().unwrap_or_else(|| {
+                            if unfused(&body) {
+                                "the bodies touch along faces that could not be fused".into()
+                            } else {
+                                format!("implausible result volume {v:.4}")
+                            }
+                        });
                     }
                     Err(e) => last = e.to_string(),
                 },

@@ -206,6 +206,26 @@ fn slab_pocket_loft() -> (f64, f64) {
     (slab - 557.68 * 100.0 * 120.0, loft)
 }
 
+/// A ball cut into the bottom of a filleted block where it also pokes out of a side, after a
+/// pattern of balls cut into the block (robustness seed 55). The first numerical try kept the
+/// piece of the ball outside the block, a bump 6.66 mm proud of the side, and cut 855 mm³ more
+/// than the ball reaches into the block; its volume was inside the bounds' slack and no
+/// membership sample fell on the bump, so the result was taken. Every candidate's kept surface
+/// and box are checked now, and the next try answers: 906 mm³, the ball's upper half inside the
+/// block less what the pattern's copy beside it had cut already (the same design with the
+/// copies as plain balls removes 906.26 mm³ on any path).
+#[test]
+fn a_ball_seat_cut_at_a_side_leaves_no_bump_outside_the_block() {
+    let s = replay(include_str!("../../../examples/regressions/ball_seat_bump.json"));
+    let st = s.model.state();
+    let body = &st.body("Body1").expect("the block").body;
+    assert!(body.validity().is_empty(), "{:?}", body.validity());
+    let m = solidcraft_kernel::measure(body).unwrap();
+    assert!(m.bbox.max.x <= 35.0 + 0.05 && m.bbox.min.x >= -0.05 && m.bbox.min.z >= -0.05, "the block is 35 x 35 x 25, the body spans {:?}", m.bbox);
+    let want = 25598.9;
+    assert!((m.volume - want).abs() < 1.0, "volume {} vs {want}", m.volume);
+}
+
 #[test]
 fn loft_cut_beside_a_round_hole() {
     let s = replay(include_str!("../../../examples/regressions/loft_cut_beside_round_hole.json"));

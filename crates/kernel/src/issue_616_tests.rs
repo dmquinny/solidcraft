@@ -183,3 +183,35 @@ fn boxes_joined_flush_to_a_shelled_box_stay_local() {
     }
     assert_eq!((joined, refused), (40, 0), "every one of these joins works");
 }
+
+#[test]
+fn the_retry_guard_refuses_a_tool_piece_kept_on_the_wrong_side() {
+    // A ball cut into the top of a block: the right result keeps the ball's lower half (a seat);
+    // a result keeping its upper half instead (what the block joined with the ball looks like)
+    // has a piece of the tool's surface outside the block. Its volume gives it away here, but
+    // not when the piece is a sliver, or when a bump below a face comes with the dent above it:
+    // the surface test does, whatever the volume.
+    let block = bx([0., 0., 0.], [20., 20., 20.]);
+    let ball = sphere(Vec3::new(10., 10., 20.), 3.).unwrap();
+    let seat = boolean(&block, &ball, BoolOp::Cut).unwrap().unwrap();
+    let bump = boolean(&block, &ball, BoolOp::Union).unwrap().unwrap();
+    let t = 0.01;
+    let (mb, mt) = (block.tessellate(t).unwrap(), ball.tessellate(t).unwrap());
+    let reach = 3.0 * t;
+    assert!(crate::boolean_guard::wrong_side(BoolOp::Cut, &mb, &mt, &seat.tessellate(t).unwrap(), reach).is_none());
+    let (p, what) = crate::boolean_guard::wrong_side(BoolOp::Cut, &mb, &mt, &bump.tessellate(t).unwrap(), reach).expect("the bump is refused");
+    assert!(p.z > 20.0 + reach, "the offending point is on the bump: {p:?}");
+    assert!(what.contains("tool"), "{what}");
+    // The same two results as a join: the seat keeps a piece of the tool inside the block.
+    assert!(crate::boolean_guard::wrong_side(BoolOp::Union, &mb, &mt, &bump.tessellate(t).unwrap(), reach).is_none());
+    assert!(crate::boolean_guard::wrong_side(BoolOp::Union, &mb, &mt, &seat.tessellate(t).unwrap(), reach).is_some());
+    // The boxes: a cut's never reaches outside its target, a join's exactly as far as both.
+    let (bb, bt) = (mb.bounds(), mt.bounds());
+    assert!(crate::boolean_guard::bounds_hold(BoolOp::Cut, &bb, &bt, &seat.tessellate(t).unwrap().bounds(), reach));
+    assert!(!crate::boolean_guard::bounds_hold(BoolOp::Cut, &bb, &bt, &bump.tessellate(t).unwrap().bounds(), reach));
+    assert!(crate::boolean_guard::bounds_hold(BoolOp::Union, &bb, &bt, &bump.tessellate(t).unwrap().bounds(), reach));
+    assert!(!crate::boolean_guard::bounds_hold(BoolOp::Union, &bb, &bt, &seat.tessellate(t).unwrap().bounds(), reach));
+    // Through the guard a retry's result goes through.
+    assert!(crate::boolean_guard::check_retry(&block, &ball, BoolOp::Cut, Some(&seat)).is_ok());
+    assert!(crate::boolean_guard::check_retry(&block, &ball, BoolOp::Cut, Some(&bump)).is_err());
+}

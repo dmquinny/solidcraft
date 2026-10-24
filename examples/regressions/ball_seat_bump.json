@@ -1,0 +1,10 @@
+{
+  "description": "A ball cut into the bottom face of a filleted block where it also pokes out of a side, after a circular pattern of balls cut into the block: the boolean's first try kept the piece of the ball outside the block, a bump 6.66 mm proud of the side, and cut 855 mm3 more than the ball reaches into the block. Its volume was inside the volume bounds' slack and no membership sample fell on the bump (robustness seed 55).",
+  "commands": [
+    {"command": "solid.box", "params": {"height": 25.0, "length": 35.0, "width": 35.0}},
+    {"command": "solid.fillet", "params": {"edges": [[35.0, 17.5, 25.0]], "radius": 2.5}},
+    {"command": "solid.sphere", "params": {"center": [10.0, 35.0, 10.0], "operation": "cut", "radius": 10.0}},
+    {"command": "solid.pattern.circular", "params": {"axis": "Z", "count": 6, "features": ["Sphere1"]}},
+    {"command": "solid.sphere", "params": {"center": [32.5, 15.0, 0.0], "operation": "cut", "radius": 10.0}}
+  ]
+}
